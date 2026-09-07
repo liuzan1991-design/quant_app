@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 数据与运行状态（不进 git，行情/账户快照本地才有）
+data/
+live_outputs/
+test_outputs/
+reports/
+logs/
+*.log
+
+# Streamlit
+.streamlit/
+
+# 临时/备份
+*.tmp
+*.bak*
+_tmp*.py
+
+# 系统
+.DS_Store
+Thumbs.db

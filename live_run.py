@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
@@ -66,14 +67,20 @@ def main() -> None:
     observers = match._build_observers()
     quiet_rounds = 0
     last_seen = None
+    # 健康标记累积：采集异常次数 + 各组合累计订单/成交/最新水位。
+    collect_errors = 0
+    last_collected = {}
+    health_path = match.OUTPUT_DIR / "health.json"
 
     _LOGGER.info("== 观察期启动 == codes=%s", CODES)
     while True:
         # 采集当天实时数据
         try:
             collected = collector.run_once(CODES, datetime.now().strftime("%Y-%m-%d"))
+            last_collected = dict(collected) if isinstance(collected, dict) else {}
             _LOGGER.info("[collector] 采集完成 %s", collected)
         except Exception as exc:  # noqa: BLE001
+            collect_errors += 1
             _LOGGER.exception("[collector] 采集失败")
 
         # 撮合新 bar
@@ -100,6 +107,24 @@ def main() -> None:
                 for obs in observers:
                     summary_item = match._write_daily_summary(obs)
                     _LOGGER.info("[daily] %s", summary_item)
+                # 每天必写健康标记（正常也写），文件日期未更新即视为断签。
+                health = {
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "collect_errors": collect_errors,
+                    "last_collected": last_collected,
+                    "observers": {
+                        f"{obs.code}×{obs.strategy_id}": {
+                            "latest_watermark": (obs.watermark.isoformat()
+                                                  if obs.watermark is not None else None),
+                            "orders": len(obs.broker.orders),
+                            "fills": len(obs.broker.fills),
+                        }
+                        for obs in observers
+                    },
+                }
+                health_path.write_text(json.dumps(health, ensure_ascii=False, indent=2),
+                                       encoding="utf-8")
+                _LOGGER.info("[health] %s", health)
                 break
 
         time.sleep(POLL_INTERVAL)

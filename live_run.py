@@ -60,6 +60,9 @@ def _past_hard_close() -> bool:
 
 def main() -> None:
     collector = MarketCollector(dry_run=False)
+    # 观察期启动时，用历史 CSV 初始化 live 文件（幂等），之后采集追加不覆盖。
+    for code in CODES:
+        collector.init_from_history(code)
     observers = match._build_observers()
     quiet_rounds = 0
     last_seen = None

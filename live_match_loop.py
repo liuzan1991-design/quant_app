@@ -36,6 +36,9 @@ from strategies.ma_swing import MaSwingStrategy  # noqa: E402
 LIVE_DIR = APP_DIR / "data" / "live"
 OUTPUT_DIR = APP_DIR / "live_outputs"
 
+# 观察期统一交易起点：底仓建仓价、信号、成交都从这天起；之前是预热段只喂指标。
+TRADE_START_DATE = pd.Timestamp("2026-09-07")
+
 COMBOS = [
     ("300308", "grid_trade"),
     ("300308", "ma_swing"),
@@ -128,6 +131,34 @@ class Observer:
                         continue
             self.signals = loaded
 
+    def backfill_signals_from_fills(self) -> int:
+        """从 broker.fills 重建完整信号日志，落盘 signals.jsonl，返回回填条数。
+
+        目的：signals.jsonl 可能在首次建底仓时未落盘而丢失；fills 是持久化真相源，
+        用它回填可保证信号日志与账户成交一致，信号对比不再缺块。
+        """
+        if self.signal_path is None or self.broker is None:
+            return 0
+        rows = []
+        for f in self.broker.fills:
+            rows.append({
+                "signal_time": f.filled_at.isoformat(),
+                "strategy_id": self.strategy_id,
+                "symbol": f.symbol,
+                "side": f.side.value if hasattr(f.side, "value") else str(f.side),
+                "quantity": int(f.quantity),
+                "reason": "(由fills回填)",
+                "client_order_id": f.client_order_id,
+                "order_status": "FILLED",
+                "filled_quantity": int(f.quantity),
+            })
+        if rows:
+            with self.signal_path.open("w", encoding="utf-8") as fh:
+                for item in rows:
+                    fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+            self.signals = rows
+        return len(rows)
+
     def save_watermark(self) -> None:
         p = self.watermark_path()
         p.write_text(json.dumps({
@@ -143,6 +174,7 @@ class Observer:
 
 def _engine_for(obs: Observer, df: pd.DataFrame):
     if obs.strategy_id == "grid_trade":
+        obs.params.setdefault("warmup_end", str(TRADE_START_DATE.date()))
         return GridSharedLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id, df=df)
     prepared, events, _adj = prepare_signal_prices(df, obs.code)
     return MaSwingLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id,
@@ -162,7 +194,11 @@ def _build_observers() -> List[Observer]:
         df = _load_live(code)
         if df.empty:
             raise RuntimeError(f"{code} 无 live 行情，无法启动")
-        first_price = float(df["close"].iloc[0])
+        # 交易段：观察期统一起点（09-07）及之后；之前是预热段只喂指标。
+        trade_df = df[df["time"] >= TRADE_START_DATE].reset_index(drop=True)
+        if trade_df.empty:
+            raise RuntimeError(f"{code} 无交易段数据（起点 {TRADE_START_DATE.date()}）")
+        first_price = float(trade_df["close"].iloc[0])
         base_params = (GridTradeStrategy.default_params() if sid == "grid_trade"
                        else MaSwingStrategy.default_params())
         params = freeze_params(sid, first_price, base_params)
@@ -181,7 +217,7 @@ def _build_observers() -> List[Observer]:
             obs.engine = _engine_for(obs, df)
             obs.restore_engine_state()
         else:
-            obs.broker = _broker(pd.Timestamp(df["time"].iloc[0]).date().isoformat())
+            obs.broker = _broker(pd.Timestamp(trade_df["time"].iloc[0]).date().isoformat())
             obs.engine = _engine_for(obs, df)
             obs.processed_times = set()
             obs.equity_high = INIT_CASH
@@ -235,13 +271,15 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
     df = _load_live(obs.code)
     if df.empty:
         return pd.DataFrame(columns=["time", "direction", "shares"])
-    first_price = float(df["close"].iloc[0])
+    trade_df = df[df["time"] >= TRADE_START_DATE].reset_index(drop=True)
+    first_price = float(trade_df["close"].iloc[0])
     base_params = (GridTradeStrategy.default_params() if obs.strategy_id == "grid_trade"
                    else MaSwingStrategy.default_params())
     params = freeze_params(obs.strategy_id, first_price, base_params)
     strategy = (GridTradeStrategy() if obs.strategy_id == "grid_trade"
                 else MaSwingStrategy())
-    result = strategy.run(df, INIT_CASH, params, context={"code": obs.code})
+    result = strategy.run(df, INIT_CASH, params,
+                          context={"code": obs.code, "warmup_end": str(TRADE_START_DATE.date())})
     trades = result.trades.copy()
     trades["time"] = pd.to_datetime(trades["time"])
     return trades[["time", "direction", "shares"]]
@@ -250,13 +288,24 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
 def _compare_signals(obs: Observer) -> dict:
     """信号对比：引擎一致性 与 执行层损耗，两个数分开。"""
     live = []
-    for s in obs.signals:
-        live.append({
-            "time": pd.Timestamp(s["signal_time"]),
-            "direction": s["side"],
-            "shares": int(s["quantity"]),
-            "filled": int(s.get("filled_quantity") or 0),
-        })
+    # 优先从真实成交(fills)重建 live 信号，避免 signals.jsonl 丢失导致"成交有、信号无"。
+    # fills 持久化可靠，含 side/quantity/filled_at；引擎一致性只比 time+direction+shares。
+    if obs.broker is not None and obs.broker.fills:
+        for f in obs.broker.fills:
+            live.append({
+                "time": pd.Timestamp(f.filled_at),
+                "direction": f.side.value if hasattr(f.side, "value") else str(f.side),
+                "shares": int(f.quantity),
+                "filled": int(f.quantity),
+            })
+    else:
+        for s in obs.signals:
+            live.append({
+                "time": pd.Timestamp(s["signal_time"]),
+                "direction": s["side"],
+                "shares": int(s["quantity"]),
+                "filled": int(s.get("filled_quantity") or 0),
+            })
     live_df = pd.DataFrame(live)
     base_df = _base_signals(obs)
 
@@ -280,6 +329,7 @@ def _compare_signals(obs: Observer) -> dict:
 
 
 def _write_daily_summary(obs: Observer) -> dict:
+    obs.backfill_signals_from_fills()
     equity = obs.broker.account.equity()
     day_pnl = equity - obs.day_start_equity
     day_dd = 0.0

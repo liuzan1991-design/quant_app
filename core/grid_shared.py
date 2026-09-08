@@ -61,6 +61,9 @@ class GridSharedEngine:
 
     def __init__(self, params: dict):
         self.params = dict(params)
+        self.warmup_end = params.pop("warmup_end", None)
+        if self.warmup_end is not None:
+            self.warmup_end = pd.Timestamp(self.warmup_end)
         self.state = GridSharedState()
         self._base_position = int(params.get("base_position", 1000))
         self._trade_shares = int(params.get("trade_shares", 100))
@@ -94,6 +97,10 @@ class GridSharedEngine:
         self.state.day_amount += float(bar.get("amount", 0) or 0)
         self.state.day_volume += float(bar.get("volume", 0) or 0)
         self.state.prev_day_close = signal_close
+
+        # 预热段：warmup_end 之前只推进 daily_closes / 日线状态，不建仓、不交易。
+        if self.warmup_end is not None and pd.Timestamp(bar["time"]) < self.warmup_end:
+            return trades or None
 
         # 建底仓（首日第一根bar）
         if self.state.base_price is None:

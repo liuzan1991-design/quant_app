@@ -45,12 +45,43 @@ class MarketCollector:
     def _target_path(self, code: str) -> Path:
         return self.live_dir / f"stock_{code}_1m.csv"
 
-    def _write_atomic(self, code: str, df) -> int:
-        """原子写入：先写 .tmp 再 os.replace，避免撮合进程读到半截文件。"""
+    def _write_atomic(self, code: str, df, merge: bool = True) -> int:
+        """原子写入：先写 .tmp 再 os.replace，避免撮合进程读到半截文件。
+
+        merge=True 时，把新数据与已有文件按 time 去重合并（保留最新），
+        实现「历史 + 增量追加」而不覆盖历史起点。
+        """
         target = self._target_path(code)
         tmp = target.with_suffix(".tmp")
-        df.to_csv(tmp, index=False, encoding="utf-8-sig")
+        import pandas as pd  # noqa: PLC0415
+        new = pd.DataFrame(df)
+        if merge and target.exists():
+            existing = pd.read_csv(target, parse_dates=["time"])
+            merged = pd.concat([existing, new], ignore_index=True)
+            merged = merged.drop_duplicates(subset="time", keep="last").sort_values("time").reset_index(drop=True)
+            out = merged
+        else:
+            out = new
+        out.to_csv(tmp, index=False, encoding="utf-8-sig")
         tmp.replace(target)
+        return len(out)
+
+    def init_from_history(self, code: str, history_path: Optional[Path] = None) -> int:
+        """用历史 CSV 初始化 live 文件（观察期启动时只调用一次）。
+
+        之后 fetch_today 会在此基础上追加，实现「历史预热 + 增量追加不覆盖」。
+        """
+        target = self._target_path(code)
+        if target.exists():
+            return 0  # 已初始化，幂等
+        if history_path is None:
+            history_path = APP_DIR / "data" / f"stock_{code}_1m.csv"
+        history_path = Path(history_path)
+        if not history_path.exists():
+            raise FileNotFoundError(f"历史数据不存在：{history_path}")
+        import pandas as pd  # noqa: PLC0415
+        df = pd.read_csv(history_path, parse_dates=["time"])
+        self._write_atomic(code, df, merge=False)
         return len(df)
 
     # ---- 拉取（真实登录，dry_run 时跳过） ---------------------------------

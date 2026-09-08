@@ -64,6 +64,9 @@ class GridTradeStrategy(BaseStrategy):
         grid_step = grid_pct / 100.0
 
         raw_code = str((context or {}).get("code") or df.attrs.get("code", ""))
+        warmup_end = (context or {}).get("warmup_end") or p.pop("warmup_end", None)
+        if warmup_end is not None:
+            warmup_end = pd.Timestamp(warmup_end)
         prepared, corporate_dates, adjustment = prepare_signal_prices(df, raw_code)
         df = prepared.copy()
         df["date"] = pd.to_datetime(df["time"]).dt.date
@@ -101,6 +104,15 @@ class GridTradeStrategy(BaseStrategy):
             day = dates[i]
             h = hhmm[i]
             cur = closes[i]
+
+            # 预热段：warmup_end 之前只推进日线/账户状态，不建仓、不交易。
+            if warmup_end is not None and pd.Timestamp(ts) < warmup_end:
+                if day != prev_day:
+                    acc.new_day()
+                    prev_day = day
+                equity_curve.append({"time": ts, "equity": acc.equity(cur),
+                                     "close": cur, "cash": acc.cash, "position": acc.total})
+                continue
 
             if day != prev_day:
                 acc.new_day()

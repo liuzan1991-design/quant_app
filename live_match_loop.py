@@ -119,6 +119,10 @@ class Observer:
         else:
             from core.ma_swing_live import MaSwingLiveState
             self.engine.state = MaSwingLiveState.from_dict(state)
+            # 恢复后补 finalize：current_day 尚未进入 completed 的最后一天。
+            finalize = getattr(self.engine, "finalize_if_dirty", None)
+            if callable(finalize):
+                finalize()
 
     def load_signals(self) -> None:
         if self.signal_path is not None and self.signal_path.exists():

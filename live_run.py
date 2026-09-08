@@ -8,12 +8,23 @@
 """
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
+LOG_DIR = APP_DIR / "live_outputs" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOGGER = logging.getLogger("live_run")
+_LOGGER.setLevel(logging.INFO)
+if not _LOGGER.handlers:
+    _fh = logging.FileHandler(
+        LOG_DIR / f"live_{datetime.now():%Y%m%d}.log", encoding="utf-8")
+    _fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s"))
+    _LOGGER.addHandler(_fh)
 for _p in (str(APP_DIR), str(APP_DIR / "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -53,12 +64,14 @@ def main() -> None:
     quiet_rounds = 0
     last_seen = None
 
+    _LOGGER.info("== 观察期启动 == codes=%s", CODES)
     while True:
         # 采集当天实时数据
         try:
-            collector.run_once(CODES, datetime.now().strftime("%Y-%m-%d"))
+            collected = collector.run_once(CODES, datetime.now().strftime("%Y-%m-%d"))
+            _LOGGER.info("[collector] 采集完成 %s", collected)
         except Exception as exc:  # noqa: BLE001
-            print(f"[collector] 采集失败：{exc}")
+            _LOGGER.exception("[collector] 采集失败")
 
         # 撮合新 bar
         summary = match._run_once(observers, match.OUTPUT_DIR)
@@ -67,6 +80,7 @@ def main() -> None:
             obs.day_high_equity = max(obs.day_high_equity, equity)
             obs.equity_high = max(obs.equity_high, equity)
             obs.persist_all()
+        _LOGGER.info("[match] %s", summary)
         print(summary)
 
         # 收盘判定：数据最后 bar 到 14:59 后，连续无新 bar 才写摘要。
@@ -78,9 +92,11 @@ def main() -> None:
                 quiet_rounds = 0
             last_seen = latest
             if quiet_rounds >= CLOSE_QUIET_ROUNDS or _past_hard_close():
+                _LOGGER.info("== 收盘缓冲结束，写每日摘要 ==")
                 print("== 收盘缓冲结束，写每日摘要 ==")
                 for obs in observers:
-                    match._write_daily_summary(obs)
+                    summary_item = match._write_daily_summary(obs)
+                    _LOGGER.info("[daily] %s", summary_item)
                 break
 
         time.sleep(POLL_INTERVAL)

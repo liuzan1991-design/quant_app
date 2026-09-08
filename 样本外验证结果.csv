@@ -1,0 +1,6 @@
+﻿市场状态,训练最优策略,训练相对%,该策略样本外相对%,样本外实际最优,样本外最优相对%,策略是否一致
+深跌,ma_swing,18.3,43.0,ma_swing,43.0,True
+下跌,ma_swing,5.0,7.3,ma_swing,7.3,True
+震荡,grid_trade,-1.5,-0.7,grid_trade,-0.7,True
+温和上涨,grid_trade,-9.7,-8.3,grid_trade,-8.3,True
+大涨,grid_trade,-128.3,-83.4,sentiment_t,-81.8,False

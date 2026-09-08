@@ -85,6 +85,9 @@ class MaSwingLiveEngine:
                  corporate_action_dates: Optional[List[date]] = None):
         self.symbol = symbol
         self.params = dict(params)
+        self.warmup_end = self.params.pop("warmup_end", None)
+        if self.warmup_end is not None:
+            self.warmup_end = pd.Timestamp(self.warmup_end)
         self.strategy_id = strategy_id
         self.state = MaSwingLiveState()
         self.corporate_action_dates = set(corporate_action_dates or [])
@@ -133,7 +136,11 @@ class MaSwingLiveEngine:
             if position and position.quantity > 0:
                 # 快速路径在信号判断前已把当根真实最高价纳入移动止损跟踪。
                 self.state.highest_price = max(self.state.highest_price, high)
-            signals = self._signals_for_new_day(ts, execution_price, broker)
+            # 预热段：只推进 completed 日线，不产生交易信号。
+            if self.warmup_end is not None and pd.Timestamp(bar["time"]) < self.warmup_end:
+                signals = []
+            else:
+                signals = self._signals_for_new_day(ts, execution_price, broker)
         else:
             self.state.current_high = max(self.state.current_high, signal_high)
             self.state.current_low = min(self.state.current_low, signal_low)

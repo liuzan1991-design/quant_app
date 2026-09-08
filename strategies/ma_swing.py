@@ -77,6 +77,9 @@ class MaSwingStrategy(BaseStrategy):
                 raise ValueError(f"缺少行情字段：{col}")
 
         raw_code = str((context or {}).get("code") or df.attrs.get("code", ""))
+        warmup_end = (context or {}).get("warmup_end") or p.pop("warmup_end", None)
+        if warmup_end is not None:
+            warmup_end = pd.Timestamp(warmup_end)
         prepared, corporate_dates, adjustment = prepare_signal_prices(df, raw_code)
         bars = prepared.sort_values("time").reset_index(drop=True)
         bars["time"] = pd.to_datetime(bars["time"])
@@ -96,6 +99,17 @@ class MaSwingStrategy(BaseStrategy):
             ts = row["time"]
             day = row["date"]
             price = float(row["open"] if i in first_bar else row["close"])
+
+            # 预热段：warmup_end 之前只推进日线状态，不交易。
+            if warmup_end is not None and pd.Timestamp(ts) < warmup_end:
+                if day != prev_day:
+                    acc.new_day()
+                    prev_day = day
+                equity_curve.append({"time": ts, "equity": acc.equity(float(row["close"])),
+                                     "close": float(row["close"]), "cash": acc.cash,
+                                     "position": acc.total})
+                continue
+
             if day != prev_day:
                 acc.new_day()
                 prev_day = day

@@ -173,8 +173,8 @@ class Observer:
 
 
 def _engine_for(obs: Observer, df: pd.DataFrame):
+    obs.params.setdefault("warmup_end", str(TRADE_START_DATE.date()))
     if obs.strategy_id == "grid_trade":
-        obs.params.setdefault("warmup_end", str(TRADE_START_DATE.date()))
         return GridSharedLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id, df=df)
     prepared, events, _adj = prepare_signal_prices(df, obs.code)
     return MaSwingLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id,

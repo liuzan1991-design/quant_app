@@ -330,6 +330,11 @@ def _compare_signals(obs: Observer) -> dict:
 
 def _write_daily_summary(obs: Observer) -> dict:
     obs.backfill_signals_from_fills()
+    # 均线波段预热段最后一天需显式 finalize，否则 completed 少一根日线。
+    if obs.strategy_id == "ma_swing":
+        finalize = getattr(obs.engine, "finalize_if_dirty", None)
+        if callable(finalize):
+            finalize()
     equity = obs.broker.account.equity()
     day_pnl = equity - obs.day_start_equity
     day_dd = 0.0

@@ -183,6 +183,16 @@ class MaSwingLiveEngine:
             volume=self.state.current_volume,
         ))
 
+    def finalize_if_dirty(self) -> None:
+        """预热结束后，把尚未 finalize 的最后一个交易日推进 completed。
+
+        正常实时观察靠「下一交易日到来」触发 finalize；但预热段在最后一天结束，
+        没有下一根 bar，故必须显式补 finalize，否则 MA60/ATR 少一根日线。
+        """
+        if self.state.current_day is not None and (
+                not self.state.completed or self.state.completed[-1].day != self.state.current_day):
+            self._finalize_current_day()
+
     def _daily_frame(self) -> pd.DataFrame:
         return pd.DataFrame([vars(item) for item in self.state.completed]).set_index("day")
 

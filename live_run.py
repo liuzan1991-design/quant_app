@@ -143,8 +143,10 @@ def main() -> None:
                     "last_collected": last_collected,
                     "observers": {
                         f"{obs.code}×{obs.strategy_id}": {
-                            "latest_watermark": (obs.watermark.isoformat()
-                                                  if obs.watermark is not None else None),
+                            # 最新水位 = processed_times 里最大的已处理 bar 时间
+                            # （Observer 无 .watermark 属性，此前的 AttributeError 即因此）
+                            "latest_watermark": (max(obs.processed_times).isoformat()
+                                                  if obs.processed_times else None),
                             "orders": len(obs.broker.orders),
                             "fills": len(obs.broker.fills),
                         }

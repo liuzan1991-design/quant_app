@@ -45,7 +45,8 @@ except Exception:
 import live_match_loop as match  # noqa: E402
 from core.market_collector import MarketCollector  # noqa: E402
 
-CODES = [c for c, _ in match.COMBOS]
+# COMBOS 里同一 code 可能对应多个策略，去重保留出现顺序（日志里不再出现重复 code）。
+CODES = list(dict.fromkeys(c for c, _ in match.COMBOS))
 POLL_INTERVAL = 30
 # 14:59 最后一根 bar 后，连续这么多次采集都没有新 bar，才判定收盘。
 CLOSE_QUIET_ROUNDS = 6

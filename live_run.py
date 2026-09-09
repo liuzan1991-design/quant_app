@@ -30,6 +30,18 @@ for _p in (str(APP_DIR), str(APP_DIR / "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# 控制台输出重定向：计划任务下 stdout/stderr 无处可去，未捕获 traceback 会静默丢失
+# （2026-09-09 12:43 进程无声死亡，就是崩溃现场没留痕）。这里全部落到文件。
+_CONSOLE_LOG = open(LOG_DIR / f"console_{datetime.now():%Y%m%d}.log",
+                    "a", buffering=1, encoding="utf-8")
+sys.stdout = _CONSOLE_LOG
+sys.stderr = _CONSOLE_LOG
+try:
+    import faulthandler
+    faulthandler.enable(_CONSOLE_LOG)  # 段错误等硬崩溃也留 Python 层栈
+except Exception:
+    pass
+
 import live_match_loop as match  # noqa: E402
 from core.market_collector import MarketCollector  # noqa: E402
 
@@ -73,28 +85,45 @@ def main() -> None:
     health_path = match.OUTPUT_DIR / "health.json"
 
     _LOGGER.info("== 观察期启动 == codes=%s", CODES)
+    match_errors = 0  # 连续撮合异常计数；超过阈值说明状态已坏，退出交计划任务重启
     while True:
         # 采集当天实时数据
         try:
             collected = collector.run_once(CODES, datetime.now().strftime("%Y-%m-%d"))
             last_collected = dict(collected) if isinstance(collected, dict) else {}
             _LOGGER.info("[collector] 采集完成 %s", collected)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             collect_errors += 1
             _LOGGER.exception("[collector] 采集失败")
 
-        # 撮合新 bar
-        summary = match._run_once(observers, match.OUTPUT_DIR)
-        for obs in observers:
-            equity = obs.broker.account.equity()
-            obs.day_high_equity = max(obs.day_high_equity, equity)
-            obs.equity_high = max(obs.equity_high, equity)
-            obs.persist_all()
-        _LOGGER.info("[match] %s", summary)
-        print(summary)
+        # 撮合新 bar：单轮异常只记日志不退出，下一轮从持久化状态继续。
+        try:
+            summary = match._run_once(observers, match.OUTPUT_DIR)
+            for obs in observers:
+                equity = obs.broker.account.equity()
+                obs.day_high_equity = max(obs.day_high_equity, equity)
+                obs.equity_high = max(obs.equity_high, equity)
+                try:
+                    obs.persist_all()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("[persist] %s 持久化失败", obs.strategy_id)
+            _LOGGER.info("[match] %s", summary)
+            print(summary)
+            match_errors = 0
+        except Exception:  # noqa: BLE001
+            match_errors += 1
+            _LOGGER.exception("[match] 撮合循环异常（连续第 %d 次）", match_errors)
+            if match_errors >= 10:
+                _LOGGER.critical("[match] 连续 %d 轮撮合异常，退出交由计划任务重启",
+                                 match_errors)
+                raise
 
         # 收盘判定：数据最后 bar 到 14:59 后，连续无新 bar 才写摘要。
-        latest = _latest_bar_time(observers)
+        try:
+            latest = _latest_bar_time(observers)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("[latest] 读取最新bar时间失败，本轮跳过收盘判定")
+            latest = None
         if latest is not None and latest.time() >= datetime.strptime("14:59", "%H:%M").time():
             if last_seen is not None and latest == last_seen:
                 quiet_rounds += 1
@@ -131,4 +160,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        _LOGGER.exception("== 主循环致命退出（非零码，交由计划任务重启）==")
+        raise SystemExit(1)

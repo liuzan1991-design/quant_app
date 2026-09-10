@@ -9,7 +9,7 @@ Write-Host '==================== Check ====================' -ForegroundColor Cy
 Write-Host ("Time: {0}" -f $now.ToString('yyyy-MM-dd HH:mm:ss dddd'))
 Write-Host ''
 
-# 1. 进程
+# 1. 进程（硬判据）
 $proc = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match 'live_run.py' }
 if ($proc) {
     Write-Host ("[OK] live_run.py running. PID={0} start={1}" -f $proc.ProcessId, $proc.CreationDate.ToString('HH:mm:ss')) -ForegroundColor Green
@@ -29,21 +29,19 @@ if ($task) {
 }
 Write-Host ''
 
-# 3. 日志：解析内容里的时间戳，而不是文件元数据时间
+# 3. 日志内容时间戳（解析内容，不用文件元数据）
 $todayLog = Get-ChildItem $logDir -Filter 'live_*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $lastTs = $null
 if ($todayLog) {
     $lastLine = Get-Content $todayLog.FullName -Tail 1
-    # 日志行格式：2026-09-10 08:24:58,410 [INFO] ...
     if ($lastLine -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
         $lastTs = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null)
     }
     Write-Host ("Log File   : {0}" -f $todayLog.Name) -ForegroundColor Yellow
-    Write-Host ("File mtime : {0}" -f $todayLog.LastWriteTime.ToString('HH:mm:ss')) -ForegroundColor Gray
     if ($lastTs) {
         $gap = ($now - $lastTs)
         Write-Host ("Log content: {0}" -f $lastTs.ToString('HH:mm:ss')) -ForegroundColor Yellow
-        Write-Host ("Gap        : {0} min {1} sec" -f $gap.Minutes, $gap.Seconds) -ForegroundColor Yellow
+        Write-Host ("Gap        : {0} min {1} sec" -f [int]$gap.TotalMinutes, $gap.Seconds) -ForegroundColor Yellow
     } else {
         Write-Host 'Cannot parse timestamp from last line' -ForegroundColor Gray
     }
@@ -52,13 +50,30 @@ if ($todayLog) {
 }
 Write-Host ''
 
-# 4. 结论（用日志内容时间判断，容差 5 分钟）
+# 4. 结论：新鲜度优先。07:30-07:50 只作 stale 时的诊断提示，绝不单独触发 BAD
+#    （否则修复成功后、你恰好在 07:40 查看时会误报 BAD）
 Write-Host '==================== Verdict ====================' -ForegroundColor Cyan
-if ($proc -and $lastTs -and ((($now - $lastTs).TotalMinutes) -lt 5)) {
+$inDeathWindow = $false
+$gapMin = 9999
+if ($lastTs) {
+    $t = $lastTs.TimeOfDay
+    if ($t -ge [timespan]::FromHours(7.5) -and $t -le [timespan]::FromHours(7.833)) { $inDeathWindow = $true }
+    $gapMin = ($now - $lastTs).TotalMinutes
+}
+
+if (-not $proc) {
+    Write-Host 'BAD: process dead. Note the time, then check LastResult (1067?).' -ForegroundColor Red
+} elseif (-not $lastTs) {
+    Write-Host 'WARN: process alive but log timestamp unreadable.' -ForegroundColor Yellow
+} elseif ($gapMin -gt 15) {
+    if ($inDeathWindow) {
+        Write-Host ('BAD: log stopped in 07:30-07:50 death window and is stale {0} min. Suspect second trigger.' -f [math]::Round($gapMin,0)) -ForegroundColor Red
+    } else {
+        Write-Host ('BAD: log stale {0} min. Process may be zombie.' -f [math]::Round($gapMin,0)) -ForegroundColor Red
+    }
+} elseif ($gapMin -le 5) {
     Write-Host 'GOOD: process alive, log fresh. Fix works.' -ForegroundColor Green
-} elseif ($proc) {
-    Write-Host 'WARN: process alive but log content stale > 5 min.' -ForegroundColor Yellow
 } else {
-    Write-Host 'BAD: process dead. Note time, check LastResult (1067?).' -ForegroundColor Red
+    Write-Host 'WARN: log gap 5-15 min. Possibly off-hours, re-check at open.' -ForegroundColor Yellow
 }
 Write-Host ''

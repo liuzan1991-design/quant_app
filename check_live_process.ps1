@@ -2,7 +2,9 @@
 $ErrorActionPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$logDir = 'D:\Documents\ChatGPT\daily work\日内做T策略\quant_app\live_outputs\logs'
+$base = 'D:\Documents\ChatGPT\daily work\日内做T策略\quant_app'
+$logDir = Join-Path $base 'live_outputs\logs'
+$hbPath = Join-Path $base 'live_outputs\heartbeat.json'
 $now = Get-Date
 
 Write-Host '==================== Check ====================' -ForegroundColor Cyan
@@ -29,7 +31,22 @@ if ($task) {
 }
 Write-Host ''
 
-# 3. 日志内容时间戳（解析内容，不用文件元数据）
+# 3. 心跳（启动即死探测：登录失败/断网时 last_success_at 为空）
+if (Test-Path $hbPath) {
+    $hb = Get-Content $hbPath -Raw | ConvertFrom-Json
+    $hbDate = if ($hb.date) { $hb.date } else { '-' }
+    $hbStatus = if ($hb.status) { $hb.status } else { '-' }
+    $hbLast = if ($hb.last_success_at) { $hb.last_success_at } else { '(无)' }
+    Write-Host ("Heartbeat  : date={0} status={1} last_success={2}" -f $hbDate, $hbStatus, $hbLast) -ForegroundColor Yellow
+    if (-not $hb.last_success_at) {
+        Write-Host '  !!! 今日已启动但从未成功采集（嫌疑：登录失败 / 断网 / 凭证）' -ForegroundColor Red
+    }
+} else {
+    Write-Host 'Heartbeat  : (无) 今日可能未启动' -ForegroundColor Gray
+}
+Write-Host ''
+
+# 4. 日志内容时间戳（解析内容，不用文件元数据）
 $todayLog = Get-ChildItem $logDir -Filter 'live_*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $lastTs = $null
 if ($todayLog) {
@@ -50,8 +67,7 @@ if ($todayLog) {
 }
 Write-Host ''
 
-# 4. 结论：新鲜度优先。07:30-07:50 只作 stale 时的诊断提示，绝不单独触发 BAD
-#    （否则修复成功后、你恰好在 07:40 查看时会误报 BAD）
+# 5. 结论：新鲜度优先。07:30-07:50 只作 stale 时的诊断提示，绝不单独触发 BAD
 Write-Host '==================== Verdict ====================' -ForegroundColor Cyan
 $inDeathWindow = $false
 $gapMin = 9999

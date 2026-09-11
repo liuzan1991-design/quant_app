@@ -35,16 +35,45 @@ def load_credentials() -> dict:
     return json.loads(CRED_FILE.read_text(encoding="utf-8"))
 
 
+# 登录软超时（秒）：断网时 ad.login() 会无限阻塞（第三方 SDK 不设超时），
+# 必须在线程里 join 超时，否则整个采集进程卡死在登录、不抛异常、无 traceback。
+_LOGIN_TIMEOUT = 45
+
+
 def _login():
+    import socket
+    import threading
     import AmazingData as ad
     if _AD_CACHE.get("ad") is not None:
         return _AD_CACHE["ad"]
     cred = load_credentials()
-    with suppress_sdk_output():
-        ad.login(username=cred["username"], password=cred["password"],
-                 host=cred["host"], port=int(cred["port"]))
-    _AD_CACHE["ad"] = ad
-    return ad
+
+    result: dict = {}
+
+    def _worker():
+        # 底层 socket 默认超时：兜底 connect/recv 无限阻塞（SDK 可能显式 timeout=None）。
+        old = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(30)
+        try:
+            with suppress_sdk_output():
+                ad.login(username=cred["username"], password=cred["password"],
+                         host=cred["host"], port=int(cred["port"]))
+            result["ad"] = ad
+        except Exception as exc:  # noqa: BLE001
+            result["err"] = exc
+        finally:
+            socket.setdefaulttimeout(old)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=_LOGIN_TIMEOUT)
+    if "err" in result:
+        raise result["err"]
+    if "ad" not in result:
+        raise TimeoutError(
+            f"星耀登录超时（>{_LOGIN_TIMEOUT}秒），疑似网络不通或服务器无响应")
+    _AD_CACHE["ad"] = result["ad"]
+    return _AD_CACHE["ad"]
 
 
 def fetch_kline(code: str, begin: str, end: str, period: str = "min1") -> pd.DataFrame:

@@ -72,18 +72,60 @@ def _past_hard_close() -> bool:
     return (now.hour, now.minute) >= (CLOSE_HARD_LOCAL_HOUR, CLOSE_HARD_LOCAL_MINUTE)
 
 
+def _write_heartbeat(path: Path, started_at: datetime, status: str,
+                     last_success_at: datetime | None, collect_errors: int = 0,
+                     match_errors: int = 0) -> None:
+    """启动心跳：一启动就落盘，采集成功持续更新。
+
+    用途：health.json 只在收盘写，盘中"启动即死 / 采集停摆"靠它暴露——
+    - 没有 heartbeat.json            → 今天根本没启动（计划任务漏触发）；
+    - started_at 有、last_success_at 为 None → 启动了但从未采到数据（登录失败/网络断）；
+    - last_success_at 停在某个时刻    → 从那之后采集停摆（中途断网/崩溃）。
+    """
+    try:
+        heartbeat = {
+            "date": started_at.strftime("%Y-%m-%d"),
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "status": status,
+            "last_success_at": (last_success_at.isoformat(timespec="seconds")
+                                if last_success_at is not None else None),
+            "collect_errors": collect_errors,
+            "match_errors": match_errors,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        path.write_text(json.dumps(heartbeat, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception("[heartbeat] 心跳写入失败")
+
+
 def main() -> None:
-    collector = MarketCollector(dry_run=False)
-    # 观察期启动时，用历史 CSV 初始化 live 文件（幂等），之后采集追加不覆盖。
-    for code in CODES:
-        collector.init_from_history(code)
-    observers = match._build_observers()
+    started_at = datetime.now()
+    health_path = match.OUTPUT_DIR / "health.json"
+    heartbeat_path = match.OUTPUT_DIR / "heartbeat.json"
+    # 启动心跳：即使随后 init/build_observers/login 卡死或崩，也能看出"今天启动过但没采到数据"。
+    _write_heartbeat(heartbeat_path, started_at, status="starting",
+                     last_success_at=None, collect_errors=0, match_errors=0)
+
+    # 启动段之前不在 try/except 里，断网/损坏曾导致静默退出、无 traceback。
+    try:
+        collector = MarketCollector(dry_run=False)
+        # 观察期启动时，用历史 CSV 初始化 live 文件（幂等），之后采集追加不覆盖。
+        for code in CODES:
+            collector.init_from_history(code)
+        observers = match._build_observers()
+    except Exception:
+        _LOGGER.exception("== 启动段初始化失败（init_from_history / build_observers）==")
+        _write_heartbeat(heartbeat_path, started_at, status="failed",
+                         last_success_at=None, collect_errors=0, match_errors=0)
+        raise
+
     quiet_rounds = 0
     last_seen = None
     # 健康标记累积：采集异常次数 + 各组合累计订单/成交/最新水位。
     collect_errors = 0
     last_collected = {}
-    health_path = match.OUTPUT_DIR / "health.json"
+    last_success_at = None
 
     _LOGGER.info("== 观察期启动 == codes=%s", CODES)
     match_errors = 0  # 连续撮合异常计数；超过阈值说明状态已坏，退出交计划任务重启
@@ -92,10 +134,18 @@ def main() -> None:
         try:
             collected = collector.run_once(CODES, datetime.now().strftime("%Y-%m-%d"))
             last_collected = dict(collected) if isinstance(collected, dict) else {}
+            last_success_at = datetime.now()
+            _write_heartbeat(heartbeat_path, started_at, status="running",
+                             last_success_at=last_success_at,
+                             collect_errors=collect_errors, match_errors=match_errors)
             _LOGGER.info("[collector] 采集完成 %s", collected)
         except Exception:  # noqa: BLE001
             collect_errors += 1
             _LOGGER.exception("[collector] 采集失败")
+            # 采集失败也落心跳（last_success_at 保持上次成功值），让断网可从 collect_errors 观测。
+            _write_heartbeat(heartbeat_path, started_at, status="running",
+                             last_success_at=last_success_at,
+                             collect_errors=collect_errors, match_errors=match_errors)
 
         # 撮合新 bar：单轮异常只记日志不退出，下一轮从持久化状态继续。
         try:

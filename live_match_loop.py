@@ -332,6 +332,34 @@ def _compare_signals(obs: Observer) -> dict:
     }
 
 
+def _upsert_daily_history(root: Path, payload: dict) -> None:
+    """把当日摘要并入 daily_history.jsonl（同一天同策略幂等覆盖，按日期排序）。
+
+    观察期需要跨日横向对比，单个 daily_summary.json 会被每日覆盖导致历史丢失，
+    故用追加式台账累积；同日同策略重复写（重启/补跑）只保留最新一条，不产生重复。
+    """
+    hist = root / "daily_history.jsonl"
+    rows: List[dict] = []
+    if hist.exists():
+        for line in hist.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (rec.get("date") == payload["date"]
+                    and rec.get("strategy") == payload["strategy"]
+                    and rec.get("code") == payload["code"]):
+                continue  # 同日同策略旧记录由新记录替代
+            rows.append(rec)
+    rows.append(payload)
+    rows.sort(key=lambda r: (r.get("date", ""), r.get("code", ""), r.get("strategy", "")))
+    hist.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                    encoding="utf-8")
+
+
 def _write_daily_summary(obs: Observer) -> dict:
     obs.backfill_signals_from_fills()
     # 均线波段预热段最后一天需显式 finalize，否则 completed 少一根日线。
@@ -370,8 +398,14 @@ def _write_daily_summary(obs: Observer) -> dict:
         "note": "绝对收益不与回测直接比，只比策略行为一致性",
         "signal_compare": _compare_signals(obs),
     }
-    p = obs.store.root / "daily_summary.json"
-    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    # 按天留档：跨日不再覆盖，观察期历史永久可回溯（09-09 曾因覆盖丢失两天摘要）
+    (obs.store.root / f"daily_summary_{payload['date'].replace('-', '')}.json").write_text(
+        body, encoding="utf-8")
+    # 最新一天副本：保留 daily_summary.json，兼容既有引用（检查脚本 / 文档）
+    (obs.store.root / "daily_summary.json").write_text(body, encoding="utf-8")
+    # 追加台账：daily_history.jsonl，便于横向汇总与复盘
+    _upsert_daily_history(obs.store.root, payload)
     return payload
 
 

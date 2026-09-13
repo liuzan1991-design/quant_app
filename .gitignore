@@ -7,7 +7,9 @@ __pycache__/
 .ruff_cache/
 
 # 数据与运行状态（不进 git，行情/账户快照本地才有）
-data/
+# 例外：观察池台账是元数据（记录池里有谁 + 验数结论），需要留档
+data/*
+!data/pool.jsonl
 live_outputs/
 test_outputs/
 reports/

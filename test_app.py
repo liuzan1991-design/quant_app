@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
-"""AppTest 冒烟测试：渲染 + 点击开始回测。"""
+"""AppTest 冒烟测试：渲染 + 点击开始回测。
+
+UI 测试（streamlit AppTest），分钟级，标记 slow —— 不进日常回归，
+需要时用 `pytest -m "not external"` 跑（含慢档）。
+"""
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 
@@ -76,6 +81,12 @@ def main():
     data_file = Path(r"D:\Documents\ChatGPT\daily work\日内做T策略\quant_app\data\stock_601619_1m.csv")
     assert data_file.exists() and data_file.stat().st_size > 1000000
     print("P1 数据增量更新测试通过")
+
+
+@pytest.mark.slow
+def test_app_ui():
+    """pytest 入口：包装原 main()（AppTest UI 冒烟，分钟级，进慢档）。"""
+    main()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""验证星耀数智增量拉取链路（小范围）。"""
+"""验证星耀数智增量拉取链路（小范围）。
+
+🔴 禁止包成 pytest 用例 —— 本脚本会 `ad.login()` 占用 AmazingData 单点登录，
+与观察期 live_run.py 的采集进程互斥。若被作为测试执行，会踢掉当天采集。
+手动跑也必须避开观察期采集窗口（本机 04:30~10:10）。
+（同类排除项：test_industry.py / test_sentiment_data.py / test_down_market.py）
+"""
 import sys
 from pathlib import Path
 

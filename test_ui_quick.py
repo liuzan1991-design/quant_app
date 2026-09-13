@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""UI 打磨后快速验证：渲染 + 回测 + 指标卡。"""
+"""UI 打磨后快速验证：渲染 + 回测 + 指标卡。
+
+UI 测试（streamlit AppTest），分钟级，标记 slow —— 不进日常回归。
+"""
+import pytest
 from streamlit.testing.v1 import AppTest
 
 
@@ -68,6 +72,12 @@ def main():
     print("均线波段回测:", f"总收益{res4.total_return*100:+.2f}% "
           f"交易{len(res4.trades)}笔")
     print("UI 快速验证通过")
+
+
+@pytest.mark.slow
+def test_ui_quick_smoke():
+    """pytest 入口：包装原 main()（AppTest UI 冒烟，分钟级，进慢档）。"""
+    main()
 
 
 if __name__ == "__main__":

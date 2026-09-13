@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""批量回测界面测试：多股票 × 多策略。"""
+"""批量回测界面测试：多股票 × 多策略。
+
+UI 测试（streamlit AppTest），分钟级，标记 slow —— 不进日常回归。
+"""
+import pytest
 from streamlit.testing.v1 import AppTest
 
 
@@ -34,6 +38,12 @@ def main():
     print("批量回测结果行数:", len(b["df"]))
     print(b["df"][["股票", "策略", "总收益%", "股票涨跌%", "超额收益%"]].to_string(index=False))
     print("批量回测界面测试通过")
+
+
+@pytest.mark.slow
+def test_batch_ui_smoke():
+    """pytest 入口：包装原 main()（AppTest UI 冒烟，分钟级，进慢档）。"""
+    main()
 
 
 if __name__ == "__main__":

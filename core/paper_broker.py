@@ -93,6 +93,19 @@ class PaperBroker:
         self.orders[request.client_order_id] = order
         decision = self.risk_manager.evaluate(request, self.account, market, now)
         if not decision.passed:
+            # H9 观测增强（纯新增，不改任何交易行为）：风控拒绝此前是静默的，
+            # 无法区分「策略无信号」与「信号被风控拒」。结构化拒绝原因写入审计日志，
+            # 由 PaperStateStore.flush_new_audit() 持久化到 paper_audit.jsonl。
+            self.audit_log.append({
+                "time": now,
+                "client_order_id": request.client_order_id,
+                "event": "RISK_REJECTED",
+                "side": request.side.value,
+                "symbol": request.symbol,
+                "quantity": request.quantity,
+                "strategy_id": request.strategy_id,
+                "violations": [item.code for item in decision.violations],
+            })
             self._transition(order, OrderStatus.REJECTED, now, decision.reason)
             return order
         self._transition(order, OrderStatus.PENDING_SUBMIT, now)

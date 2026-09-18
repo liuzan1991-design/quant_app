@@ -32,6 +32,7 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from core.ma_swing_live import DailyBar, MaSwingLiveEngine, MaSwingLiveState
+from core.ma_swing_signals import build_daily_signal_table
 from strategies.ma_swing import MaSwingStrategy
 
 
@@ -143,22 +144,69 @@ def test_from_dict_dedupes_polluted_state_keeping_last():
 
 
 def test_volume_ratio_uses_true_daily_volume():
-    """验收判据：去重后量比恢复原值（不再被放大）。
+    """验收判据：去重后量比恢复原值，且 `breakout_entry` 的量条件不得被误翻为 True。
 
-    原缺陷使重复日 volume 翻倍，20 日均量被抬高约 1.25 倍、当日量翻倍，
-    净效果是量比被放大 1.55–1.85 倍。此处以 09-14 为样本锁定。
+    ⚠️ 本用例为**真实回归测试**，走完整生产链路：
+        污染状态字典 → `MaSwingLiveState.from_dict()`（读取侧去重）
+        → `engine._daily_frame()`（生产取数）→ `build_daily_signal_table()`（生产判据）
+        → 读 `breakout_entry`。
+
+    首版此用例用占位数字 (`[25_000_000.0] * 20`) 自行算了一遍除法再断言相等，
+    属**同义反复**，不具备防回归能力（由外部审查指出，2026-09-18 重写）。
+
+    H8 机制：重复日 `volume` 经 `groupby("date").sum()` 精确 ×2；20 日均量因
+    窗口内仅部分日重复而抬高约 1.25~1.3 倍（净效果量比放大 1.55~1.85 倍）。
+    下方用 25 天缓涨序列 + 末日放量突破价格前高，**隔离出量条件**，
+    使量比是否被放大直接决定 `breakout_entry` 真值。
     """
-    # 09-14 真实全天量 27,183,039；原缺陷下该值被写两遍。
-    real_volume = 27_183_039.0
-    prev_twenty_real = [25_000_000.0] * 20          # 占位：仅验证聚合口径
-    polluted = real_volume * 2.0
-    deduped = real_volume
+    params = MaSwingStrategy.default_params()
+    n_days = 25
+    # 价格缓涨：末日 close=124 > 前 20 日最高 123 ⇒ 价格条件成立，只剩量条件可翻转
+    rows = []
+    for i in range(n_days):
+        close = 100.0 + i
+        rows.append({"day": f"2026-08-{i + 1:02d}", "open": close, "high": close,
+                     "low": close, "close": close, "volume": 1_000_000.0})
 
-    assert polluted != deduped
-    assert deduped == real_volume
-    # 量比口径：当日量 / 前 20 日均量。去重后分子不得再翻倍。
-    ratio_deduped = deduped / (sum(prev_twenty_real) / len(prev_twenty_real))
-    assert abs(ratio_deduped - (real_volume / 25_000_000.0)) < 1e-9
+    # 污染形态：复刻 H8 实际形态（观察期最后 7 天被写两遍）
+    polluted_rows = rows + rows[-7:]
+    assert len(polluted_rows) == 32 and len({r["day"] for r in polluted_rows}) == 25
+
+    # —— 走生产链路：from_dict 去重 → _daily_frame → 生产判据 ——
+    state = MaSwingLiveState.from_dict({
+        "current_day": "2026-08-26", "current_volume": 0.0, "completed": polluted_rows,
+    })
+    assert len(state.completed) == n_days, "读取侧应去重为 25 条"
+
+    engine = _engine()
+    engine.state = state
+    daily = engine._daily_frame().reset_index().rename(columns={"day": "time"})
+    # ⚠️ 不能只看 daily["volume"].iloc[-1]——`_daily_frame()` 是**未聚合的原始帧**，
+    # 重复条目不会改变末行取值，那样写等于假断言（首版即踩此坑，靠变异测试发现）。
+    # 真正有判别力的是下面两条：源帧日期唯一 + 按生产过程聚合后的当日量。
+    assert daily["time"].is_unique, "生产取数帧不允许存在重复日期"
+    aggregated = daily.groupby(daily["time"])["volume"].sum()
+    assert aggregated.iloc[-1] == 1_000_000.0, \
+        f"聚合后当日量不得被重复写入放大，实际 {aggregated.iloc[-1]:,.0f}"
+
+    signals = build_daily_signal_table(daily, params)
+    avg_volume = aggregated.rolling(20, min_periods=20).mean().shift(1).iloc[-1]
+    ratio = aggregated.iloc[-1] / avg_volume
+    assert abs(ratio - 1.0) < 1e-9, f"去重后量比应恰为 1.0，实际 {ratio:.3f}"
+    assert not bool(signals["breakout_entry"].iloc[-1]), \
+        "量比 1.0 < 门槛 1.3，量条件必须为 False"
+
+    # —— 对照：若重复未被去掉（即 H8 未修），量比被放大到 ~1.54，量条件被误翻为 True ——
+    # 生产判据要求 time 列，故此处把 day 改名为 time（与 _daily_frame().reset_index() 一致）
+    polluted_daily = pd.DataFrame(polluted_rows).rename(columns={"day": "time"})
+    polluted_agg = (polluted_daily.assign(d=pd.to_datetime(polluted_daily["time"]))
+                    .groupby("d")["volume"].sum())
+    polluted_avg = polluted_agg.rolling(20, min_periods=20).mean().shift(1).iloc[-1]
+    polluted_ratio = polluted_agg.iloc[-1] / polluted_avg
+    polluted_signals = build_daily_signal_table(polluted_daily, params)
+    assert polluted_ratio > 1.5, f"污染量比应被放大到 1.5 以上，实际 {polluted_ratio:.3f}"
+    assert bool(polluted_signals["breakout_entry"].iloc[-1]), \
+        "污染下量条件应被误翻为 True（本对照证明该用例确有防回归能力）"
 
 
 def main() -> None:

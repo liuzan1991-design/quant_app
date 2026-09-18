@@ -3,8 +3,14 @@
 
 与 `strategies/grid_trade.py` 的快速路径保持口径一致：
 - 盘中 VWAP 用当日累计量额比（截至当前bar，无未来数据）；
-- 趋势防御同样只使用已完成交易日，但因为快速路径用 `pd.Timestamp(day)` 去查
-  `date` 键字典，实际永远拿不到（False），这里显式复刻该行为以保证逐笔对齐。
+- 趋势防御同样只使用已完成交易日（`daily_closes` 只累积已收官的交易日收盘），
+  两条路径均为**真实计算**：快速路径用 `trend_defense.get(day)`（键为 `date`），
+  增量路径由 `_trend_defense_active()` 复刻同一 MA/slope 判定。
+
+2026-09-18 更正：本文件此前注释称「快速路径用 `pd.Timestamp(day)` 查 `date` 键字典，
+实际永远拿不到（False），这里显式复刻该行为」——该描述**与事实不符**：
+git 全历史检索 `trend_defense.get(pd.Timestamp` 零命中，首次入库（ff6f4fe）即为正确的
+`day` 类型；且 `_trend_defense_active()` 是真实计算而非返回 False。原注释已删除。
 """
 from __future__ import annotations
 

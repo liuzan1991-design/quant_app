@@ -59,6 +59,25 @@ class MaSwingLiveState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "MaSwingLiveState":
+        completed = [
+            DailyBar(day=date.fromisoformat(item["day"]), open=float(item["open"]),
+                     high=float(item["high"]), low=float(item["low"]),
+                     close=float(item["close"]), volume=float(item["volume"]))
+            for item in d.get("completed", [])
+        ]
+        # 修复 H8：历史状态文件可能含重复日期（每日 04:30 重启 + 次日 day 切换各写一次）。
+        # 按日去重并保留**最后一条**——最后一条是当日完整数据，靠前的是盘中重启产生的
+        # 半日快照。保留错误的那条会把不完整的成交量固化成"真实日线"。
+        deduped: List[DailyBar] = []
+        seen: Dict[date, int] = {}
+        for item in completed:
+            if item.day in seen:
+                deduped[seen[item.day]] = item
+            else:
+                seen[item.day] = len(deduped)
+                deduped.append(item)
+        # 非相邻重复会让"原位覆盖"破坏升序，这里显式重排，保证 MA/ATR 的时序口径。
+        deduped.sort(key=lambda item: item.day)
         return cls(
             current_day=date.fromisoformat(d["current_day"]) if d.get("current_day") else None,
             current_open=float(d.get("current_open", 0.0)),
@@ -66,12 +85,7 @@ class MaSwingLiveState:
             current_low=float(d.get("current_low", 0.0)),
             current_close=float(d.get("current_close", 0.0)),
             current_volume=float(d.get("current_volume", 0.0)),
-            completed=[
-                DailyBar(day=date.fromisoformat(item["day"]), open=float(item["open"]),
-                         high=float(item["high"]), low=float(item["low"]),
-                         close=float(item["close"]), volume=float(item["volume"]))
-                for item in d.get("completed", [])
-            ],
+            completed=deduped,
             entry_day=date.fromisoformat(d["entry_day"]) if d.get("entry_day") else None,
             highest_price=float(d.get("highest_price", 0.0)),
             last_signal_day=date.fromisoformat(d["last_signal_day"]) if d.get("last_signal_day") else None,
@@ -174,24 +188,38 @@ class MaSwingLiveEngine:
         self.state.processed_fill_count = len(fills)
 
     def _finalize_current_day(self) -> None:
-        self.state.completed.append(DailyBar(
+        """把当前交易日推进到 completed。
+
+        修复 H8：改为**幂等 upsert**——若 completed 末尾已是同一天，则**覆盖**而非追加。
+        原实现无条件 append，导致同一天出现两条：
+          - 每日 04:30 重启时 `restore_engine_state()` 先补一次 finalize；
+          - 次日首根 bar 走 `current_day != day` 分支又 finalize 一次。
+        重复条目经 `groupby("date").sum()` 后使成交量翻倍，进而放大 20 日均量判据。
+        覆盖语义同时保证盘中重启产生的半日快照会被当日完整数据升级。
+        """
+        if self.state.current_day is None:
+            return
+        bar = DailyBar(
             day=self.state.current_day,
             open=self.state.current_open,
             high=self.state.current_high,
             low=self.state.current_low,
             close=self.state.current_close,
             volume=self.state.current_volume,
-        ))
+        )
+        if self.state.completed and self.state.completed[-1].day == bar.day:
+            self.state.completed[-1] = bar
+            return
+        self.state.completed.append(bar)
 
     def finalize_if_dirty(self) -> None:
         """预热结束后，把尚未 finalize 的最后一个交易日推进 completed。
 
         正常实时观察靠「下一交易日到来」触发 finalize；但预热段在最后一天结束，
         没有下一根 bar，故必须显式补 finalize，否则 MA60/ATR 少一根日线。
+        幂等性由 `_finalize_current_day()` 的 upsert 语义保证（见 H8）。
         """
-        if self.state.current_day is not None and (
-                not self.state.completed or self.state.completed[-1].day != self.state.current_day):
-            self._finalize_current_day()
+        self._finalize_current_day()
 
     def _daily_frame(self) -> pd.DataFrame:
         return pd.DataFrame([vars(item) for item in self.state.completed]).set_index("day")

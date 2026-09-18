@@ -1,5 +1,44 @@
-streamlit>=1.40
-plotly>=5.20
-pandas>=2.0
-numpy>=1.24
-numba>=0.60
+# quant_app 依赖声明
+# ---------------------------------------------------------------------------
+# 生成依据：对**全部生产代码**做静态 import 扫描（2026-09-18），版本取本机实际安装版本。
+#   ⚠️ 扫描范围必须同时覆盖两个位置，漏掉任一个都会得出错误结论：
+#      · quant_app\**\*.py            （应用层）
+#      · ..\*.py                      （引擎层：backtest_generic.py 等，在上级目录）
+#   本文件曾因"只扫 quant_app"而误判 numba/matplotlib 为多余依赖 —— 见 §备注。
+#
+# 解释器：固定使用 D:\Anaconda3\python.exe
+#   （WorkBuddy 托管的 Python 没有 pandas，不能用来跑本项目）
+#
+# 安装：D:\Anaconda3\python.exe -m pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
+# ===== 生产路径必需 =====
+pandas==2.3.3
+numpy==2.3.5
+numba==0.67.0            # 引擎加速：backtest_generic.py:20 `from numba import njit`，:205 @njit(cache=True)
+AmazingData==1.1.9       # 数据源 SDK：core/data_fetch.py 等 9 处。缺失 = 取不到数（命脉）
+streamlit==1.51.0        # 前端 app.py / ui/
+plotly==6.3.0            # 全部图表（ui/charts.py、core/report.py、gen_batch_report.py）
+
+# ===== 可选 / 单脚本需要 =====
+matplotlib==3.10.6       # 仅回测出图（backtest_generic.py:997、backtest_300319.py:595），且在 try 里 ⇒ 失败不阻断
+requests==2.32.5         # 仅 fetch_stock_data.py（一次性取数脚本）
+akshare==1.18.84         # 仅 build_stock_list.py
+pypinyin==0.55.0         # 仅 build_stock_list.py（股票名转拼音）
+
+# ===== 测试 =====
+pytest==8.4.2
+
+# ===== 已知但不列入的原因 =====
+# talib  —— 仅被上级目录两个历史遗留脚本 import：
+#           日内做T_指标加权模型_多股票.py:48、日内做T_指标加权模型_多股票_UTF8.py:48
+#           这两个文件**不属于生产路径**（生产用 strategies/ 下的自研指标，纯 Python 实现），
+#           且本机**未安装 talib** ⇒ 这两个脚本当前跑不起来。
+#           要不要装/或把它们归档，见《纠偏记录》阶段 B 的 B7（根目录归档）。
+
+# ===== 备注：一处已更正的误判（留档，避免再犯）=====
+# 本文件原声明 `numba>=0.60`，曾被误标为"全项目 0 处使用的多余依赖"并计划删除。
+# 实测：numba 是**引擎加速的硬依赖**（backtest_generic.py:20 / :205）。
+# 误判根因：静态扫描**只扫了 quant_app\**，漏掉上级目录的引擎文件。
+# 同理 matplotlib 也在用（backtest_generic.py:997），差点被一并误删。
+# ⇒ 教训：**"全项目未使用"这类结论，成立的前提是扫描范围真的等于"全项目"。**

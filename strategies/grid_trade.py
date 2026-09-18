@@ -144,21 +144,26 @@ class GridTradeStrategy(BaseStrategy):
                 sellable_t = max(0, min(acc.closeable, acc.total - base_position))
                 if sellable_t > 0:
                     sold = acc.sell(cur, sellable_t)
-                    trades.append({"time": ts, "direction": "SELL", "price": acc.last_fill_price,
-                                   "shares": sold, "reason": "网格硬止损", "score": "",
-                                   "fee": round(acc.last_fee, 2),
-                                   "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
+                    # H17：只有真正成交才记一笔。未成交时 acc 的 last_fill_price/last_fee
+                    # 仍是上一笔的值，直接记会伪造出一条"用陈旧数据拼出来的成交"。
+                    if sold:
+                        trades.append({"time": ts, "direction": "SELL", "price": acc.last_fill_price,
+                                       "shares": sold, "reason": "网格硬止损", "score": "",
+                                       "fee": round(acc.last_fee, 2),
+                                       "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
                     grid_bought = max(0, grid_bought - sold // max(trade_shares, 1))
 
             # 尾盘平 T 仓（可选）
             if enable_close and h >= 1455:
                 t_shares = max(0, acc.total - base_position)
                 if t_shares > 0:
-                    acc.sell(cur, t_shares)
-                    trades.append({"time": ts, "direction": "SELL", "price": acc.last_fill_price,
-                                   "shares": t_shares, "reason": "尾盘平T仓", "score": "",
-                                   "fee": round(acc.last_fee, 2),
-                                   "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
+                    sold = acc.sell(cur, t_shares)
+                    # H17：只有真正成交才记一笔
+                    if sold:
+                        trades.append({"time": ts, "direction": "SELL", "price": acc.last_fill_price,
+                                       "shares": sold, "reason": "尾盘平T仓", "score": "",
+                                       "fee": round(acc.last_fee, 2),
+                                       "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
                     grid_bought = 0
                 continue
 
@@ -168,13 +173,16 @@ class GridTradeStrategy(BaseStrategy):
                 if cur >= sell_line:
                     sellable = max(0, acc.total - base_position)
                     if sellable >= trade_shares:
-                        acc.sell(cur, trade_shares)
-                        trades.append({"time": ts, "direction": "SELL",
-                                       "price": acc.last_fill_price,
-                                       "shares": trade_shares,
-                                       "reason": f"网格卖出(回到{grid_bought-1}档)", "score": "",
-                                       "fee": round(acc.last_fee, 2),
-                                       "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
+                        sold = acc.sell(cur, trade_shares)
+                        # H17：只有真正成交才记一笔；shares 记实际成交量（原记声明量）。
+                        # 参考实现：core/grid_shared.py:160-165（live 路径早已如此）。
+                        if sold:
+                            trades.append({"time": ts, "direction": "SELL",
+                                           "price": acc.last_fill_price,
+                                           "shares": sold,
+                                           "reason": f"网格卖出(回到{grid_bought-1}档)", "score": "",
+                                           "fee": round(acc.last_fee, 2),
+                                           "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
                         grid_bought -= 1
                     else:
                         rejected.append({"time": ts, "direction": "SELL", "price": cur,

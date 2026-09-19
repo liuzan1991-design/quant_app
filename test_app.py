@@ -3,16 +3,25 @@
 
 UI 测试（streamlit AppTest），分钟级，标记 slow —— 不进日常回归，
 需要时用 `pytest -m "not external"` 跑（含慢档）。
+
+⚠️ 离线约束（H19 / A7）
+---------------------
+本测试**禁止真实登录 AmazingData**（守卫见 `tests_offline_guard.py`）。
+原先末尾"拉取最新数据"段会经 `incremental_update` → `_login()` 真实登录，
+与观察期采集互斥；且它的断言只看"生产 CSV 存在且够大"，**拉取失败也会绿**
+（假绿）。现改为：断言离线守卫确实拦下、且生产数据文件**未被改写**。
+真实拉取验证仍在 `test_fetch.py`（手工运行，见其文件头红线）。
 """
 from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
+APP_DIR = Path(r"D:\Documents\ChatGPT\daily work\日内做T策略\quant_app")
+
 
 def main():
-    at = AppTest.from_file(r"D:\Documents\ChatGPT\daily work\日内做T策略\quant_app\app.py",
-                           default_timeout=180)
+    at = AppTest.from_file(str(APP_DIR / "app.py"), default_timeout=180)
     at.run()
     print("首次渲染异常:", at.exception)
     assert not at.exception, at.exception
@@ -36,29 +45,42 @@ def main():
 
     # ── P1 参数组对比：保存快照 → 选择 → 运行对比 ──
     from core import param_store
-    at.text_input(key="snap_name_input").set_value("测试组A")
-    at.run()
-    save_btn = [b for b in at.button if b.label == "保存当前参数"]
-    assert save_btn, "未找到保存按钮"
-    save_btn[0].click()
-    at.run()
-    names = param_store.list_snapshot_names()
-    print("快照列表:", names)
-    assert "测试组A" in names
+    try:
+        at.text_input(key="snap_name_input").set_value("测试组A")
+        at.run()
+        save_btn = [b for b in at.button if b.label == "保存当前参数"]
+        assert save_btn, "未找到保存按钮"
+        save_btn[0].click()
+        at.run()
+        names = param_store.list_snapshot_names()
+        print("快照列表:", names)
+        assert "测试组A" in names
 
-    at.multiselect(key="snap_compare_select").set_value(["测试组A"])
-    at.run()
-    run_btn = [b for b in at.button if b.label == "运行对比"]
-    assert run_btn, "未找到运行对比按钮"
-    run_btn[0].click()
-    at.run()
-    comp = at.session_state["compare"] if "compare" in at.session_state else None
-    print("对比结果:", None if comp is None else
-          f"组数{len(comp['metrics'])} 指标行{len(comp['metrics'])}")
-    assert comp is not None and len(comp["metrics"]) >= 1
-
-    # 清理测试快照
-    param_store.delete_snapshot("测试组A")
+        at.multiselect(key="snap_compare_select").set_value(["测试组A"])
+        at.run()
+        # ⚠️ app.py 里有**两个** label 均为「运行对比」的按钮：
+        #   [4] 多股票对比（expander「多股票对比（同一参数）」）
+        #   [7] 参数组对比（expander「⚙ 更多工具」，即本段要点的那个）
+        # 原实现取 run_btn[0] ⇒ 点成多股票对比 ⇒ 它要求 ≥2 只股票，
+        # 只弹 warning、从不设 compare_req ⇒ 下面断言恒为 None（死断言，
+        # 实测确认）。这里按顺序取最后一个，并断言"恰好两个"以免再点错。
+        run_btn = [b for b in at.button if b.label == "运行对比"]
+        assert len(run_btn) == 2, (
+            f"预期恰好 2 个「运行对比」按钮（多股票/参数组），实际 {len(run_btn)} 个"
+            "—— app.py 布局变了，需重新确认该点哪个")
+        run_btn[-1].click()
+        at.run()
+        comp = at.session_state["compare"] if "compare" in at.session_state else None
+        print("对比结果:", None if comp is None else
+              f"组数{len(comp['metrics'])} 指标行{len(comp['metrics'])}")
+        assert comp is not None and len(comp["metrics"]) >= 1
+    finally:
+        # 必须 try/finally：若上面断言失败，快照会残留在生产文件
+        # config/param_snapshots.json 里（H19 同类"测试污染生产"问题）
+        if param_store.delete_snapshot("测试组A"):
+            print("已清理测试快照「测试组A」")
+        else:
+            print("测试快照「测试组A」不存在（无需清理）")
     print("P1 参数组对比测试通过")
 
     # ── P1 HTML 报告导出 ──
@@ -66,21 +88,39 @@ def main():
     assert rep_btn, "未找到导出按钮"
     rep_btn[0].click()
     at.run()
-    reports = sorted(Path(r"D:\Documents\ChatGPT\daily work\日内做T策略\quant_app\reports").glob("*.html"))
+    reports = sorted((APP_DIR / "reports").glob("*.html"))
     print("报告文件:", [p.name for p in reports])
     assert reports and reports[-1].stat().st_size > 10000
     print("P1 报告导出测试通过")
 
-    # ── P1 数据增量更新（真实调用星耀API，已有数据只拉最近几天）──
+    # ── P1 数据增量更新：离线守卫必须拦下，且生产数据不得被改写 ──
+    # （原实现在此真实拉取星耀 API —— 与观察期采集抢单点登录，H19）
+    data_file = APP_DIR / "data" / "stock_601619_1m.csv"
+    mtime_before = data_file.stat().st_mtime if data_file.exists() else None
+    size_before = data_file.stat().st_size if data_file.exists() else None
+
     fetch_btn = [b for b in at.button if b.label == "拉取最新数据"]
     assert fetch_btn, "未找到拉取按钮"
     fetch_btn[0].click()
     at.run(timeout=300)
-    print("拉取后异常:", at.exception)
+
+    mtime_after = data_file.stat().st_mtime if data_file.exists() else None
+    size_after = data_file.stat().st_size if data_file.exists() else None
+    print(f"拉取段: 异常={at.exception} mtime {mtime_before} -> {mtime_after}")
+
+    # 1) 离线守卫生效：界面应显示"数据拉取失败"，而不是静默成功
+    err_text = " ".join(e.value for e in at.error)
     assert not at.exception, at.exception
-    data_file = Path(r"D:\Documents\ChatGPT\daily work\日内做T策略\quant_app\data\stock_601619_1m.csv")
-    assert data_file.exists() and data_file.stat().st_size > 1000000
-    print("P1 数据增量更新测试通过")
+    assert "数据拉取失败" in err_text, (
+        f"离线守卫未生效：界面未报拉取失败（errors={err_text!r}）"
+        "—— 说明测试真的联网了")
+    assert "H19" in err_text, f"未看到 H19 守卫标识（errors={err_text!r}）"
+
+    # 2) 生产数据文件未被改写（这是本段存在的真正意义）
+    assert mtime_before == mtime_after and size_before == size_after, (
+        f"生产数据被测试改写！{data_file.name} "
+        f"mtime {mtime_before}->{mtime_after} size {size_before}->{size_after}")
+    print("P1 离线守卫 + 生产数据未改写：通过")
 
 
 @pytest.mark.slow

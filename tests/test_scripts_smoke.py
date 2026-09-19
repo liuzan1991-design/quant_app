@@ -22,14 +22,26 @@ pytest 收不到；但**它们已有非零退出判据**，外部可以判定成
 > 凡是改动核心引擎（策略 / shared 状态机 / 撮合），**必须跑慢档**：
 > `pytest -m "not external"`（含门禁）；涉及黄金基准时再跑 `pytest`（全量）。
 
-安全边界
---------
-**不包含任何会 `ad.login()` 的脚本**（`test_fetch.py` / `test_industry.py` /
-`test_sentiment_data.py` / `test_down_market.py`）——它们会与观察期 `live_run.py`
-抢 AmazingData 单点登录，一旦执行会踢掉当天采集。
+安全边界（**2026-09-19 修订 —— 原判据不够，见 H19**）
+----------------------------------------------------
+本文件**不直接包含**会 `ad.login()` 的脚本（`test_fetch.py` / `test_industry.py`
+/ `test_sentiment_data.py` / `test_down_market.py`）——它们会与观察期
+`live_run.py` 抢 AmazingData 单点登录，一旦执行会踢掉当天采集。
+
+⚠️ 但**只按文件名排除是不够的**：`test_sentiment_t_dual_gate.py` 与
+`test_sentiment_t_shared_consistency.py`（本文件 GATES / CONSISTENCY 两份名单
+都在跑）会经 `SentimentTStrategy.run()` → `sentiment_data.load_index_min` /
+`get_stock_industry_index` → `core/data_fetch._login()` **间接真实登录**。
+实测：缓存覆盖不到当天时即触发（`sentiment_data` 的覆盖判据要求缓存末根
+≥ `end 15:00`，而日线 bar 时间戳是 `00:00`，**天然永远判不覆盖**）。
+
+因此本文件在 subprocess 上**显式挂载离线守卫**（`test_support/sitecustomize.py`
++ `PYTHONPATH`），**不依赖"脚本自己不会联网"这个假设**。守卫见
+`tests_offline_guard.py`。
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +49,7 @@ from pathlib import Path
 import pytest
 
 APP = Path(__file__).resolve().parents[1]
+GUARD_DIR = APP / "test_support"
 
 # 一致性测试：慢 + 依赖外部黄金基准
 CONSISTENCY = [
@@ -56,11 +69,20 @@ GATES = [
 
 
 def _run_script(name: str, timeout: int) -> None:
-    """跑脚本并断言退出码为 0（判据在脚本内部）。"""
+    """跑脚本并断言退出码为 0（判据在脚本内部）。
+
+    子进程显式挂载离线守卫：`PYTHONPATH` 指向 `test_support/`，
+    由 `sitecustomize.py` 在解释器启动时装上守卫（H19 / A7 第 2 道锁）。
+    """
+    env = dict(os.environ)
+    env["QUANT_OFFLINE_GUARD"] = "1"
+    _sep = os.pathsep
+    env["PYTHONPATH"] = (str(GUARD_DIR) + _sep + env["PYTHONPATH"]
+                         if env.get("PYTHONPATH") else str(GUARD_DIR))
     result = subprocess.run(
         [sys.executable, "-X", "utf8", str(APP / name)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=str(APP), timeout=timeout,
+        cwd=str(APP), timeout=timeout, env=env,
     )
     assert result.returncode == 0, (
         f"{name} 退出码={result.returncode}（0 才算通过）\n"

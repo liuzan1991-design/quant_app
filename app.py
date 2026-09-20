@@ -193,8 +193,9 @@ def sidebar() -> tuple:
         today = date.today()
         default_start = today - timedelta(days=365)
         d_range = st.date_input("回测区间", [default_start, today])
-        start = d_range[0].isoformat() if isinstance(d_range, list) and d_range else default_start.isoformat()
-        end = d_range[1].isoformat() if isinstance(d_range, list) and len(d_range) > 1 else today.isoformat()
+        # 注：st.date_input 返回的是 tuple（不是 list）—— H20 曾因只判 list 导致区间控件完全失效
+        start = d_range[0].isoformat() if isinstance(d_range, (list, tuple)) and d_range else default_start.isoformat()
+        end = d_range[1].isoformat() if isinstance(d_range, (list, tuple)) and len(d_range) > 1 else today.isoformat()
         # 交易日数量（对齐线框图：区间下方直接显示）
         try:
             _df, _ = _load(code, start, end)

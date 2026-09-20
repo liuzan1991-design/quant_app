@@ -122,6 +122,39 @@ def main():
         f"mtime {mtime_before}->{mtime_after} size {size_before}->{size_after}")
     print("P1 离线守卫 + 生产数据未改写：通过")
 
+    # ── P0 「回测区间」控件必须真正生效（H20 回归防线）──
+    # 背景：app.py:196 原写 isinstance(d_range, list)，而 st.date_input 返回的是
+    # **tuple** ⇒ 两个三元分支恒走 else ⇒ start/end 永远是默认"近一年"，
+    # 用户在界面上改区间**完全无效**（H20，生产功能缺陷）。
+    # 断言锚"本次动作的后果"：记录 app.py 实际传给 load_data 的 (start, end)，
+    # 确认等于界面设定值（而不是看默认值是否合理）。
+    import core.data as core_data
+    from datetime import date as _date
+    _set_start, _set_end = _date(2024, 1, 1), _date(2024, 6, 30)
+    _real_load, _seen = core_data.load_data, []
+
+    def _spy_load(code, start=None, end=None):
+        _seen.append((code, start, end))
+        return _real_load(code, start, end)
+
+    core_data.load_data = _spy_load
+    try:
+        assert len(at.date_input) >= 1, "未找到「回测区间」控件"
+        at.date_input[0].set_value((_set_start, _set_end))
+        at.run()
+        assert not at.exception, at.exception
+    finally:
+        core_data.load_data = _real_load
+
+    _hits = [x for x in _seen
+             if x[1] == _set_start.isoformat() and x[2] == _set_end.isoformat()]
+    print(f"回测区间段: 设定 {_set_start}~{_set_end}，命中 {len(_hits)} 次")
+    assert _hits, (
+        f"「回测区间」控件未生效：设定 {_set_start}~{_set_end} 后，"
+        f"app.py 传给 load_data 的是 {_seen[-3:]}"
+        "—— isinstance 判断可能又被改回只判 list（H20 复发）")
+    print("P0 回测区间生效：通过")
+
 
 @pytest.mark.slow
 def test_app_ui():

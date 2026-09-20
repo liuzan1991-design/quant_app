@@ -17,6 +17,16 @@ import backtest_generic as bg  # noqa: E402
 from core.sentiment_t_shared_live import SentimentTSharedLiveEngine  # noqa: E402
 from strategies.sentiment_t import SentimentTStrategy  # noqa: E402
 
+# ── 口径声明：本测试固定运行在「无情绪过滤」口径（H23 / A12 决策，2026-09-20）──
+# 与 `test_sentiment_t_dual_gate.py` 同一处理：把三个情绪数据入口置空 ⇒ 恒降级
+# ⇒ 口径钉死、结果可复现，不再依赖缓存新鲜度（否则同一测试换日期跑口径会漂移）。
+# ⚠️ 代价：本测试**不再覆盖"板块过滤"逻辑** —— 该空窗登记为 **A13**。
+import core.sentiment_data as _sd  # noqa: E402
+
+_sd.load_index_min = lambda *a, **k: pd.DataFrame()
+_sd.get_stock_industry_index = lambda *a, **k: None
+_sd.load_industry_daily = lambda *a, **k: pd.DataFrame()
+
 GOLDEN_DIR = Path(r"D:\Codex输出\情绪做T黄金基准")
 
 

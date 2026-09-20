@@ -19,6 +19,19 @@ from core.paper_replay import OfflineReplayEngine  # noqa: E402
 from core.risk_manager import RiskConfig, RiskManager  # noqa: E402
 from strategies.sentiment_t import SentimentTStrategy  # noqa: E402
 
+# ── 口径声明：本测试固定运行在「无情绪过滤」口径（H23 / A12 决策，2026-09-20）──
+# 为什么显式强制：离线守卫会拦住情绪数据源，但"拦不拦得住"取决于
+# `sentiment_data` 的缓存覆盖判据（`last >= end_dt.replace(hour=15, minute=0)`），
+# 而该判据随数据文件的新鲜度变化 ⇒ **同一测试换个日期跑，口径会漂移**（H23 实测：
+# 4 个标的中 300502 未降级 / 688256 完全降级 / 300308·600900 板块失效）。
+# 这里把三个入口直接置空 ⇒ 恒降级 ⇒ **口径钉死、结果可复现**，且完全不依赖缓存状态。
+# ⚠️ 代价：本测试**不再覆盖"板块过滤"逻辑** —— 该空窗登记为 **A13**。
+import core.sentiment_data as _sd  # noqa: E402
+
+_sd.load_index_min = lambda *a, **k: pd.DataFrame()
+_sd.get_stock_industry_index = lambda *a, **k: None
+_sd.load_industry_daily = lambda *a, **k: pd.DataFrame()
+
 OUT = APP_DIR / "test_outputs" / "sentiment_t_dual_gate"
 SIGNAL_GATE = 0.95
 FILL_GATE = 0.90

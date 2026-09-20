@@ -64,6 +64,16 @@
   ⇒ **本文件的「三份待读文档」待办可关闭**（PDF 原件非阻塞）。索引：同目录 `README_索引.md`。
   安装包路径：`https://www.gszq.com/business/quantx`（表格第 2 项，可达）。
 
+- 2026-09-20：**产出切源对照表** → `quant_app/QMT切源对照表.md`（项目内、活文档、随代码维护）。
+  核实真实改动面：**仅 3 文件 / 5 调用点**（`core/data_fetch.py:_login`+`fetch_kline`、
+  `core/adjustment.py:28` 复权因子、`core/sentiment_data.py:112` 行业表、`build_stock_list.py:57` 代码表）。
+  `incremental_update`（纯本地合并）/ `core/data.py` / `market_collector` / **全部策略与引擎零改动** ⇒ live 采集
+  只经 `fetch_kline` 一个门，切源后自动受益。**代码格式不用换**（两边都是 `300308.SZ`）。
+  🔴 **最大风险 = 复权**：AD 给"后复权因子"现成序列，QMT 只有 `get_divid_factors`（**除权事件**）⇒
+  **需重建口径而非改名**；叠加 **H13/H14 复权 bug 未修** ⇒ 切源必须排在复权修复之后，
+  且"取数切换"与"复权重建"**不可合并一步**（否则回归无法归因）。
+
+
 
 
 ## 下一步（观察期阶段）

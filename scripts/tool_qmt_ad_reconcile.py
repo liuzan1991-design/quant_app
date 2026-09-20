@@ -237,16 +237,106 @@ def reconcile(ad: pd.DataFrame, qmt: pd.DataFrame) -> dict:
 
 
 # ────────────────────────────── main ──────────────────────────────
+def _run_multi(code: str, qmt_code: str, local_csv: Path, days: int,
+               since: str | None) -> int:
+    """逐日跑对账，检验口径结论在**所有可用交易日**上是否稳定。
+
+    单日样本只能说明"存在这个口径差"，多日样本才能说明"它是恒定规律还是偶然"。
+    """
+    probe = pd.read_csv(local_csv)
+    probe.columns = [c.strip().lstrip("\ufeff") for c in probe.columns]
+    ts = pd.to_datetime(probe[probe.columns[0]], errors="coerce").dropna()
+    all_dates = sorted(set(ts.dt.strftime("%Y-%m-%d")))
+    if since:
+        all_dates = [d for d in all_dates if d >= since]
+    dates = all_dates[-days:]
+
+    print(f"本地 CSV : {local_csv}")
+    print(f"可对账日 : {len(dates)} 天   {dates[0] if dates else '-'} ~ {dates[-1] if dates else '-'}")
+    print()
+    hdr = (f"{'日期':<12}{'AD':>5}{'QMT':>5}{'平移':>7}{'close':>10}"
+           f"{'open':>10}{'末根收盘等':>12}{'量比中位':>11}")
+    print(hdr)
+    print("-" * 78)
+
+    rows = []
+    for d in dates:
+        try:
+            ad = load_ad_side(code, local_csv, d)
+            qmt, _ = load_qmt_side(qmt_code, d)
+            res = reconcile(ad, qmt)
+            ps = res["price_stats"]
+            vs = res.get("volume_stats") or {}
+            lc = res.get("last_close") or {}
+            row = {
+                "date": d, "ad_rows": len(ad), "qmt_rows": len(qmt),
+                "best_shift_min": res["best_shift_min"],
+                "close_match": (f"{ps['close']['exact']}/{ps['close']['n']}" if "close" in ps else "-"),
+                "open_match": (f"{ps['open']['exact']}/{ps['open']['n']}" if "open" in ps else "-"),
+                "last_close_equal": lc.get("equal"),
+                "last_close": (lc.get("ad_last_close"), lc.get("qmt_last_close")),
+                "vol_ratio_median": vs.get("ratio_median"),
+                "high_match": (f"{ps['high']['exact']}/{ps['high']['n']}" if "high" in ps else "-"),
+                "low_match": (f"{ps['low']['exact']}/{ps['low']['n']}" if "low" in ps else "-"),
+            }
+            rows.append(row)
+            print(f"{d:<12}{row['ad_rows']:>5}{row['qmt_rows']:>5}{row['best_shift_min']:>7}"
+                  f"{row['close_match']:>10}{row['open_match']:>10}"
+                  f"{str(row['last_close_equal']):>12}{str(row['vol_ratio_median']):>11}")
+        except Exception as exc:
+            print(f"{d:<12} ★失败 {type(exc).__name__}: {exc}")
+            rows.append({"date": d, "error": f"{type(exc).__name__}: {exc}"})
+
+    ok = [r for r in rows if "error" not in r]
+    print()
+    print(f"成功 {len(ok)}/{len(rows)} 天")
+    if ok:
+        from collections import Counter
+        print(f"best_shift 分布      : {dict(Counter(r['best_shift_min'] for r in ok))}")
+        print(f"末根收盘全等         : {sum(1 for r in ok if r['last_close_equal'])}/{len(ok)}")
+        vr = [r["vol_ratio_median"] for r in ok if r["vol_ratio_median"] is not None]
+        if vr:
+            print(f"量比中位数范围       : {min(vr)} ~ {max(vr)}")
+        for f in ("close_match", "open_match", "high_match", "low_match"):
+            vals = []
+            for r in ok:
+                a, b = r[f].split("/")
+                vals.append(int(a) / int(b) if int(b) else 0)
+            if vals:
+                print(f"{f:<20}: 均值 {sum(vals)/len(vals):.4f}  最低 {min(vals):.4f}")
+        excl = [r["date"] for r in ok if r["best_shift_min"] != ok[0]["best_shift_min"]]
+        print(f"与首日平移不一致的日期: {excl or '无（口径恒定）'}")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = f"{code}_{dates[0]}_{dates[-1]}_multi" if dates else f"{code}_multi"
+    (OUT_DIR / f"reconcile_{tag}.json").write_text(
+        json.dumps({"code": code, "qmt_code": qmt_code, "local_csv": str(local_csv),
+                    "days": len(dates), "rows": rows,
+                    "generated_at": datetime.now(BJ).strftime("%Y-%m-%d %H:%M:%S +08:00")},
+                   ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    print(f"产物：{OUT_DIR / f'reconcile_{tag}.json'}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="QMT(xtdata) ↔ AmazingData(本地CSV) 1m 对账（只读）")
     ap.add_argument("--code", default="300308", help="6 位代码，默认 300308")
     ap.add_argument("--date", default=None, help="交易日 YYYY-MM-DD；默认取本地 CSV 的末根日")
     ap.add_argument("--local-csv", default=None, help="本地 AD CSV 路径；默认 data/stock_{code}_1m.csv")
+    ap.add_argument("--multi", action="store_true",
+                    help="多日模式：对本地 CSV 里最近 N 个交易日逐日对账（检验口径是否恒定）")
+    ap.add_argument("--days", type=int, default=12, help="配合 --multi：取最近多少天，默认 12")
     args = ap.parse_args(argv)
 
     code = args.code.strip()
     local_csv = Path(args.local_csv) if args.local_csv else (APP_DIR / "data" / f"stock_{code}_1m.csv")
     qmt_code = to_qmt_code(code)
+
+    if args.multi:
+        print("=" * 74)
+        print(f"QMT(xtdata) ↔ AmazingData 本地CSV 一分钟线对账 · 多日模式   标的={code} ({qmt_code})")
+        print("=" * 74)
+        return _run_multi(code, qmt_code, local_csv, args.days, args.date)
 
     print("=" * 74)
     print(f"QMT(xtdata) ↔ AmazingData 本地CSV 一分钟线对账   标的={code} ({qmt_code})")

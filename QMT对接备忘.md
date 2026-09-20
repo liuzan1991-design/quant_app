@@ -56,6 +56,15 @@
   《实盘前置验收清单》《结论备忘》里「国盛有独立仿真环境」的旧表述已更正。
   剩余动作：向券商再确认一次以完全封闭。
 
+- 2026-09-20：**官方文档阻塞解除**。腾讯文档表格「国盛QMT」标签页（`tab=kpbezo`）经 HTML 内嵌数据提取：
+  **只列文件名，无下载链接**（全页 `hyperlink` = 0；表格第 1 项 `docs.thinktrader.net` 本网络不可达）。
+  改用**迅投官方在线文档**（公开、比 PDF 更新）并归档到 `D://Codex输出//国盛QMT官方文档_20260920//`：
+  ① `00_快速开始.md` ② `01_XtData_行情模块.md`（含 `get_market_data_ex` / `download_history_data`）
+  ③ `02_XtTrader_交易模块.md`（含 `XtQuantTrader` / `order_stock` / `StockAccount` / `query_stock_asset`）。
+  ⇒ **本文件的「三份待读文档」待办可关闭**（PDF 原件非阻塞）。索引：同目录 `README_索引.md`。
+  安装包路径：`https://www.gszq.com/business/quantx`（表格第 2 项，可达）。
+
+
 
 ## 下一步（观察期阶段）
 

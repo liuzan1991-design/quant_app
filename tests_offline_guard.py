@@ -26,13 +26,24 @@
 |---|---|---|
 | 1 | 同进程 monkeypatch（`conftest.py` 调用 `install()`） | AppTest / 直接调用 |
 | 2 | `PYTHONPATH` + `sitecustomize.py`（`test_support/`） | **subprocess 子进程** |
-| 3 | 本机时钟门禁 | 兜底：**任何**测试路径在采集窗口内一律拒绝 |
+| 3 | 本机时钟门禁 | 兜底：**任何**测试路径一律拒绝（窗口信息用于提示与排障） |
 
-关于第 3 道锁
-------------
-本机时区是 **GMT+3（坦桑尼亚）**，与北京 GMT+8 不同 —— `live_run.py` 早期
-注释里的"内罗毕=北京-5h"已随搬迁失效。本模块**一律用 UTC 换算北京时**，
-不依赖本机时区设置。
+关于第 3 道锁（采集窗口 = **本机时间**）
+------------------------------------
+采集窗口**不是**北京时概念，而是**本机时间**概念 —— 因为它由计划任务决定：
+
+- 计划任务 `QuantLiveRun` 的 `StartBoundary` = **`04:30:00+03:00`**
+  （**本机 GMT+3 的 04:30**，等同**北京 09:30 / A 股开盘**），`DaysOfWeek` = 周一至周五；
+- 实测运行时长（本机时间）：09-17 `04:32:08 → 10:09:03`、09-18 `04:32:02 → 10:08:58`
+  ⇒ **真实窗口 ≈ 本机 04:30 ~ 10:10**。
+
+🚨 **2026-09-20 修正**：本模块初版把窗口写成"**北京时** 04:30~10:10"，
+那对应**本机 23:30 ~ 05:10**，与真实窗口**几乎不重叠**（仅 04:30~05:10 这 40 分钟）
+⇒ 会在**采集实际运行期间**（本机 05:10~10:10）误报"不在采集窗口"。
+现改为**按本机时间**判断（与任务配置同源）。
+
+（`live_run.py` 早期注释里的"内罗毕=北京-5h"已随搬迁失效；本模块**不再拿时区去推算窗口**，
+窗口直接对齐任务配置的本机时刻。）
 
 本模块**不在 import 时做任何事**，只有显式 `install()` 才生效
 ⇒ 手工跑 `python test_fetch.py` 完全不受影响。
@@ -41,25 +52,29 @@ from __future__ import annotations
 
 from datetime import datetime, time as dtime, timedelta, timezone
 
-# 采集窗口（北京时）：周一至周五 04:30 ~ 10:10
-COLLECT_WINDOW_BJ = (dtime(4, 30), dtime(10, 10))
-BJ = timezone(timedelta(hours=8))
+# 采集窗口（**本机时间**）：周一至周五 04:30 ~ 10:10 —— 与计划任务 QuantLiveRun 同源
+COLLECT_WINDOW = (dtime(4, 30), dtime(10, 10))
+BJ = timezone(timedelta(hours=8))  # 仅用于在提示文案里附上北京时，便于对照 A 股
 
 _installed = False
 
 
 def beijing_now() -> datetime:
-    """当前北京时（由 UTC 换算，不依赖本机时区）。"""
+    """当前北京时（由 UTC 换算，**仅供提示文案对照 A 股**）。"""
     return datetime.now(BJ)
 
 
 def in_collect_window(dt: datetime | None = None) -> bool:
-    """是否落在观察期采集窗口内（北京时、周一至周五 04:30~10:10）。"""
-    dt = dt or beijing_now()
+    """是否落在观察期采集窗口内（**本机时间**、周一至周五 04:30~10:10）。
+
+    窗口与计划任务 `QuantLiveRun` 同源（`StartBoundary 04:30:00+03:00` + 周一至周五）
+    ⇒ 传入的 `dt` 应为**本机时间**（默认 `datetime.now()`），**不要传北京时**。
+    """
+    dt = dt or datetime.now()
     if dt.weekday() >= 5:  # 周六 / 周日：采集不开
         return False
     t = dt.timetz().replace(tzinfo=None)
-    return COLLECT_WINDOW_BJ[0] <= t <= COLLECT_WINDOW_BJ[1]
+    return COLLECT_WINDOW[0] <= t <= COLLECT_WINDOW[1]
 
 
 def _make_guard(where: str):
@@ -71,7 +86,7 @@ def _make_guard(where: str):
             "（单点登录会与观察期采集互斥，可能踢掉当天采集）。\n"
             f"  触发位置：{where}\n"
             f"  触发时刻：{now:%Y-%m-%d %H:%M:%S} 北京（本机 {datetime.now():%Y-%m-%d %H:%M:%S}）\n"
-            f"  是否采集窗口：{'是 —— 已拦下，否则会踢掉当天采集' if danger else '否（今天非交易日，或不在 04:30~10:10）'}\n"
+            f"  是否采集窗口：{'是 —— 已拦下，否则会踢掉当天采集' if danger else '否（周末，或本机时间不在 04:30~10:10）'}\n"
             "  处理方式：让被测代码走本地缓存 / 桩数据；确需联网的脚本请"
             "手工运行（见 test_fetch.py 文件头），不要包进 pytest。"
         )

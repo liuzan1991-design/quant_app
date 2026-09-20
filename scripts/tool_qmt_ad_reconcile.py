@@ -237,6 +237,93 @@ def reconcile(ad: pd.DataFrame, qmt: pd.DataFrame) -> dict:
 
 
 # ────────────────────────────── main ──────────────────────────────
+def _run_merge_check(code: str, qmt_code: str, local_csv: Path, days: int,
+                     since: str | None) -> int:
+    """检验「开盘集合竞价合并规则」—— 凭证 = AD 09:30 ≟ merge(QMT 09:30, QMT 09:31)。
+
+    规则（待多日复验）：
+        open   = QMT_09:30.open      （竞价成交价）
+        close  = QMT_09:31.close     （首根连续竞价收盘）
+        high   = max(QMT_0930.high, QMT_0931.high)
+        low    = min(QMT_0930.low,  QMT_0931.low)
+        volume = (QMT_0930.volume + QMT_0931.volume) * 100   （手→股；允许 1 手取整误差）
+    """
+    probe = pd.read_csv(local_csv)
+    probe.columns = [c.strip().lstrip("\ufeff") for c in probe.columns]
+    ts = pd.to_datetime(probe[probe.columns[0]], errors="coerce").dropna()
+    all_dates = sorted(set(ts.dt.strftime("%Y-%m-%d")))
+    if since:
+        all_dates = [d for d in all_dates if d >= since]
+    dates = all_dates[-days:]
+
+    print(f"本地 CSV : {local_csv}")
+    print(f"检验天数 : {len(dates)}   {dates[0] if dates else '-'} ~ {dates[-1] if dates else '-'}")
+    print()
+    hdr = (f"{'日期':<12}{'AD开':>9}{'规则开':>9}{'AD收':>9}{'规则收':>9}"
+           f"{'AD高':>9}{'规则高':>9}{'AD低':>9}{'规则低':>9}{'AD量(股)':>12}{'规则量':>12}")
+    print(hdr)
+    print("-" * 104)
+
+    stat = {"open": 0, "close": 0, "high": 0, "low": 0, "vol": 0}
+    n = 0
+    for d in dates:
+        try:
+            ad = load_ad_side(code, local_csv, d)
+            qmt, _ = load_qmt_side(qmt_code, d)
+        except Exception as exc:
+            print(f"{d:<12} ★失败 {type(exc).__name__}: {exc}")
+            continue
+        def pick(df, tcol, hhmm):
+            m = df[df[tcol].dt.strftime("%H:%M") == hhmm]
+            return m.iloc[0] if len(m) else None
+        a0 = pick(ad, "adm_time", "09:30")
+        q30 = pick(qmt, "qmt_dt", "09:30")
+        q31 = pick(qmt, "qmt_dt", "09:31")
+        if a0 is None or q30 is None or q31 is None:
+            print(f"{d:<12} ★缺根（AD09:30/QMT09:30/QMT09:31 有缺）")
+            continue
+        r_open = float(q30["open"])
+        r_close = float(q31["close"])
+        r_high = max(float(q30["high"]), float(q31["high"]))
+        r_low = min(float(q30["low"]), float(q31["low"]))
+        r_vol = (float(q30["volume"]) + float(q31["volume"])) * 100
+        stat["open"] += abs(float(a0["open"]) - r_open) < 1e-6
+        stat["close"] += abs(float(a0["close"]) - r_close) < 1e-6
+        stat["high"] += abs(float(a0["high"]) - r_high) < 1e-6
+        stat["low"] += abs(float(a0["low"]) - r_low) < 1e-6
+        stat["vol"] += abs(float(a0["volume"]) - r_vol) <= 100
+        n += 1
+        def g(v):   # 统一按 4 位小数显示：避免 float repr（900.3000000000001）把相邻列拼成一串引发误读
+            return f"{float(v):.4f}"
+        print(f"{d:<12}{g(a0['open']):>10}{g(r_open):>10}{g(a0['close']):>10}{g(r_close):>10}"
+              f"{g(a0['high']):>10}{g(r_high):>10}{g(a0['low']):>10}{g(r_low):>10}"
+              f"{float(a0['volume']):>13,.0f}{r_vol:>13,.0f}")
+
+    print()
+    if not n:
+        print("★ 无有效样本（客户端未开？）")
+        return 1
+    print("规则命中率：")
+    for k, label in [("open", "open = QMT09:30.open"), ("close", "close = QMT09:31.close"),
+                     ("high", "high = max(两高)"), ("low", "low = min(两低)"),
+                     ("vol", "volume = (两量和)×100")]:
+        print(f"   {label:28}: {stat[k]}/{n}")
+    allok = all(stat[k] == n for k in stat)
+    print()
+    print("✅ 规则 100% 成立 —— 可写进对照表作为实测依据" if allok
+          else "⚠️ 规则未全部命中 —— 需逐项排查（不要拍脑袋定）")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = f"{code}_{dates[0]}_{dates[-1]}_mergecheck"
+    (OUT_DIR / f"auction_merge_{tag}.json").write_text(
+        json.dumps({"code": code, "qmt_code": qmt_code, "local_csv": str(local_csv),
+                    "days": n, "hits": stat,
+                    "generated_at": datetime.now(BJ).strftime("%Y-%m-%d %H:%M:%S +08:00")},
+                   ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    print(f"产物：{OUT_DIR / f'auction_merge_{tag}.json'}")
+    return 0
+
+
 def _run_multi(code: str, qmt_code: str, local_csv: Path, days: int,
                since: str | None) -> int:
     """逐日跑对账，检验口径结论在**所有可用交易日**上是否稳定。
@@ -325,12 +412,20 @@ def main(argv=None) -> int:
     ap.add_argument("--local-csv", default=None, help="本地 AD CSV 路径；默认 data/stock_{code}_1m.csv")
     ap.add_argument("--multi", action="store_true",
                     help="多日模式：对本地 CSV 里最近 N 个交易日逐日对账（检验口径是否恒定）")
-    ap.add_argument("--days", type=int, default=12, help="配合 --multi：取最近多少天，默认 12")
+    ap.add_argument("--days", type=int, default=12, help="配合 --multi/--check-merge：取最近多少天，默认 12")
+    ap.add_argument("--check-merge", action="store_true",
+                    help="检验「开盘集合竞价合并规则」：凭证 = AD 09:30 ≟ merge(QMT 09:30, QMT 09:31)")
     args = ap.parse_args(argv)
 
     code = args.code.strip()
     local_csv = Path(args.local_csv) if args.local_csv else (APP_DIR / "data" / f"stock_{code}_1m.csv")
     qmt_code = to_qmt_code(code)
+
+    if args.check_merge:
+        print("=" * 74)
+        print(f"开盘集合竞价合并规则检验   标的={code} ({qmt_code})")
+        print("=" * 74)
+        return _run_merge_check(code, qmt_code, local_csv, args.days, args.date)
 
     if args.multi:
         print("=" * 74)

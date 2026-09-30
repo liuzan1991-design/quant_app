@@ -16,6 +16,9 @@ reports/
 logs/
 *.log
 
+# 工具运行时产物（WorkBuddy 自动化会话记忆；与 live_outputs/ 同类，非项目内容）
+.workbuddy/
+
 # Streamlit
 .streamlit/
 

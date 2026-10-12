@@ -78,6 +78,125 @@ def fmt_ts(ts) -> str:
         return str(ts)
 
 
+# ──────────────────────── 前置自检（2026-10-12 加） ────────────────────────
+# 背景：2026-10-12 实证 —— xtdata **连得上**、get_instrument_detail 正常返回，
+#      但 1m **读回 0 行**；当时误判为"本地缓存缺失 / 服务端有但通道读不回"，
+#      排查耗时约 1 小时。真因 = **QMT 极简版会话未就绪**；
+#      登录后同一命令读回 4,983 → 34,945 根（145 个交易日）。
+# ⇒ 铁律：**端口通 ≠ 数据可用；登录过 ≠ 会话就绪。**
+# ⇒ 唯一硬判据 = **能否真读到数据**；进程/端口只作失败时的诊断线索，不作否决依据。
+QMT_EXE_HINTS = ("xtminiqmt", "miniquote")   # 后者才是 58610 的监听者
+BASELINE_QMT_CODE = "300308.SZ"              # 基准标的：区分「会话坏」与「该标的本地无数据」
+
+
+def _probe_qmt_procs() -> tuple[list[str], str]:
+    """枚举 QMT 相关进程名。返回 (命中的名字列表, 说明)。psutil 缺失则降级。"""
+    try:
+        import psutil
+    except Exception:
+        return [], "psutil 不可用"
+    hits: list[str] = []
+    try:
+        for p in psutil.process_iter(["name"]):
+            nm = (p.info.get("name") or "")
+            if any(h in nm.lower() for h in QMT_EXE_HINTS):
+                hits.append(nm)
+    except Exception as exc:
+        return [], f"进程枚举异常 {type(exc).__name__}"
+    return hits, ""
+
+
+def _probe_port(host: str = "127.0.0.1", port: int = 58610, timeout: float = 3.0) -> bool:
+    import socket
+    s = socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _probe_1m(qmt_code: str) -> tuple[int | None, str]:
+    """读全量 1m 的根数（只读）。返回 (根数 or None, 错误说明)。"""
+    try:
+        from xtquant import xtdata
+    except Exception as exc:
+        return None, f"import xtquant 失败：{type(exc).__name__}: {exc}"
+    try:
+        xtdata.enable_hello = False
+    except Exception:
+        pass
+    try:
+        data = xtdata.get_market_data_ex([], [qmt_code], period="1m", count=-1)
+    except Exception as exc:
+        return None, f"get_market_data_ex 异常：{type(exc).__name__}: {exc}"
+    raw = data.get(qmt_code) if isinstance(data, dict) else None
+    return (0 if raw is None else len(raw)), ""
+
+
+def preflight_qmt(qmt_code: str) -> bool:
+    """QMT 会话就绪自检 —— 对账前**必过**。True = 可继续。
+
+    红线：**只读**。不登录、不下载 history、不下单、不写任何文件。
+    """
+    print("── 前置自检（QMT 会话就绪）──")
+
+    procs, pnote = _probe_qmt_procs()
+    if procs:
+        print(f"  进程  : ✅ {len(procs)} 个 —— {', '.join(sorted(set(procs)))}")
+    else:
+        print(f"  进程  : ⚠️ 未命中 XtMiniQmt/miniquote（{pnote or '或用了别的进程名'}）"
+              " —— 仅诊断线索，不否决")
+
+    port_ok = _probe_port()
+    print(f"  端口  : {'✅ 127.0.0.1:58610 可连' if port_ok else '❌ 127.0.0.1:58610 不可连'}"
+          " —— 仅诊断线索，不否决")
+
+    n, err = _probe_1m(qmt_code)
+    n_base: int | None = None
+    if err:
+        print(f"  数据  : ❌ {err}   ← 唯一硬判据")
+    elif n:
+        print(f"  数据  : ✅ 1m 全量可读 {n} 根   ← 唯一硬判据")
+    else:
+        # 目标标的 0 行 ⇒ 再探基准标的，区分「会话未就绪」与「该标的本身无数据」
+        if qmt_code != BASELINE_QMT_CODE:
+            n_base, _ = _probe_1m(BASELINE_QMT_CODE)
+        if n_base:
+            print(f"  数据  : ❌ {qmt_code} 读回 0 行，但基准 {BASELINE_QMT_CODE} 可读 {n_base} 根")
+            print("          ⇒ **会话正常**，是【该标的本地无 1m 数据】（未下载 / 代码有误）")
+        elif n_base == 0:
+            print(f"  数据  : ❌ {qmt_code} 与基准 {BASELINE_QMT_CODE} **双双读回 0 行**   ← 唯一硬判据")
+        else:
+            print(f"  数据  : ❌ {qmt_code} 读回 0 行   ← 唯一硬判据")
+
+    if n:
+        print("  ⇒ 自检通过\n")
+        return True
+
+    print()
+    print("=" * 74)
+    if n_base:
+        print(f"❌ 前置自检未通过：{qmt_code} 在 QMT 本地没有 1m 数据 —— 对账中止。")
+        print()
+        print(f"   会话本身正常（基准 {BASELINE_QMT_CODE} 可读 {n_base} 根）⇒ 请检查：")
+        print("     ① 代码是否写对；② 该标的的 1m 是否已在【极简版】里补充数据。")
+    else:
+        print("❌ 前置自检未通过：QMT 会话未就绪，对账中止（**未产出任何产物**）。")
+        print()
+        print("   处置：启动并登录『迅投QMT交易终端   国盛证券实盘版』的【极简版】：")
+        print("        D:\\迅投QMT交易终端   国盛证券实盘版\\bin.x64\\XtMiniQmt.exe")
+        print("   注意：完整版客户端（XtItClient.exe）与极简版是**两套 datadir**，")
+        print("         xtdata 只读 userdata_mini/datadir ⇒ 在完整版里补数据没用。")
+        print()
+        print("   🚨 不要转头去查 AD 侧、不要动 data/ —— 2026-10-12 在这上面白花约 1 小时。")
+    print("=" * 74)
+    return False
+
+
 # ────────────────────────────── 数据装载 ──────────────────────────────
 def load_ad_side(code: str, local_csv: Path, date: str) -> pd.DataFrame:
     """读本地 AmazingData CSV（不联网、不登录），只取指定交易日。"""
@@ -420,6 +539,11 @@ def main(argv=None) -> int:
     code = args.code.strip()
     local_csv = Path(args.local_csv) if args.local_csv else (APP_DIR / "data" / f"stock_{code}_1m.csv")
     qmt_code = to_qmt_code(code)
+
+    # 🚨 前置自检（2026-10-12 加）：单日 / --multi / --check-merge 三分支共用，必须先过。
+    #    不过 ⇒ 退出码 2（正常 0、异常 1），且**上游一行产物都不写**。
+    if not preflight_qmt(qmt_code):
+        return 2
 
     if args.check_merge:
         print("=" * 74)

@@ -74,6 +74,7 @@ class Observer:
     equity_high: float = INIT_CASH
     signals: List[dict] = field(default_factory=list)
     day_start_equity: float = INIT_CASH
+    day_anchor_date: str = ""
     signal_path: Path = None
     day_high_equity: float = INIT_CASH
     max_drawdown_cumulative: float = 0.0
@@ -88,8 +89,18 @@ class Observer:
             self.processed_times = set(pd.to_datetime(data.get("processed_times", [])))
             self.equity_high = float(data.get("equity_high", INIT_CASH))
             self.day_start_equity = float(data.get("day_start_equity", INIT_CASH))
+            self.day_anchor_date = str(data.get("day_anchor_date", ""))
             self.day_high_equity = float(data.get("day_high_equity", INIT_CASH))
             self.max_drawdown_cumulative = float(data.get("max_drawdown_cumulative", 0.0))
+
+    def reset_daily_metrics(self, day: str) -> None:
+        """按交易日期重置日内基准；同日重启必须保留，跨日才允许重置。"""
+        if self.day_anchor_date == day:
+            return
+        equity = self.broker.account.equity() if self.broker is not None else INIT_CASH
+        self.day_start_equity = equity
+        self.day_high_equity = equity
+        self.day_anchor_date = day
 
     def engine_state_path(self) -> Path:
         return self.store.root / "engine_state.json"
@@ -171,6 +182,7 @@ class Observer:
             "processed_times": [t.isoformat() for t in sorted(self.processed_times)],
             "equity_high": self.equity_high,
             "day_start_equity": self.day_start_equity,
+            "day_anchor_date": self.day_anchor_date,
             "day_high_equity": self.day_high_equity,
             "max_drawdown_cumulative": self.max_drawdown_cumulative,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -226,8 +238,10 @@ def _build_observers() -> List[Observer]:
             obs.processed_times = set()
             obs.equity_high = INIT_CASH
             obs.day_start_equity = INIT_CASH
+            obs.day_anchor_date = ""
             obs.day_high_equity = INIT_CASH
             obs.max_drawdown_cumulative = 0.0
+        obs.reset_daily_metrics(datetime.now().strftime("%Y-%m-%d"))
         observers.append(obs)
     return observers
 
@@ -369,6 +383,7 @@ def _write_daily_summary(obs: Observer) -> dict:
             finalize()
     equity = obs.broker.account.equity()
     day_pnl = equity - obs.day_start_equity
+    cum_pnl = equity - INIT_CASH
     day_dd = 0.0
     if obs.day_high_equity > 0:
         day_dd = (equity - obs.day_high_equity) / obs.day_high_equity
@@ -389,6 +404,7 @@ def _write_daily_summary(obs: Observer) -> dict:
         "equity": round(equity, 2),
         "cash": round(obs.broker.account.cash, 2),
         "day_pnl": round(day_pnl, 2),
+        "cum_pnl": round(cum_pnl, 2),
         "day_drawdown": round(day_dd, 6),
         "cumulative_drawdown": round(cum_dd, 6),
         "orders": len(obs.broker.orders),
@@ -406,6 +422,7 @@ def _write_daily_summary(obs: Observer) -> dict:
     (obs.store.root / "daily_summary.json").write_text(body, encoding="utf-8")
     # 追加台账：daily_history.jsonl，便于横向汇总与复盘
     _upsert_daily_history(obs.store.root, payload)
+    obs.save_watermark()
     return payload
 
 

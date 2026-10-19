@@ -21,10 +21,13 @@
 取 3 倍余量：3 × 327s = 981s ≈ 16.4 分钟 → **阈值取 20 分钟**
 （满足"阈值 ≥ 正常最大间隔 3 倍"的自定纪律，避免把"慢一轮"误判为"死亡"）
 
-存活判据：用 `heartbeat.updated_at`（每轮循环必写，无论采集成功或失败），
-**不用 `last_success_at`**。理由：网络中断时采集会连续失败，但循环仍在跑、
-updated_at 仍会刷新——那种情况**不该重启**（重启解决不了网络问题，纯属扰动）。
-看门狗的职责要窄：只判定"进程还在不在跑"。
+存活判据：用 `heartbeat.updated_at`（每轮循环必写，无论采集成功或失败）判定
+"进程还在不在跑"。`last_success_at` **不参与动作**，只作陈旧度告警（H36）。
+
+理由：网络中断时采集会连续失败，但循环仍在跑、updated_at 仍会刷新——那种情况
+**不该重启**（重启解决不了网络问题，纯属扰动；2026-10-19 更实证了 5 次重启全败）。
+但"不重启"不等于"不吭声"：当天正是因为只看 updated_at，采集停摆 33 分钟无人
+发现。故新增 `_report_success_staleness()` 告警旁路，**动作面一行未改**。
 
 三道防误判门槛
 --------------
@@ -56,6 +59,13 @@ TASK_NAME = "QuantLiveRun"
 
 # ---- 阈值（标定依据见模块 docstring）----
 STALE_SECONDS = 20 * 60          # 心跳静默超过 20 分钟 → 判定不在跑
+# 采集陈旧（last_success_at）**只用于告警，不触发动作**。标定见 H36 说明。
+# 数据源：live_outputs/logs/live_*.log 全量「[collector] 采集完成」相邻间隔
+# （24 个交易日、6015 个间隔，仅取本地 04:25–10:35 盘中段）：
+#   P50=48s  P90=57s  P99=117s  P99.5=234s  正常日最大 695s（09-21）
+# 取 900s = 正常最大的 1.3 倍、P99 的 7.7 倍：全样本触发 13 次（0.22%），
+# **全部落在已知故障日**（09-09/10/11/24/28/30、10-08/09/13/19），正常日零触发。
+SUCCESS_STALE_SECONDS = 15 * 60
 WINDOW_START = (4, 35)           # 本地时间窗口起（盘前 5 分钟）
 WINDOW_END = (10, 30)            # 本地时间窗口止（收盘缓冲结束后预留）
 MARKET_CLOSE_HHMM = "14:59"      # 北京时间的收盘最后一根 bar
@@ -120,6 +130,34 @@ def _today_watermark_reached_close() -> bool:
         return False
 
 
+def _report_success_staleness(hb: dict, succ_age: float | None, suffix: str) -> None:
+    """**H36**：循环还活着、但采集已经停摆 —— 只播报，不动作。
+
+    盲区成因（2026-10-19 D24 实证）：H44 让 AD 查询通道间歇返空，进程每轮
+    循环照跑、`updated_at` 每轮必刷，而 `last_success_at` 冻结在 09:34。
+    看门狗按 `updated_at` 判"健康"⇒ 07:43 起停摆 33 分钟无人发现，
+    直到 09:50 那次重启才救回。
+
+    为什么只告警、不重启：
+      当日 5 次人工重启**全败**（每次 RSS 涨到 ~2GB 后进程消失），只有
+      09:50 那次成功 —— 说明"重启"不是可靠解药，盲目加频只会制造更多
+      僵尸进程、并可能点燃 H37 的原生层 abort。先用告警攒一天
+      "陈旧起点 → 是否自愈 → 恢复耗时"的样本，再决定阈值与次数上限；
+      阈值与重启策略都必须有分布支撑，不能拍脑袋（本项目既有的定阈值纪律）。
+    """
+    if succ_age is None:
+        if hb.get("status") == "running":
+            log(f"[ALERT-STALE] 进程已启动但**从未采集成功**"
+                f"（started_at={hb.get('started_at')}, "
+                f"collect_err={hb.get('collect_errors')}）→ 仅告警，不重启{suffix}")
+        return
+    if succ_age > SUCCESS_STALE_SECONDS:
+        log(f"[ALERT-STALE] 循环存活但**采集已停摆 {succ_age:.0f}s**"
+            f"（> {SUCCESS_STALE_SECONDS}s）last_success={hb.get('last_success_at')} "
+            f"collect_err={hb.get('collect_errors')} status={hb.get('status')}"
+            f" → 仅告警，不重启{suffix}")
+
+
 def main() -> int:
     dry = "--dry-run" in sys.argv
     force = "--ignore-window" in sys.argv   # 测试用：跳过时间窗限制
@@ -147,14 +185,21 @@ def main() -> int:
     hb_date = hb.get("date")
     updated_at = _parse_dt(hb.get("updated_at") or "")
     last_success = hb.get("last_success_at")
+    last_success_at = _parse_dt(last_success or "")
     age = (now - updated_at).total_seconds() if updated_at else None
+    succ_age = (now - last_success_at).total_seconds() if last_success_at else None
 
     log(f"[检查] date={hb_date} status={hb.get('status')} "
         f"updated_at={hb.get('updated_at')} 距今={f'{age:.0f}s' if age is not None else 'N/A'} "
-        f"last_success={last_success} collect_err={hb.get('collect_errors')}{suffix}")
+        f"last_success={last_success} "
+        f"距今={f'{succ_age:.0f}s' if succ_age is not None else 'N/A'} "
+        f"collect_err={hb.get('collect_errors')}{suffix}")
 
-    # ---- 判据：用 updated_at（循环存活），不用 last_success_at ----
+    # ---- 判据：用 updated_at（循环存活）----
     if age is not None and age <= STALE_SECONDS:
+        # 循环还活着。但"活着"≠"在采数"—— H36 的盲区正藏在这一句之后：
+        # 采集停摆时 updated_at 照刷、age 恒小，旧版会直接判健康退出。
+        _report_success_staleness(hb, succ_age, suffix)
         return 0   # 健康
 
     # ---- 心跳静默：分三种情况处置 ----

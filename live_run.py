@@ -43,6 +43,7 @@ except Exception:
     pass
 
 import live_match_loop as match  # noqa: E402
+from core.close_timing import is_today_close_bar  # noqa: E402
 from core.market_collector import MarketCollector  # noqa: E402
 
 # COMBOS 里同一 code 可能对应多个策略，去重保留出现顺序（日志里不再出现重复 code）。
@@ -169,45 +170,58 @@ def main() -> None:
                                  match_errors)
                 raise
 
-        # 收盘判定：数据最后 bar 到 14:59 后，连续无新 bar 才写摘要。
+        # 收盘判定：两条**独立**通道 —— 硬收盘不得嵌在 bar 条件里。
+        # ① 正常收盘：**今日**末根到 14:59，且连续 CLOSE_QUIET_ROUNDS 轮无新 bar。
+        #    日期归属校验堵住 H38-B：昨日 14:59 的末根不再被当作"今天已收盘"
+        #    （09-25 中秋空跑、09-30 开盘前中断重启，都是这条路径）。
+        # ② 硬收盘：本地 10:10（北京 15:10）无条件兜底。旧代码把 _past_hard_close()
+        #    写在 `if latest.time() >= 14:59` 内部，采集全天失败、latest 停在今日
+        #    14:30 时外层条件不成立 ⇒ 兜底永远走不到 ⇒ 摘要/health 全不写（H35）。
         try:
             latest = _latest_bar_time(observers)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("[latest] 读取最新bar时间失败，本轮跳过收盘判定")
             latest = None
-        if latest is not None and latest.time() >= datetime.strptime("14:59", "%H:%M").time():
+
+        close_reason = ""
+        if _past_hard_close():
+            close_reason = "硬收盘兜底（本地 10:10）"
+        elif is_today_close_bar(latest):
             if last_seen is not None and latest == last_seen:
                 quiet_rounds += 1
             else:
                 quiet_rounds = 0
             last_seen = latest
-            if quiet_rounds >= CLOSE_QUIET_ROUNDS or _past_hard_close():
-                _LOGGER.info("== 收盘缓冲结束，写每日摘要 ==")
-                print("== 收盘缓冲结束，写每日摘要 ==")
-                for obs in observers:
-                    summary_item = match._write_daily_summary(obs)
-                    _LOGGER.info("[daily] %s", summary_item)
-                # 每天必写健康标记（正常也写），文件日期未更新即视为断签。
-                health = {
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "collect_errors": collect_errors,
-                    "last_collected": last_collected,
-                    "observers": {
-                        f"{obs.code}×{obs.strategy_id}": {
-                            # 最新水位 = processed_times 里最大的已处理 bar 时间
-                            # （Observer 无 .watermark 属性，此前的 AttributeError 即因此）
-                            "latest_watermark": (max(obs.processed_times).isoformat()
-                                                  if obs.processed_times else None),
-                            "orders": len(obs.broker.orders),
-                            "fills": len(obs.broker.fills),
-                        }
-                        for obs in observers
-                    },
-                }
-                health_path.write_text(json.dumps(health, ensure_ascii=False, indent=2),
-                                       encoding="utf-8")
-                _LOGGER.info("[health] %s", health)
-                break
+            if quiet_rounds >= CLOSE_QUIET_ROUNDS:
+                close_reason = f"今日 14:59 后连续 {quiet_rounds} 轮无新 bar"
+
+        if close_reason:
+            _LOGGER.info("== 收盘（%s），写每日摘要 ==", close_reason)
+            print(f"== 收盘（{close_reason}），写每日摘要 ==")
+            for obs in observers:
+                summary_item = match._write_daily_summary(obs)
+                _LOGGER.info("[daily] %s", summary_item)
+            # 每天必写健康标记（正常也写），文件日期未更新即视为断签。
+            health = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "collect_errors": collect_errors,
+                "last_collected": last_collected,
+                "observers": {
+                    f"{obs.code}×{obs.strategy_id}": {
+                        # 最新水位 = processed_times 里最大的已处理 bar 时间
+                        # （Observer 无 .watermark 属性，此前的 AttributeError 即因此）
+                        "latest_watermark": (max(obs.processed_times).isoformat()
+                                              if obs.processed_times else None),
+                        "orders": len(obs.broker.orders),
+                        "fills": len(obs.broker.fills),
+                    }
+                    for obs in observers
+                },
+            }
+            health_path.write_text(json.dumps(health, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+            _LOGGER.info("[health] %s", health)
+            break
 
         time.sleep(POLL_INTERVAL)
 

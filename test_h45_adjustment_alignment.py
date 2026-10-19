@@ -111,3 +111,22 @@ def test_no_cache_and_fetch_fails_raises(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError):
         adjustment.load_backward_factor("300308")
+
+
+def test_bar_before_factor_start_degrades_instead_of_bfill(tmp_path, monkeypatch):
+    """早于因子起点的 bar 不得用 bfill 拿"未来"因子回填（H16 泄漏模式）。
+
+    旧实现 `series.bfill()` 会把因子首值前向传播到更早的日期，等于用未来
+    信息给过去定价，且结果看起来"正常"。现在改为：拿不到因子就报错，
+    由上层显式降级并 WARN —— 宁可少一个信号，也不静默算错。
+    """
+    _write_factor(tmp_path, [("2026-10-08", 6.603442),
+                             ("2026-10-09", 6.603442)])
+    monkeypatch.setattr(adjustment, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(adjustment, "_STALE_MAX_LAG_DAYS", 10_000)
+
+    out, _, mode = adjustment.prepare_signal_prices(
+        _bars(["2026-10-01", "2026-10-08"], 800.0), "300308")
+
+    assert mode == "不复权降级（异常跳变日暂停信号）"
+    assert out["signal_close"].tolist() == out["close"].tolist()

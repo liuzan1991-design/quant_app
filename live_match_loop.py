@@ -414,6 +414,20 @@ def _write_daily_summary(obs: Observer) -> dict:
         "note": "绝对收益不与回测直接比，只比策略行为一致性",
         "signal_compare": _compare_signals(obs),
     }
+    # H46-③：把网格引擎的关键状态写进摘要。原摘要只有权益/订单计数，
+    # 「已停止交易」与「正常运行但无信号」在外部完全无法区分（10-15~10-19 即如此漏掉）。
+    # 纯新增观测字段，不参与任何交易决策。
+    if obs.strategy_id == "grid_trade":
+        # 注意：obs 可能没有 engine 属性（单测构造的轻量 Observer）⇒ 必须先取 obs 再取 engine。
+        engine = getattr(obs, "engine", None)
+        st = getattr(engine, "state", None)
+        if st is not None:
+            defense_fn = getattr(engine, "_trend_defense_active", None)
+            bp = getattr(st, "base_price", None)
+            payload["stopped"] = bool(getattr(st, "stopped", False))
+            payload["defense"] = bool(defense_fn()) if callable(defense_fn) else None
+            payload["grid_bought"] = int(getattr(st, "grid_bought", 0))
+            payload["base_price"] = None if bp is None else round(float(bp), 4)
     body = json.dumps(payload, ensure_ascii=False, indent=2)
     # 按天留档：跨日不再覆盖，观察期历史永久可回溯（09-09 曾因覆盖丢失两天摘要）
     (obs.store.root / f"daily_summary_{payload['date'].replace('-', '')}.json").write_text(

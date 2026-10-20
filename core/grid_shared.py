@@ -99,6 +99,11 @@ class GridSharedEngine:
             self.state.day_amount = 0.0
             self.state.day_volume = 0.0
             self.state.prev_day = day
+            # H46-①：stopped 只锁「当日」。硬止损/账户亏损线每交易日重判。
+            # 原实现全代码仅 135 行置 True、无任何置回 False 的路径 ⇒ 一次触发即
+            # 终身停用（2026-10-15 起网格永久不再买入，且 orders/fills 停 1/1 无感）。
+            # 复位后本根 bar 继续往下走，若当日仍触线则 135 行立即再次置 True。
+            self.state.stopped = False
 
         self.state.day_amount += float(bar.get("amount", 0) or 0)
         self.state.day_volume += float(bar.get("volume", 0) or 0)

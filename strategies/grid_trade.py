@@ -117,6 +117,10 @@ class GridTradeStrategy(BaseStrategy):
             if day != prev_day:
                 acc.new_day()
                 prev_day = day
+                # H46-①：stopped 只锁当日，与 core/grid_shared.py 同语义。
+                # 回测/快速路径原本在一次触发后终身不再买入，与 live 修复前一致；
+                # 两条路径必须同步，否则 engine_consistency 会失去可比性。
+                stopped = False
 
             if base_price is None:
                 ok = acc.buy(cur, base_position) if base_position > 0 else True

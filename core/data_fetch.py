@@ -199,16 +199,25 @@ def fetch_kline(code: str, begin: str, end: str, period: str = "min1",
 
     socket 默认超时在外层设置：超时被放弃的工作线程不会回改全局值（否则会把
     外层刚设的值恢复成 None，重新变成无超时裸奔）。
+
+    ⚠️ 硬超时触发时**故意不复原**全局 socket 超时：被放弃的工作线程仍在跑 SDK
+    调用，若此刻把全局值恢复成 `None`，它立刻重新变成无限阻塞。代价是此后本进程
+    的 socket 默认超时停在 `_SDK_SOCKET_TIMEOUT`（有界，比 `None` 安全）。
     """
     old = socket.getdefaulttimeout()
     socket.setdefaulttimeout(_SDK_SOCKET_TIMEOUT)
+    abandoned = False
     try:
         if hard_timeout is None:
             return _fetch_kline_inner(code, begin, end, period)
         return _run_with_deadline(
             lambda: _fetch_kline_inner(code, begin, end, period), hard_timeout)
+    except AdFetchTimeout:
+        abandoned = True
+        raise
     finally:
-        socket.setdefaulttimeout(old)
+        if not abandoned:
+            socket.setdefaulttimeout(old)
 
 
 def incremental_update(code: str, start: str, end: str,

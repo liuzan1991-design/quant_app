@@ -189,6 +189,36 @@ def test_socket_timeout_restored_even_on_error(stub_login):
     assert socket.getdefaulttimeout() == baseline
 
 
+def test_socket_timeout_stays_armed_after_hard_timeout(stub_login, monkeypatch):
+    """硬超时后**不得**把全局超时复原成 None。
+
+    被放弃的工作线程仍在跑 SDK 调用（Python 无法强杀），若此时复原，它立刻
+    回到无限阻塞 —— 等于硬超时只切断了主线程、没切断真正卡住的那条链。
+    """
+    baseline = socket.getdefaulttimeout()
+    blocker = threading.Event()
+    stub_login["ad"] = _ad(blocker.wait, lambda: {})
+    monkeypatch.setattr(data_fetch, "LIVE_FETCH_TIMEOUT", 0.2)
+
+    box: dict = {}
+
+    def _call():
+        try:
+            MarketCollector(dry_run=False).fetch_today(CODE, DAY)
+        except BaseException as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(5.0)
+    try:
+        assert isinstance(box.get("exc"), AdFetchTimeout)
+        assert socket.getdefaulttimeout() == data_fetch._SDK_SOCKET_TIMEOUT, \
+            "超时后全局 socket 超时被复原 ⇒ 被放弃线程重新裸奔"
+    finally:
+        socket.setdefaulttimeout(baseline)  # 测试隔离：本文件跑完不留全局副作用
+
+
 # ------------------------------------------------------------- 4 墙钟硬上限
 def test_hard_timeout_cuts_off_blocking_calendar(stub_login, monkeypatch):
     """改前：get_calendar() 永不返回 ⇒ 整轮挂死（D24 的 158s/397s 块）。

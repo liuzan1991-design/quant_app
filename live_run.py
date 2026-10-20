@@ -12,6 +12,7 @@ import json
 import logging
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,7 @@ except Exception:
 import live_match_loop as match  # noqa: E402
 from core.close_timing import is_today_close_bar  # noqa: E402
 from core.market_collector import MarketCollector  # noqa: E402
+from core.data_fetch import format_failure_line  # noqa: E402
 
 # COMBOS 里同一 code 可能对应多个策略，去重保留出现顺序（日志里不再出现重复 code）。
 CODES = list(dict.fromkeys(c for c, _ in match.COMBOS))
@@ -131,6 +133,7 @@ def main() -> None:
     _LOGGER.info("== 观察期启动 == codes=%s", CODES)
     match_errors = 0  # 连续撮合异常计数；超过阈值说明状态已坏，退出交计划任务重启
     while True:
+        round_t0 = time.monotonic()
         # 采集当天实时数据
         try:
             collected = collector.run_once(CODES, datetime.now().strftime("%Y-%m-%d"))
@@ -140,9 +143,14 @@ def main() -> None:
                              last_success_at=last_success_at,
                              collect_errors=collect_errors, match_errors=match_errors)
             _LOGGER.info("[collector] 采集完成 %s", collected)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             collect_errors += 1
-            _LOGGER.exception("[collector] 采集失败")
+            # 单条记录同时承载「可聚合的分类行」与「可追溯的栈」：
+            # 分类行必须留在首行（"采集失败" 仍每块恰好出现 1 次，不破坏按块计数），
+            # 栈续行不带日志前缀，`^TypeError:` 之类的行首匹配照旧成立。
+            _LOGGER.error("%s\n%s",
+                          format_failure_line(exc, time.monotonic() - round_t0),
+                          traceback.format_exc())
             # 采集失败也落心跳（last_success_at 保持上次成功值），让断网可从 collect_errors 观测。
             _write_heartbeat(heartbeat_path, started_at, status="running",
                              last_success_at=last_success_at,

@@ -95,7 +95,10 @@ class MarketCollector:
             return 0
 
         from core import data_fetch  # 延迟导入：只有真正拉数才触碰 SDK 模块
-        df = data_fetch.fetch_kline(code, trade_day, trade_day, period="min1")
+        # hard_timeout：盘中单轮必须有墙钟上限。H44 实测 SDK 内部重试循环可把
+        # 单轮拖到 158~397 秒（socket 超时只管单次收发，管不住循环）。
+        df = data_fetch.fetch_kline(code, trade_day, trade_day, period="min1",
+                                    hard_timeout=data_fetch.LIVE_FETCH_TIMEOUT)
         if df is None or not len(df):
             print(f"[collector] {code} {trade_day} 无新数据（可能非交易日或接口未返回盘中数据）")
             return 0

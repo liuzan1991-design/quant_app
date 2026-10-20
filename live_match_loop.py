@@ -420,9 +420,17 @@ def _write_daily_summary(obs: Observer) -> dict:
     if obs.strategy_id == "grid_trade":
         # 注意：obs 可能没有 engine 属性（单测构造的轻量 Observer）⇒ 必须先取 obs 再取 engine。
         engine = getattr(obs, "engine", None)
-        st = getattr(engine, "state", None)
+        # 🚨 层级陷阱（2026-10-20 收盘后实测）：生产 obs.engine 是 GridSharedLiveEngine，
+        #    其 state 与 _trend_defense_active 都在**内层** self.engine（GridSharedEngine）上；
+        #    LiveEngine 自身既无 state 也无 _trend_defense_active（getattr 均返回 None）。
+        #    单测用 SimpleNamespace 单层替身，测不出这个差异 ⇒ 曾导致四字段在生产上静默缺失。
+        #    兼容两种形态：优先取内层，内层无 state 时回退外层。
+        inner = getattr(engine, "engine", None)
+        if getattr(inner, "state", None) is None:
+            inner = engine
+        st = getattr(inner, "state", None)
         if st is not None:
-            defense_fn = getattr(engine, "_trend_defense_active", None)
+            defense_fn = getattr(inner, "_trend_defense_active", None)
             bp = getattr(st, "base_price", None)
             payload["stopped"] = bool(getattr(st, "stopped", False))
             payload["defense"] = bool(defense_fn()) if callable(defense_fn) else None

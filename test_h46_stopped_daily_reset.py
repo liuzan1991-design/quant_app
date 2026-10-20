@@ -196,3 +196,60 @@ def test_summary_omits_grid_state_for_ma_swing(tmp_path, monkeypatch):
     payload = live_match_loop._write_daily_summary(obs)
     for k in ("stopped", "defense", "grid_bought", "base_price"):
         assert k not in payload, f"ma_swing 摘要不应包含 {k}"
+
+
+# ---------------------------------------------------------------------------
+# H46-③ 层级陷阱（2026-10-20 收盘后实测暴露）：
+#   生产 obs.engine = GridSharedLiveEngine，state / _trend_defense_active
+#   都在**内层** self.engine（GridSharedEngine）上；LiveEngine 自身两者皆无。
+#   上面那条测试用的是**单层** SimpleNamespace 替身 ⇒ 测不出这个差异，
+#   曾导致四字段在生产上静默缺失（无报错、无告警）。
+# ---------------------------------------------------------------------------
+
+def test_summary_writes_state_fields_for_nested_live_engine(tmp_path, monkeypatch):
+    """双层结构（对齐生产 GridSharedLiveEngine）也必须写出四字段。"""
+    from types import SimpleNamespace
+
+    import live_match_loop
+    from core.grid_shared import GridSharedState
+
+    monkeypatch.setattr(live_match_loop, "_compare_signals", lambda obs: {})
+    st = GridSharedState(base_price=772.8, anchor_price=840.0,
+                         grid_bought=0, stopped=True)
+    inner = SimpleNamespace(state=st, _trend_defense_active=lambda: True)
+    shell = SimpleNamespace(engine=inner)          # 形状对齐 GridSharedLiveEngine
+
+    obs = live_match_loop.Observer(
+        code="300308",
+        strategy_id="grid_trade",
+        symbol="300308.SZ",
+        params={},
+        broker=SimpleNamespace(
+            account=SimpleNamespace(equity=lambda: 980_877.0, cash=916_087.0),
+            orders={}, fills=[]),
+        store=SimpleNamespace(root=tmp_path),
+    )
+    obs.engine = shell
+    obs.equity_high = 1_000_000.0
+    obs.day_start_equity = 982_157.0
+    obs.day_high_equity = 982_157.0
+    obs.max_drawdown_cumulative = 0.0
+
+    payload = live_match_loop._write_daily_summary(obs)
+
+    assert payload["stopped"] is True
+    assert payload["defense"] is True         # 必须取到**内层**的方法
+    assert payload["grid_bought"] == 0
+    assert payload["base_price"] == pytest.approx(772.8, abs=1e-9)
+
+
+def test_grid_live_engine_has_no_own_state_attribute():
+    """结构哨兵：LiveEngine 自身无 state，取法必须往内层走。
+
+    若哪天 GridSharedLiveEngine 自己加了 state，本测试会失败，
+    提醒复核 live_match_loop 的层级取法（而不是悄悄按旧假设继续）。
+    """
+    from core.grid_shared_live import GridSharedLiveEngine
+
+    assert "state" not in dir(GridSharedLiveEngine)
+    assert "_trend_defense_active" not in dir(GridSharedLiveEngine)

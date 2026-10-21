@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
+from traceback import format_exc as _format_exc
 from uuid import uuid4
 
 from core.paper_models import (
@@ -182,11 +183,73 @@ class PaperBroker:
         return order
 
     def start_new_trading_day(self, trading_day: str) -> None:
+        # H40：先应用到期除权除息事件（只读本地缓存，失败不阻断换日），再解锁持仓。
+        # 顺序保证：事件应用后换日循环统一重置 sellable_quantity，送转股当日即可卖出。
+        self._apply_due_corporate_actions(trading_day)
         self.account.trading_day = trading_day
         self.account.daily_realized_pnl = 0.0
         for position in self.account.positions.values():
             position.sellable_quantity = position.quantity
             position.today_bought_quantity = 0
+
+    def apply_corporate_action(self, action, symbol: str) -> bool:
+        """应用一次除权除息事件（H40，2026-10-21 拍板：税前入账留痕、成本冲减、幂等）。
+
+        派息基数 = 登记日（送转前）持股；成本总价 = 原总成本 − 分红，送转摊薄每股。
+        纯分红：cost −= dps（与 10-12 实测口径一致）；纯送转：cost ÷= (1+r)。
+        同一 (symbol, ex_date) 只应用一次；无持仓也记账，防重复扫描。返回是否实际应用。
+        """
+        last = self.account.applied_corporate_actions.get(symbol, "")
+        if action.ex_date <= last:
+            return False
+        self.account.applied_corporate_actions[symbol] = action.ex_date
+        position = self.account.positions.get(symbol)
+        if position is None or position.quantity <= 0:
+            return False
+        qty0 = position.quantity
+        cash_div = qty0 * action.dividend_per_share
+        total_cost = qty0 * position.average_cost
+        new_qty = int(round(qty0 * (1.0 + action.bonus_ratio))) if action.bonus_ratio > 0 else qty0
+        new_cost = (total_cost - cash_div) / new_qty
+        position.quantity = new_qty
+        position.average_cost = new_cost
+        if cash_div > 0:
+            self.account.cash += cash_div
+        position.sellable_quantity = max(position.sellable_quantity, new_qty)
+        self.audit_log.append({
+            "time": datetime.now(),
+            "event": "CORPORATE_ACTION",
+            "symbol": symbol,
+            "ex_date": action.ex_date,
+            "plan": action.plan_desc,
+            "dividend_per_share": action.dividend_per_share,
+            "bonus_ratio": action.bonus_ratio,
+            "cash_in": cash_div,
+            "qty_before": qty0,
+            "qty_after": new_qty,
+            "cost_before": (total_cost / qty0) if qty0 else 0.0,
+            "cost_after": new_cost,
+        })
+        return True
+
+    def _apply_due_corporate_actions(self, trading_day: str) -> None:
+        """换日钩子：对全部持仓标的应用到期除权事件。只读缓存，任何异常不阻断换日。"""
+        try:
+            from core import corporate_actions as _ca
+            symbols = list(self.account.positions.keys()) or \
+                list(self.account.applied_corporate_actions.keys())
+            for symbol in symbols:
+                code = _ca.symbol_to_code(symbol)
+                last = self.account.applied_corporate_actions.get(symbol, "")
+                for action in _ca.pending_from_cache(code, last, trading_day):
+                    self.apply_corporate_action(action, symbol)
+        except Exception:  # noqa: BLE001 —— 记账修正不应阻断交易主流程；留审计痕迹
+            self.audit_log.append({
+                "time": datetime.now(),
+                "event": "CORPORATE_ACTION_ERROR",
+                "trading_day": trading_day,
+                "error": _format_exc(),
+            })
 
     def mark_to_market(self, market: MarketSnapshot) -> None:
         position = self.account.positions.get(market.symbol)

@@ -45,6 +45,7 @@ except Exception:
 
 import live_match_loop as match  # noqa: E402
 from core.close_timing import is_today_close_bar  # noqa: E402
+from core.corporate_actions import refresh_cache as _refresh_corporate_actions  # noqa: E402
 from core.market_collector import MarketCollector  # noqa: E402
 from core.data_fetch import format_failure_line  # noqa: E402
 
@@ -122,6 +123,14 @@ def main() -> None:
         _write_heartbeat(heartbeat_path, started_at, status="failed",
                          last_success_at=None, collect_errors=0, match_errors=0)
         raise
+
+    # H40：启动时刷新公司行为缓存（低频记账事件，TTL 7 天；失败降级旧缓存，仅告警不阻断当日运行）。
+    for _code in CODES:
+        try:
+            _, _fresh = _refresh_corporate_actions(_code)
+            _LOGGER.info("公司行为缓存 code=%s fresh=%s", _code, _fresh)
+        except Exception:
+            _LOGGER.warning("公司行为缓存刷新失败（用旧缓存继续） code=%s", _code, exc_info=True)
 
     quiet_rounds = 0
     last_seen = None

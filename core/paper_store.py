@@ -95,6 +95,8 @@ class PaperStateStore:
             daily_realized_pnl=float(account_data.get("daily_realized_pnl", 0.0)),
             consecutive_stop_losses=dict(account_data.get("consecutive_stop_losses", {})),
             symbol_pause_until=dict(account_data.get("symbol_pause_until", {})),
+            # H40：旧快照无此字段时取空（幂等记录重启续跑不丢）
+            applied_corporate_actions=dict(account_data.get("applied_corporate_actions", {})),
         )
         for item in payload.get("orders", []):
             request_data = item["request"]

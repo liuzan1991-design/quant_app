@@ -99,6 +99,8 @@ class AccountState:
     daily_realized_pnl: float = 0.0
     consecutive_stop_losses: Dict[str, int] = field(default_factory=dict)
     symbol_pause_until: Dict[str, str] = field(default_factory=dict)
+    # H40：已应用的除权除息事件（symbol → 最晚 ex_date），落盘进 paper_state.json 保证幂等
+    applied_corporate_actions: Dict[str, str] = field(default_factory=dict)
 
     def equity(self) -> float:
         return self.cash + sum(position.market_value for position in self.positions.values())

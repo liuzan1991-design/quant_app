@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
@@ -36,6 +37,7 @@ def collect(df):
             for o in b.orders.values()], b
 
 
+@pytest.mark.slow
 def test_future_mutation_does_not_change_past_signals():
     df = pd.read_csv(APP_DIR / "data" / "stock_300308_1m.csv", parse_dates=["time"])
     cutoff = df["time"].sort_values().iloc[min(len(df) - 1, 50000)]
@@ -47,6 +49,7 @@ def test_future_mutation_does_not_change_past_signals():
     assert [x for x in original_signals if x[0] <= cutoff] == [x for x in changed_signals if x[0] <= cutoff]
 
 
+@pytest.mark.slow
 def test_no_duplicate_signal_per_day_and_original_run_unchanged():
     df = pd.read_csv(APP_DIR / "data" / "stock_300308_1m.csv", parse_dates=["time"])
     signals, b = collect(df)

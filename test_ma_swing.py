@@ -3,6 +3,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.data import load_data  # noqa: E402
@@ -28,6 +30,7 @@ def main() -> int:
     return ran
 
 
+@pytest.mark.slow
 def test_ma_swing_smoke():
     """pytest 入口：包装原 main()。
 

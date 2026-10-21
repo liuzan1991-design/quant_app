@@ -1,0 +1,7 @@
+# 行尾按 LF 固定，不随 core.autocrlf 变化。
+# 原因：scripts/skill_sync.py 用 sha256 判断「仓库副本 vs C 盘部署副本」是否一致。
+# 若换行在 checkout 时被转成 CRLF，而部署侧是 LF，就会报出**假的漂移**
+# （内容其实一样），把唯一的真信号淹掉。
+tools/skills/** text eol=lf
+scripts/skill_sync.py text eol=lf
+test_skill_sync.py text eol=lf

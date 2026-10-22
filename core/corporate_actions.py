@@ -24,12 +24,24 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _CACHE_TTL_DAYS = 7  # 除权实施公告通常早于除权日 1~2 周；7 天足够新，又不必每天拉
-_EASTMONEY_URL = (
+_EASTMONEY_BASE = (
     "https://datacenter-web.eastmoney.com/api/data/v1/get"
     "?reportName=RPT_SHAREBONUS_DET&columns=ALL"
-    '&filter=(SECURITY_CODE="{code}")(ASSIGN_PROGRESS="实施分配")'
+    "&filter={flt}"
     "&sortColumns=EX_DIVIDEND_DATE&sortTypes=-1&pageSize=100&pageNumber=1"
 )
+
+
+def build_url(code: str) -> str:
+    """构造东财请求 URL。
+
+    🚨 H48：filter 里含中文「实施分配」，而 ``http.client`` 的请求行**只能**
+    ``encode('ascii')`` ⇒ 裸中文必抛 ``UnicodeEncodeError``（生产首日 2026-10-22
+    04:32:08 实测，position 112-115 正好是这 4 个汉字）。
+    ⇒ 必须整体百分号编码（``safe=""`` 连 ``=`` ``"`` 一起编码，服务端实测可解析）。
+    """
+    flt = '(SECURITY_CODE="%s")(ASSIGN_PROGRESS="实施分配")' % code
+    return _EASTMONEY_BASE.format(flt=urllib.parse.quote(flt, safe=""))
 
 
 @dataclass(frozen=True)
@@ -76,7 +88,7 @@ def _parse_payload(payload: dict) -> List[CorporateAction]:
 
 def fetch_actions(code: str, timeout: int = 15) -> List[CorporateAction]:
     """拉取东财全量实施分配记录（网络）。"""
-    url = _EASTMONEY_URL.format(code=code)
+    url = build_url(code)
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8"))

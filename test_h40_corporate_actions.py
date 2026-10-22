@@ -99,6 +99,22 @@ def test_no_position_still_records():
     assert broker.account.applied_corporate_actions["300308.SZ"] == "2026-10-12"
 
 
+def test_build_url_is_ascii_encodable():
+    """H48：请求行只能 encode('ascii') ⇒ URL 里的中文必须先百分号编码。
+
+    生产首日（2026-10-22 04:32:08）真实抛过
+    ``UnicodeEncodeError: 'ascii' codec can't encode characters in position 112-115``
+    —— 正是 filter 里「实施分配」4 个汉字。原 8 例全绿却漏掉它，因为
+    ``fetch_actions`` 在测试里被整体替换（不打网络）⇒ **URL 构造零覆盖**。
+    """
+    url = ca.build_url("300308")
+    url.encode("ascii")  # 不抛 = 通过（这是本用例的核心断言）
+    assert "RPT_SHAREBONUS_DET" in url
+    assert "300308" in url
+    assert "%E5%AE%9E%E6%96%BD%E5%88%86%E9%85%8D" in url  # 实施分配
+    assert "ASSIGN_PROGRESS" in url
+
+
 def test_parse_eastmoney_payload():
     """东财 JSON 解析：null 送转字段 → 0、每10股 → 每股、按日期排序去重。"""
     payload = {"result": {"data": [

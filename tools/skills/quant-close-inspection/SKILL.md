@@ -185,9 +185,26 @@ D:/Anaconda3/python.exe scripts/tool_e5_trend_audit.py
 # ⓿ 前置：QMT 极简版必须在跑（它不随开机自启！重启后必查）
 ps -W 2>/dev/null | grep -iE "XtMiniQmt|miniquote" || echo "❌ QMT 没开 —— 先去开『迅投QMT交易终端 国盛证券实盘版』并登录"
 D:/Anaconda3/python.exe -c "import socket;s=socket.socket();s.settimeout(3);s.connect(('127.0.0.1',58610));print('✅ 58610 可连')"
-# ⓿' 🔥 仅"端口可连"不够 —— 必须验一根真实数据（2026-10-12 实证：端口通、读回仍 0 行）
-D:/Anaconda3/python.exe -c "from xtquant import xtdata;d=xtdata.get_market_data_ex(['time'],['300308.SZ'],period='1m',count=-1);n=len(d.get('300308.SZ',[]));print(('OK 1m 可读 %d 根'%n) if n else 'FAIL 1m 读回 0 行 —— QMT 会话未就绪')"
-# ① 对账
+# ⓿' 🔥 仅"端口可连"不够 —— 必须验真实数据 **且核末根日期**（2026-10-12 实证：端口通、读回仍 0 行）
+#     🚨 2026-10-22 实证（H49）：**根数万级也可能全是旧数据** —— QMT mini 启动后**不自动补当日**，
+#        实测 36,632 根、末根却是昨日 15:00，格式全对、零告警 ⇒ **只数根数会假绿**。必须看末根日期。
+D:/Anaconda3/python.exe - <<'PY'
+from xtquant import xtdata
+from datetime import datetime, timezone, timedelta
+d = xtdata.get_market_data_ex(['time'], ['300308.SZ'], period='1m', count=-1)
+df = d.get('300308.SZ')
+if df is None or len(df) == 0:
+    print('FAIL 1m 读回 0 行 —— QMT 会话未就绪')
+    raise SystemExit(1)
+last = datetime.fromtimestamp(float(df['time'].iloc[-1]) / 1000, timezone(timedelta(hours=8)))
+today = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
+print('OK 1m %d 根，末根 %s（北京）' % (len(df), last.strftime('%Y-%m-%d %H:%M')))
+print('判读：末根 %s %s 今日 %s' % (last.strftime('%Y-%m-%d'), '>=' if last.strftime('%Y-%m-%d') >= today else '<', today))
+if last.strftime('%Y-%m-%d') < today:
+    print('❌ 数据是「旧」不是「坏」—— 先补当日：')
+    print("   xtdata.download_history_data('300308.SZ','1m','%s','%s')" % (today.replace('-', ''), today.replace('-', '')))
+PY
+# ① 对账（脚本内置同一硬判据，绕过上面这段也不会假绿 —— H49 起 expect_day 生效）
 D:/Anaconda3/python.exe scripts/tool_qmt_ad_reconcile.py \
   --code 300308 --date 2026-09-22 \
   --local-csv "data/live/stock_300308_1m.csv"
@@ -199,7 +216,8 @@ D:/Anaconda3/python.exe scripts/tool_qmt_ad_reconcile.py \
 当时被误读为"QMT 本地 1m 缓存缺失 / 服务端有但通道读不回"，**两个定性都是错的** —— 登录极简版后**同一命令**读回 **4,983 → 34,945 根（145 个交易日，首 2026-03-09）** ⇒ **不是"某两天数据丢了"，是整个数据源处于降级／未就绪状态**。
 👉 **遇到 1m 读回 0 行：先回 ⓿'，不要去查 AD、不要去动 `data/`。**
 
-**📌 三层防线（2026-10-12 立）**：① 本 skill 的 ⓿/⓿' 前置；② 台账 §五 **§5.2**「QMT 对账前置检查」（主清单同项，防"绕过 skill 直接跑脚本"）；③ `scripts/tool_qmt_ad_reconcile.py` 待加自检（**未做，观察期纪律待用户授权**）。
+**📌 三层防线（2026-10-12 立，2026-10-22 修订）**：① 本 skill 的 ⓿/⓿' 前置；② 台账 §五 **§5.2**「QMT 对账前置检查」（主清单同项，防"绕过 skill 直接跑脚本"）；③ `scripts/tool_qmt_ad_reconcile.py` **已内置自检**（10-12 加 `preflight_qmt()`，未过 ⇒ exit 2 零产物；**10-22 H49 起把「末根日期 ≥ 期望交易日」并入硬判据**）。
+> ⚠️ 本行原文曾写「③ 待加自检（**未做**，观察期纪律待用户授权）」—— **与事实不符**（自检 10-12 就已随 `f96706d` 上线），2026-10-22 更正。教训：**"文档说没做"和"文档说做了"一样要核**。
 看：`best_shift`（应 −1，bar开始 vs bar结束）、末根收盘是否相等、量比中位（应 ~0.01）、`close` 一致率（~0.9958）。
 - **根数差 1 属正常**：AD 240 根（无 15:00 标签）vs QMT 241 根（末 15:00）——AD 把收盘量并入 14:59。
 - ⚠️ **QMT 索引按本机时区渲染**（本机 GMT+3 会给 `20260924043000`）⇒ **用 `epoch` 字段或 +5h 换算，别硬编码其它偏移**。

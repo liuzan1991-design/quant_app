@@ -37,7 +37,7 @@
 | **现在（AD）** | `base = ad.BaseData()` → `calendar = base.get_calendar()` → `market = ad.MarketData(calendar)` → `market.query_kline([ad_code], begin_date=int, end_date=int, period=...)` |
 | **QMT 对应** | 两步：① `xtdata.download_history_data(code, '1m', start, end)` ② `xtdata.get_market_data_ex([], [code], period='1m', start_time, end_time)`（或 `get_market_data`，见官方文档"获取行情数据"） |
 | **要做的转换** | 见下表 |
-| **风险** | ① **QMT 必须先 download 再 get**（官方原文："使用时需要先确保 MiniQmt 已有所需要的数据"）⇒ 失败模式与 AD 不同，多一个可能失败环节；② 返回 schema 不同（11 列 vs 7 列） |
+| **风险** | ① **QMT 必须先 download 再 get**（官方原文："使用时需要先确保 MiniQmt 已有所需要的数据"）⇒ 失败模式与 AD 不同，多一个可能失败环节；② 返回 schema 不同（11 列 vs 7 列）；③ 🔴 **不 download 时 get 不报错、只给旧数据**：2026-10-22 实证，QMT 刚启动时 `get_market_data_ex` 返回 **36,632 根、末根 10-21 15:00**（当日零根），**根数个万级、格式全对、无任何告警**，显式 `download_history_data('300308.SZ','1m','20261022','20261022')` 后才变 36,873 根（+241）⇒ **切源后采集入口必须「先 download 再 get，且 get 后二次校验末根日期 ≥ 期望交易日」两道**（H49） |
 
 **转换清单（7 项，全部已实测）**：
 

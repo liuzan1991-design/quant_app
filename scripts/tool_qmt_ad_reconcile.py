@@ -119,28 +119,62 @@ def _probe_port(host: str = "127.0.0.1", port: int = 58610, timeout: float = 3.0
         s.close()
 
 
-def _probe_1m(qmt_code: str) -> tuple[int | None, str]:
-    """读全量 1m 的根数（只读）。返回 (根数 or None, 错误说明)。"""
+def _csv_last_day(path: Path) -> str | None:
+    """读本地 AD CSV 的末行日期（只读末行，不整表加载）。失败返回 None。"""
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
+            last = ""
+            for line in fh:
+                if line.strip():
+                    last = line
+        day = last.split(",")[0].strip()[:10]
+        return day or None
+    except Exception:
+        return None
+
+
+def _probe_1m(qmt_code: str) -> tuple[int | None, str, str | None]:
+    """读全量 1m 的根数与末根日期（只读）。
+
+    返回 (根数 or None, 错误说明, 末根日期 YYYY-MM-DD or None)。
+    🚨 必须同时给末根日期：QMT mini 启动后**不自动补当日数据**，
+    只有昨日数据时这里照样返回数万根 ⇒ 只数根数会「假绿」（2026-10-22 实证）。
+    """
     try:
         from xtquant import xtdata
     except Exception as exc:
-        return None, f"import xtquant 失败：{type(exc).__name__}: {exc}"
+        return None, f"import xtquant 失败：{type(exc).__name__}: {exc}", None
     try:
         xtdata.enable_hello = False
     except Exception:
         pass
     try:
-        data = xtdata.get_market_data_ex([], [qmt_code], period="1m", count=-1)
+        data = xtdata.get_market_data_ex(["time"], [qmt_code], period="1m", count=-1)
     except Exception as exc:
-        return None, f"get_market_data_ex 异常：{type(exc).__name__}: {exc}"
+        return None, f"get_market_data_ex 异常：{type(exc).__name__}: {exc}", None
     raw = data.get(qmt_code) if isinstance(data, dict) else None
-    return (0 if raw is None else len(raw)), ""
+    if raw is None or len(raw) == 0:
+        return 0, "", None
+    last_day = None
+    try:
+        if "time" in getattr(raw, "columns", []):
+            ts = raw["time"].iloc[-1]
+            last_day = datetime.fromtimestamp(float(ts) / 1000, BJ).strftime("%Y-%m-%d")
+    except Exception:
+        last_day = None
+    return len(raw), "", last_day
 
 
-def preflight_qmt(qmt_code: str) -> bool:
+def preflight_qmt(qmt_code: str, expect_day: str | None = None) -> bool:
     """QMT 会话就绪自检 —— 对账前**必过**。True = 可继续。
 
     红线：**只读**。不登录、不下载 history、不下单、不写任何文件。
+
+    expect_day（YYYY-MM-DD，可选）：期望 QMT 本地 1m **已含**该交易日。
+      给定时「末根日期 >= expect_day」并入硬判据 —— 因为 QMT mini 启动后
+      **不会自动补当日数据**：2026-10-22 实证，QMT 刚启动时 `get_market_data_ex`
+      返回 36632 根「可读」数据、末根却是 10-21 15:00；只数根数会假绿。
+      None = 不检查（向后兼容 `tool_gap_probe.py` 等既有调用方，行为不变）。
     """
     print("── 前置自检（QMT 会话就绪）──")
 
@@ -155,31 +189,50 @@ def preflight_qmt(qmt_code: str) -> bool:
     print(f"  端口  : {'✅ 127.0.0.1:58610 可连' if port_ok else '❌ 127.0.0.1:58610 不可连'}"
           " —— 仅诊断线索，不否决")
 
-    n, err = _probe_1m(qmt_code)
+    n, err, qmt_last = _probe_1m(qmt_code)
     n_base: int | None = None
     if err:
-        print(f"  数据  : ❌ {err}   ← 唯一硬判据")
+        print(f"  数据  : ❌ {err}   ← 硬判据")
     elif n:
-        print(f"  数据  : ✅ 1m 全量可读 {n} 根   ← 唯一硬判据")
+        print(f"  数据  : ✅ 1m 全量可读 {n} 根，末根 {qmt_last or '未知'}   ← 硬判据")
     else:
         # 目标标的 0 行 ⇒ 再探基准标的，区分「会话未就绪」与「该标的本身无数据」
         if qmt_code != BASELINE_QMT_CODE:
-            n_base, _ = _probe_1m(BASELINE_QMT_CODE)
+            n_base, _, _ = _probe_1m(BASELINE_QMT_CODE)
         if n_base:
             print(f"  数据  : ❌ {qmt_code} 读回 0 行，但基准 {BASELINE_QMT_CODE} 可读 {n_base} 根")
             print("          ⇒ **会话正常**，是【该标的本地无 1m 数据】（未下载 / 代码有误）")
         elif n_base == 0:
-            print(f"  数据  : ❌ {qmt_code} 与基准 {BASELINE_QMT_CODE} **双双读回 0 行**   ← 唯一硬判据")
+            print(f"  数据  : ❌ {qmt_code} 与基准 {BASELINE_QMT_CODE} **双双读回 0 行**   ← 硬判据")
         else:
-            print(f"  数据  : ❌ {qmt_code} 读回 0 行   ← 唯一硬判据")
+            print(f"  数据  : ❌ {qmt_code} 读回 0 行   ← 硬判据")
 
-    if n:
+    stale = bool(n and expect_day and qmt_last and qmt_last < expect_day)
+    if n and expect_day and not qmt_last:
+        print("  新鲜度: ⚠️ 取不到末根时间，无法校验是否含期望交易日 —— 不否决")
+    elif stale:
+        print(f"  新鲜度: ❌ QMT 末根 {qmt_last} 早于期望交易日 {expect_day}"
+              "   ← 硬判据（数据未补到当日）")
+        d8 = expect_day.replace("-", "")
+        print(f"          ⇒ 先补数据：xtdata.download_history_data('{qmt_code}', '1m', '{d8}', '{d8}')")
+    elif n and expect_day:
+        print(f"  新鲜度: ✅ 末根 {qmt_last} ≥ 期望交易日 {expect_day}")
+
+    if n and not stale:
         print("  ⇒ 自检通过\n")
         return True
 
     print()
     print("=" * 74)
-    if n_base:
+    if stale:
+        print(f"❌ 前置自检未通过：QMT 本地 1m **未含期望交易日 {expect_day}**（末根 {qmt_last}）—— 对账中止。")
+        print()
+        print("   会话本身正常、数据也只是「旧」而非「坏」⇒ 补数据后再跑：")
+        d8 = expect_day.replace("-", "")
+        print(f"     xtdata.download_history_data('{qmt_code}', '1m', '{d8}', '{d8}')")
+        print()
+        print("   🚨 QMT mini 启动后**不会自动补当日数据**；只数根数会假绿（2026-10-22 实证）。")
+    elif n_base:
         print(f"❌ 前置自检未通过：{qmt_code} 在 QMT 本地没有 1m 数据 —— 对账中止。")
         print()
         print(f"   会话本身正常（基准 {BASELINE_QMT_CODE} 可读 {n_base} 根）⇒ 请检查：")
@@ -542,7 +595,12 @@ def main(argv=None) -> int:
 
     # 🚨 前置自检（2026-10-12 加）：单日 / --multi / --check-merge 三分支共用，必须先过。
     #    不过 ⇒ 退出码 2（正常 0、异常 1），且**上游一行产物都不写**。
-    if not preflight_qmt(qmt_code):
+    #    2026-10-22 加：期望交易日并入硬判据 —— QMT mini 启动后不自动补当日数据，
+    #    只有昨日数据时 `get_market_data_ex` 照样返回数万根 ⇒ 只数根数会假绿。
+    expect_day = args.date
+    if expect_day is None:
+        expect_day = _csv_last_day(local_csv)
+    if not preflight_qmt(qmt_code, expect_day=expect_day):
         return 2
 
     if args.check_merge:

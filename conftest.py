@@ -24,3 +24,19 @@ import tests_offline_guard as guard  # noqa: E402
 
 # 锁 1：同进程 monkeypatch（AppTest 与直接调用都在本进程内执行，可穿透）
 guard.install("conftest")
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_ad_session_state():
+    """H34：`data_fetch` 的会话治理状态（熔断计数/重建配额/日历缓存）是模块级单例。
+
+    不每个用例复位，前一个文件的失败游程会累到后一个文件 ⇒ 后者的"正常路径"
+    被熔断快速失败打死，红得像功能坏了（与 `_AD_CACHE` 跨文件污染同一类坑）。
+    """
+    from core import data_fetch
+    data_fetch.reset_session_state()
+    yield
+    data_fetch.reset_session_state()
+

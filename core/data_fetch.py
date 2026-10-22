@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
@@ -14,6 +15,7 @@ import pandas as pd
 from .ad_silence import suppress_sdk_output
 from .ad_errors import (  # noqa: F401  （部分名称在此 re-export，供 live_run / 工具脚本取用）
     AdCalendarError,
+    AdCircuitOpen,
     AdError,
     AdFetchTimeout,
     AdKlineEmpty,
@@ -44,6 +46,171 @@ _SDK_SOCKET_TIMEOUT = 20
 # 历史批量补数不启用 —— 长区间拉取本就该慢，不该被硬砍。
 LIVE_FETCH_TIMEOUT = 90
 
+# ------------------------------------------------------------------ H34 会话治理
+# 依据（28 份 live_*.log 全量统计，09-09~10-22，不是抽样）：
+#   TimeoutError@_login           417 次（49%）
+#   TypeError@get_calendar        360 次（42%）  ← H34 本体
+#   RuntimeError@fetch_kline       71 次（8%，**唯一**有清缓存重登的路径）
+# ⇒ 91% 的故障是"会话/连接不可用"，却只有 8% 那条路会重建。
+# 三件套：① 日历缓存（每日 300~470 次调用压到 1 次）；② 被动重建（统一入口）；
+#         ③ 熔断（限流，防"失败就重登"造出更多可能挂死的原生登录线程，H37）。
+_AD_LOCK = threading.RLock()   # 登录单飞 + 缓存读写互斥（原先裸 dict 无锁 ⇒ 并发互踢）
+_LOGIN_FAIL_COOLDOWN = 10.0    # 秒；登录失败后此时长内快速失败，避免线程排队串行登录
+
+REBUILD_MIN_INTERVAL = 60.0    # 秒；正常轮节拍 30~48s，60s 保证重建后至少跑完一轮再看结果
+REBUILD_DAILY_CAP = 20         # 每日重建上限；最坏日实测 197 块失败，不封顶会打出 197 个登录线程
+
+BREAKER_FAIL_THRESHOLD = 5     # 连续失败阈值：游程 ≤5 占实测 64.3%（≤3 会误伤 40% 的自愈故障）
+BREAKER_COOLDOWN = 180.0       # 秒；必须 > 实测单轮阻塞中位 158s / ~188s 簇形态
+# 计入熔断游程的 kind：calendar_error 走重建（5 次就把可重建故障判"整日不可用"是误判），
+# kline_empty 可能是休市/代码无效（H38 语境），同样不计。
+_BREAKER_KINDS = ("login_timeout", "login_error", "sdk_error", "fetch_timeout")
+
+_SESSION = {
+    "day": "",
+    "rebuild_count": 0,
+    "rebuild_rejected": 0,
+    "last_rebuild_at": 0.0,
+    "breaker_state": "closed",     # closed / open / half_open
+    "breaker_opens": 0,
+    "breaker_fails": 0,
+    "opened_at": 0.0,
+    "half_open_inflight": False,
+    "login_fail_at": 0.0,
+}
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _roll_session_day() -> None:
+    """换日清零重建计数（熔断计数不跨日累计，避免第二天开盘就带闸）。"""
+    today = _today()
+    with _AD_LOCK:
+        if _SESSION["day"] != today:
+            _SESSION["day"] = today
+            _SESSION["rebuild_count"] = 0
+            _SESSION["rebuild_rejected"] = 0
+            _SESSION["last_rebuild_at"] = 0.0
+            _SESSION["breaker_fails"] = 0
+            if _SESSION["breaker_state"] != "closed":
+                _SESSION["breaker_state"] = "closed"
+                _SESSION["half_open_inflight"] = False
+
+
+def reset_session_state() -> None:
+    """测试用：清日历缓存 + 全部治理计数（**不动** `_AD_CACHE["ad"]`）。
+
+    不整块 clear 是为了不干扰 `test_h44_ad_failure.py` 里
+    `monkeypatch.setattr(data_fetch, "_AD_CACHE", {})` + 手工塞 ad 的桩法。
+    """
+    with _AD_LOCK:
+        _AD_CACHE.pop("calendar", None)
+        _SESSION.update({
+            "day": _today(), "rebuild_count": 0, "rebuild_rejected": 0,
+            "last_rebuild_at": 0.0, "breaker_state": "closed", "breaker_opens": 0,
+            "breaker_fails": 0, "opened_at": 0.0, "half_open_inflight": False,
+            "login_fail_at": 0.0,
+        })
+
+
+def session_stats() -> dict:
+    """供心跳/巡检聚合的可观测字段（H46 教训：缺字段 ⇒ "进程活着"被误读成"在干活"）。"""
+    try:
+        with _AD_LOCK:
+            return {
+                "breaker_state": _SESSION["breaker_state"],
+                "breaker_opens": int(_SESSION["breaker_opens"]),
+                "breaker_fails": int(_SESSION["breaker_fails"]),
+                "rebuild_count": int(_SESSION["rebuild_count"]),
+                "rebuild_rejected": int(_SESSION["rebuild_rejected"]),
+            }
+    except Exception:  # noqa: BLE001 —— 可观测性代码不得成为新的失败点
+        return {}
+
+
+def _rebuild_session(reason: str) -> bool:
+    """被动重建：只清缓存，**不主动登录**，由下一次 fetch 在既有 45s 软超时下自然登录。
+
+    主动登录要新起线程，多一个可能挂死的原生线程（H37 正是登录在原生层 abort）；
+    复用既有路径 = 零新增风险，代价最多延后一轮（30s）。
+    返回 False 表示被限流拒绝（调用方应直接抛原异常，不要硬重试）。
+    """
+    try:
+        now = time.monotonic()
+        with _AD_LOCK:
+            if _SESSION["day"] != _today():
+                _roll_session_day()
+            if _SESSION["rebuild_count"] >= REBUILD_DAILY_CAP:
+                _SESSION["rebuild_rejected"] += 1
+                return False
+            if now - _SESSION["last_rebuild_at"] < REBUILD_MIN_INTERVAL:
+                _SESSION["rebuild_rejected"] += 1
+                return False
+            _AD_CACHE.clear()          # ad 引用 + calendar 缓存一起失效
+            _SESSION["last_rebuild_at"] = now
+            _SESSION["rebuild_count"] += 1
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _breaker_before_call() -> None:
+    """熔断门：open 且未到冷却 ⇒ 快速失败（不触任何 SDK）；冷却到期 ⇒ 放一个探针。"""
+    now = time.monotonic()
+    with _AD_LOCK:
+        state = _SESSION["breaker_state"]
+        if state == "open":
+            if now - _SESSION["opened_at"] < BREAKER_COOLDOWN:
+                left = BREAKER_COOLDOWN - (now - _SESSION["opened_at"])
+                raise AdCircuitOpen(
+                    f"星耀链路熔断中（连续失败 {_SESSION['breaker_fails']} 次，"
+                    f"冷却剩余 {left:.0f}s），本轮不调用 SDK", stage="circuit")
+            _SESSION["breaker_state"] = "half_open"
+            _SESSION["half_open_inflight"] = True
+            return
+        if state == "half_open":
+            if _SESSION["half_open_inflight"]:
+                raise AdCircuitOpen(
+                    "星耀链路半开探测进行中，本轮快速失败（并发探测会放大线程数）",
+                    stage="circuit")
+            _SESSION["half_open_inflight"] = True
+
+
+def _breaker_on_success() -> None:
+    try:
+        with _AD_LOCK:
+            _SESSION["breaker_fails"] = 0
+            _SESSION["half_open_inflight"] = False
+            _SESSION["breaker_state"] = "closed"
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _breaker_on_failure(exc: BaseException) -> None:
+    """按 kind 计数；只有 `_BREAKER_KINDS` 参与游程（calendar_error 走重建）。"""
+    try:
+        kind, _stage = classify(exc)
+        if kind not in _BREAKER_KINDS:
+            return
+        now = time.monotonic()
+        with _AD_LOCK:
+            if _SESSION["half_open_inflight"]:
+                _SESSION["half_open_inflight"] = False
+                _SESSION["breaker_state"] = "open"
+                _SESSION["opened_at"] = now
+                _SESSION["breaker_opens"] += 1
+                return
+            _SESSION["breaker_fails"] += 1
+            if (_SESSION["breaker_fails"] >= BREAKER_FAIL_THRESHOLD
+                    and _SESSION["breaker_state"] != "open"):
+                _SESSION["breaker_state"] = "open"
+                _SESSION["opened_at"] = now
+                _SESSION["breaker_opens"] += 1
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def code_to_ad(code: str) -> str:
     if "." in code:
@@ -63,41 +230,72 @@ def load_credentials() -> dict:
     return json.loads(CRED_FILE.read_text(encoding="utf-8"))
 
 
-def _login():
+def _import_ad():
+    """延迟导入 SDK。抽成函数仅为让测试注入替身（生产路径仍走真实 import，
+    受 H19 离线守卫约束：pytest 里 import 会被拦，故不能拿它当注入点）。"""
     import AmazingData as ad
-    if _AD_CACHE.get("ad") is not None:
+    return ad
+
+
+def _login():
+    """登录收口点（**H19 离线守卫在本函数上拦截**，测试里被整体替换）。
+
+    实现放在 `_login_impl`：守卫装的是本函数名，若把 200 行实现直接写在这里，
+    测试就无从验证锁/冷却本身（只能验证"守卫会拦"）。
+    """
+    return _login_impl()
+
+
+def _login_impl():
+    ad = _import_ad()
+    # 单飞：整段"查缓存 → 登录 → 写缓存"持锁。
+    # H34-1B：原先裸 dict 无锁 ⇒ 硬超时被放弃的线程与新一轮线程会并发登录，
+    #         触发 AD 单点登录互踢（实测 TimeoutError/TypeError 交替出现）。
+    with _AD_LOCK:
+        if _AD_CACHE.get("ad") is not None:
+            return _AD_CACHE["ad"]
+        # 失败冷却：多线程排队等锁时若前一个刚失败，不要接着一个个去登
+        # （每次 45s 且每次都会新增一个可能挂死的原生登录线程 = H37 的燃料）。
+        since_fail = time.monotonic() - _SESSION["login_fail_at"]
+        if _SESSION["login_fail_at"] and since_fail < _LOGIN_FAIL_COOLDOWN:
+            raise AdLoginTimeout(
+                f"星耀登录 {since_fail:.0f}s 前刚失败，冷却 "
+                f"{_LOGIN_FAIL_COOLDOWN:.0f}s 内不重试", stage="login")
+        cred = load_credentials()
+
+        result: dict = {}
+
+        def _worker():
+            # 底层 socket 默认超时：兜底 connect/recv 无限阻塞（SDK 可能显式 timeout=None）。
+            old = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(30)
+            try:
+                with suppress_sdk_output():
+                    ad.login(username=cred["username"], password=cred["password"],
+                             host=cred["host"], port=int(cred["port"]))
+                result["ad"] = ad
+            except Exception as exc:  # noqa: BLE001
+                result["err"] = exc
+            finally:
+                socket.setdefaulttimeout(old)
+
+        t = threading.Thread(target=_worker, daemon=True, name="ad-login")
+        t.start()
+        t.join(timeout=_LOGIN_TIMEOUT)
+        if "err" in result:
+            _SESSION["login_fail_at"] = time.monotonic()
+            raise AdLoginError(
+                f"星耀登录失败：{type(result['err']).__name__}: {result['err']}",
+                stage="login") from result["err"]
+        if "ad" not in result:
+            _SESSION["login_fail_at"] = time.monotonic()
+            raise AdLoginTimeout(
+                f"星耀登录超时（>{_LOGIN_TIMEOUT}秒），疑似网络不通或服务器无响应",
+                stage="login")
+        _AD_CACHE["ad"] = result["ad"]
+        _AD_CACHE.pop("calendar", None)   # 新会话 ⇒ 旧日历对象不再可信
+        _SESSION["login_fail_at"] = 0.0
         return _AD_CACHE["ad"]
-    cred = load_credentials()
-
-    result: dict = {}
-
-    def _worker():
-        # 底层 socket 默认超时：兜底 connect/recv 无限阻塞（SDK 可能显式 timeout=None）。
-        old = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(30)
-        try:
-            with suppress_sdk_output():
-                ad.login(username=cred["username"], password=cred["password"],
-                         host=cred["host"], port=int(cred["port"]))
-            result["ad"] = ad
-        except Exception as exc:  # noqa: BLE001
-            result["err"] = exc
-        finally:
-            socket.setdefaulttimeout(old)
-
-    t = threading.Thread(target=_worker, daemon=True, name="ad-login")
-    t.start()
-    t.join(timeout=_LOGIN_TIMEOUT)
-    if "err" in result:
-        raise AdLoginError(
-            f"星耀登录失败：{type(result['err']).__name__}: {result['err']}",
-            stage="login") from result["err"]
-    if "ad" not in result:
-        raise AdLoginTimeout(
-            f"星耀登录超时（>{_LOGIN_TIMEOUT}秒），疑似网络不通或服务器无响应",
-            stage="login")
-    _AD_CACHE["ad"] = result["ad"]
-    return _AD_CACHE["ad"]
 
 
 def _run_with_deadline(fn, timeout: float):
@@ -127,6 +325,43 @@ def _run_with_deadline(fn, timeout: float):
     return box.get("value")
 
 
+def _get_calendar(ad):
+    """取交易日历；**当日**缓存命中则完全不调 SDK。
+
+    H34 ①：正常日 300~470 轮 ⇒ 原先每轮必调 `get_calendar()`，把 42% 的故障面
+    暴露在一条没有重登的路径上。缓存后每日仅 1 次，且会话死亡会改成暴露在
+    `query_kline` 上 —— 那条路径本来就有清缓存重登（等价于"死路并到活路"）。
+    只缓存日历对象，**不缓存任何行情**；换日 / 会话重建 双失效。
+    """
+    today = _today()
+    cached = _AD_CACHE.get("calendar")
+    if isinstance(cached, dict) and cached.get("day") == today and cached.get("obj") is not None:
+        return cached["obj"]
+    try:
+        base = ad.BaseData()
+    except Exception as exc:  # noqa: BLE001
+        raise AdSdkError(
+            f"星耀 BaseData() 构造失败：{type(exc).__name__}: {exc}",
+            stage="calendar") from exc
+    try:
+        calendar = base.get_calendar()
+    except Exception as exc:  # noqa: BLE001
+        # 实测形态：SDK base_data.py:50 'NoneType' object is not subscriptable
+        raise AdCalendarError(
+            f"星耀 get_calendar() 抛 {type(exc).__name__}: {exc}",
+            stage="calendar") from exc
+    if calendar is None:
+        raise AdCalendarError(
+            "星耀 get_calendar() 返回 None（SDK 未就绪或会话异常）",
+            stage="calendar")
+    try:
+        with _AD_LOCK:
+            _AD_CACHE["calendar"] = {"day": today, "obj": calendar}
+    except Exception:  # noqa: BLE001 —— 缓存写失败只是退化，不得影响本次取数
+        pass
+    return calendar
+
+
 def _fetch_kline_inner(code: str, begin: str, end: str,
                        period: str = "min1") -> pd.DataFrame:
     """真实拉取逻辑（不含超时包装）。每个环节按 H44 分类返错。"""
@@ -136,22 +371,13 @@ def _fetch_kline_inner(code: str, begin: str, end: str,
     for attempt in range(2):
         ad = _login()
         try:
-            base = ad.BaseData()
-        except Exception as exc:  # noqa: BLE001
-            raise AdSdkError(
-                f"星耀 BaseData() 构造失败：{type(exc).__name__}: {exc}",
-                stage="calendar") from exc
-        try:
-            calendar = base.get_calendar()
-        except Exception as exc:  # noqa: BLE001
-            # 实测形态：SDK base_data.py:50 'NoneType' object is not subscriptable
-            raise AdCalendarError(
-                f"星耀 get_calendar() 抛 {type(exc).__name__}: {exc}",
-                stage="calendar") from exc
-        if calendar is None:
-            raise AdCalendarError(
-                "星耀 get_calendar() 返回 None（SDK 未就绪或会话异常）",
-                stage="calendar")
+            calendar = _get_calendar(ad)
+        except AdCalendarError:
+            # H34 本体（占全部失败 42%）：原先在这里直接 raise，绕过了唯一的重登通道。
+            # 现在统一走重建入口；重建成功则本轮再试一次（`_login` 会自然重登）。
+            if attempt == 0 and _rebuild_session("calendar_error"):
+                continue
+            raise
         try:
             market = ad.MarketData(calendar)
             period_val = getattr(ad.constant.Period, period).value
@@ -169,8 +395,8 @@ def _fetch_kline_inner(code: str, begin: str, end: str,
         if kline is not None and ad_code in kline and kline[ad_code] is not None:
             df = kline[ad_code].reset_index(drop=True)
             break
-        # 连接可能被顶/失效：清缓存重登重试一次
-        _AD_CACHE.clear()
+        # 连接可能被顶/失效：走统一重建入口（带 60s/20 次限流），下一轮自然重登
+        _rebuild_session("kline_empty")
         if attempt == 1:
             raise AdKlineEmpty(
                 f"星耀接口未返回 {ad_code} 的数据（可能账号连接被占用或代码无效，"
@@ -203,15 +429,32 @@ def fetch_kline(code: str, begin: str, end: str, period: str = "min1",
     ⚠️ 硬超时触发时**故意不复原**全局 socket 超时：被放弃的工作线程仍在跑 SDK
     调用，若此刻把全局值恢复成 `None`，它立刻重新变成无限阻塞。代价是此后本进程
     的 socket 默认超时停在 `_SDK_SOCKET_TIMEOUT`（有界，比 `None` 安全）。
+
+    H34 熔断（`_BREAKER_KINDS` 连续 5 次 ⇒ 开闸 180s ⇒ 单探针半开）：
+    - 开闸期间**不触任何 SDK**，直接抛 `AdCircuitOpen`（elapsed≈0）；
+    - 目的是不再新增"可能挂死的登录线程"（H37），不是省时间；
+    - `calendar_error` / `kline_empty` 不计入游程（前者走重建，后者可能是休市）。
     """
+    _roll_session_day()
+    _breaker_before_call()      # 抛 AdCircuitOpen 时**尚未**改 socket 全局值
     old = socket.getdefaulttimeout()
     socket.setdefaulttimeout(_SDK_SOCKET_TIMEOUT)
     abandoned = False
     try:
-        if hard_timeout is None:
-            return _fetch_kline_inner(code, begin, end, period)
-        return _run_with_deadline(
-            lambda: _fetch_kline_inner(code, begin, end, period), hard_timeout)
+        try:
+            if hard_timeout is None:
+                df = _fetch_kline_inner(code, begin, end, period)
+            else:
+                df = _run_with_deadline(
+                    lambda: _fetch_kline_inner(code, begin, end, period), hard_timeout)
+        except BaseException as exc:  # noqa: BLE001 —— 计数后原样抛出，不改语义
+            _breaker_on_failure(exc)
+            if getattr(exc, "kind", "") == "sdk_error":
+                # 会话级 SDK 异常（BaseData/MarketData/query 构造失败）也可能只是会话坏了
+                _rebuild_session("sdk_error")
+            raise
+        _breaker_on_success()
+        return df
     except AdFetchTimeout:
         abandoned = True
         raise

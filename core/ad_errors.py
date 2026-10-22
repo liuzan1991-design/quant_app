@@ -13,6 +13,7 @@
 | `kline_empty`   | `query_kline` 空返回（重登重试后仍空）    | 8–61s        |
 | `sdk_error`     | 其余 SDK 异常（如 `Exception: 查询失败`） | 8–61s        |
 | `fetch_timeout` | 整轮 wall-clock 上限（线程被放弃）        | 上限值       |
+| `circuit_open`  | 熔断开闸期间快速失败（不调任何 SDK）      | ≈0（H34 三件套）|
 
 ⚠️ 新增 kind 前先在本文件 grep，避免同义异名（§6.9 第十六形态）。
 ⚠️ 所有异常都继承 `AdError(RuntimeError)`，`*_timeout` 额外继承 `TimeoutError`，
@@ -22,13 +23,13 @@ from __future__ import annotations
 
 __all__ = [
     "AdError", "AdLoginTimeout", "AdLoginError", "AdCalendarError",
-    "AdKlineEmpty", "AdSdkError", "AdFetchTimeout",
+    "AdKlineEmpty", "AdSdkError", "AdFetchTimeout", "AdCircuitOpen",
     "classify", "format_failure_line", "KINDS",
 ]
 
 KINDS = (
     "login_timeout", "login_error", "calendar_error",
-    "kline_empty", "sdk_error", "fetch_timeout",
+    "kline_empty", "sdk_error", "fetch_timeout", "circuit_open",
 )
 
 
@@ -81,6 +82,18 @@ class AdFetchTimeout(AdError, TimeoutError):
     """整轮硬超时：墙钟上限到点，工作线程被放弃（Python 无法强杀线程）。"""
 
     kind = "fetch_timeout"
+
+
+class AdCircuitOpen(AdError):
+    """熔断开闸：连续失败超阈值后快速失败，**不调用任何 SDK**。
+
+    H34 三件套之一。目的不是省时间，而是不再新增"可能挂死的登录线程"
+    （H37：AD 登录在原生层 abort）。继承 `RuntimeError`，既有
+    `except RuntimeError` 语义不变；**不继承 TimeoutError** —— 它不是超时，
+    也不想被历史 `except TimeoutError` 当成"再试一次"的信号。
+    """
+
+    kind = "circuit_open"
 
 
 _FALLBACK_BY_TYPE = {

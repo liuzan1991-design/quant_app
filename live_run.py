@@ -85,6 +85,8 @@ def _write_heartbeat(path: Path, started_at: datetime, status: str,
     - 没有 heartbeat.json            → 今天根本没启动（计划任务漏触发）；
     - started_at 有、last_success_at 为 None → 启动了但从未采到数据（登录失败/网络断）；
     - last_success_at 停在某个时刻    → 从那之后采集停摆（中途断网/崩溃）。
+    - breaker_state / rebuild_count   → H34 会话治理是否在"重建/开闸"（H46 教训：
+      没有字段就会被读成"一切正常"，进程活着 ≠ 策略在工作）。
     """
     try:
         heartbeat = {
@@ -97,6 +99,11 @@ def _write_heartbeat(path: Path, started_at: datetime, status: str,
             "match_errors": match_errors,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
+        try:
+            from core import data_fetch as _df
+            heartbeat.update(_df.session_stats())
+        except Exception:  # noqa: BLE001 —— 可观测性字段缺失不该让心跳写不出去
+            pass
         path.write_text(json.dumps(heartbeat, ensure_ascii=False, indent=2),
                         encoding="utf-8")
     except Exception:  # noqa: BLE001

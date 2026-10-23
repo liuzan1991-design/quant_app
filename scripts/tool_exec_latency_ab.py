@@ -18,6 +18,17 @@
 **2026-09-18 首轮实测结论**：grid_trade 在 K=1（次根开盘）下收益变动 ≤0.05%（四个窗口），
 即「同根成交」在本策略上**几乎没有虚高**；ma_swing 的 K=1 变动 ±1%（1 分钟噪声量级）。
 
+**⚠️ 2026-10-23 复跑修正（原结论数字需作废重读）**：发现本脚本 k>0 分支**漏加 5bps 滑点**
+（K=0 加了、延迟腿没加）⇒ 原 A/B 把"少付滑点"混进了"延迟"效应，K>0 被系统性抬高。
+修正后（同费率新口径 + 滑点两侧一致）：
+  · grid_trade K=1 次根开盘变动 **+0.22% ~ +0.86%**（四个窗口同向为正）
+    ⇒ 「同根成交」在本策略上**不是虚高，反而略偏保守**（延迟成交更赚）。
+  · 原 ≤0.05% 的读数**不可再引用**；结论方向（未见系统性虚高）不变，量级放大一个数量级。
+  · ma_swing K=1 变动 −0.68% ~ +0.72%（符号混合 = 1 分钟噪声），口径本就干净。
+  · 新增「价差影响·路径无关」列：不重放现金路径，只算 Σ(延迟价−原价)×股数−Δ费用，
+    用于路径分叉窗口（复价后买入被拒 ⇒ 持仓被劈开）的可信替代读数。
+  · 新增自动分叉标注：任一情形 `跳过笔数>0` 或期末持仓 != K=0 ⇒ 标 ⚠路径分叉 并清空变动率。
+
 对照实验：ma_swing 本来就 `shift(1)` + 次日开盘成交，两条策略的执行口径本就不同。
 """
 from __future__ import annotations
@@ -94,13 +105,49 @@ def replay_with_account(trades: pd.DataFrame, params: dict, df: pd.DataFrame,
         else:
             px = price_by_time.get(ts, np.nan)
             if not np.isfinite(px):            # 末尾不足 k 根 → 退回原价并计数
-                px = raw_price(float(t["price"]), side, params["slippage_bps"])
+                px = float(t["price"])
                 n_skip += 1
+            # 2026-10-23 修正：延迟腿原先直接用原始 open/close，**漏掉 5bps 滑点**，
+            # 而 K=0 生产口径是加了滑点的 ⇒ 原 A/B 把"少付滑点"混进了"延迟"效应，
+            # K>0 结果被系统性抬高。此处统一为同一套执行假设（只改 bar 位移，不改成本）。
+            px = raw_price(px, side, params["slippage_bps"])
         ok = acc.buy(px, qty) if side == "BUY" else acc.sell(px, qty)
         if not ok:
             n_skip += 1
     return {"equity": acc.equity(last_close), "cash": acc.cash, "pos": acc.total,
             "fees": acc.total_fees, "n_skip": n_skip}
+
+
+def price_only_pnl_delta(trades: pd.DataFrame, params: dict, df: pd.DataFrame,
+                         k: int, use: str, init_cash: float) -> dict:
+    """路径无关口径：只问「成交价挪 k 根 bar」本身值多少钱，不重放现金/持仓路径。
+
+    Δequity = Σ sign·(延迟价 − 原价)·股数 − Δ费用，sign：卖 +1 / 买 −1。
+    费用项按修正后费率线性近似（成交额变化量 × 费率；最低佣金在 1 手规模不触发）。
+    ⇒ 该口径**不受"复价后买入被拒"的路径分叉影响**，可与分叉窗口的 A/B 数字并行采信。
+    """
+    d = df.sort_values("time").reset_index(drop=True)
+    px_delayed = d[use].shift(-k)
+    price_by_time = dict(zip(d["time"], px_delayed))
+    gross = fee_delta = 0.0
+    n_missing = 0
+    for _, t in trades.iterrows():
+        ts = pd.Timestamp(t["time"])
+        px_new = price_by_time.get(ts, np.nan)
+        if not np.isfinite(px_new):
+            n_missing += 1
+            continue
+        side, qty = t["direction"], int(t["shares"])
+        delta_px = float(px_new) - float(t["price"])
+        d_value = delta_px * qty
+        sign = 1.0 if side == "SELL" else -1.0
+        gross += sign * d_value
+        rate = (params["commission_rate"] + params["transfer_fee_rate"]
+                + (params["stamp_tax_rate"] if side == "SELL" else 0.0))
+        fee_delta += rate * abs(d_value)
+    net = gross - fee_delta
+    return {"gross": gross, "fee_delta": fee_delta, "net": net,
+            "net_pct_of_cash": net / init_cash * 100, "n_missing": n_missing}
 
 
 def count_phantoms(trades: pd.DataFrame, params: dict, df: pd.DataFrame,
@@ -146,15 +193,33 @@ def run_case(sid: str, df: pd.DataFrame, label: str) -> tuple[list[dict], list[d
         delayed = d["close"].shift(0) if use is None else d[use].shift(-k)
         res = replay_with_account(trades, p, df, delayed, k, CASH)
         ret = (res["equity"] / CASH - 1) * 100
+        po = (price_only_pnl_delta(trades, p, df, k, use, CASH) if use is not None
+              else {"net": 0.0, "net_pct_of_cash": 0.0, "n_missing": 0})
         out.append({"策略": sid, "窗口": label, "情形": name,
                     "期末权益": round(res["equity"], 2),
                     "收益%": round(ret, 3),
                     "相对K0变动%": None,  # 下面回填
                     "手续费": round(res["fees"], 2),
-                    "期末持仓": res["pos"], "跳过笔数": res["n_skip"]})
+                    "期末持仓": res["pos"], "跳过笔数": res["n_skip"],
+                    "价差影响·路径无关(元)": round(po["net"], 2),
+                    "价差影响·占初始资金%": round(po["net_pct_of_cash"], 4),
+                    "缺后续bar笔数": po["n_missing"]})
     base = out[0]["期末权益"]
     for row in out:
         row["相对K0变动%"] = round((row["期末权益"] / base - 1) * 100, 4)
+
+    # H13 教训（2026-09-18 首轮 + 2026-10-23 复跑均命中）：复价后若有一笔买入因现金不足被拒，
+    # 持仓路径被劈开 ⇒ 该窗口的 A/B 差异是【路径分叉复合效应】，不可读作"前视虚高"。
+    # 这里自动标注，避免再次靠人眼核对"跳过笔数/期末持仓"。
+    base_pos = out[0]["期末持仓"]
+    split_rows = [row_ for row_ in out[1:]
+                  if (row_["跳过笔数"] or 0) > 0 or row_["期末持仓"] != base_pos]
+    if split_rows:
+        for row_ in split_rows:
+            row_["情形"] = "⚠路径分叉 " + row_["情形"]
+            row_["相对K0变动%"] = None      # 分叉窗口不提供可比的"变动率"
+        print(f"⚠ {sid} / {label}: {len(split_rows)} 个情形发生路径分叉"
+              f"（K=0 持仓 {base_pos}）⇒ 这些情形的相对变动不可用", flush=True)
 
     ph = count_phantoms(trades, p, df, CASH)
     contract_ok = abs(out[0]["期末权益"] - prod_eq) < 0.01 and out[0]["期末持仓"] == int(

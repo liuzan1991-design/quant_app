@@ -74,3 +74,15 @@ def test_h15_strategy_param_meta_confirmed():
         assert p["min_commission"] == pytest.approx(1.0), sid
         assert p["stamp_tax_rate"] == pytest.approx(0.0005), sid
         assert p["transfer_fee_rate"] == pytest.approx(0.00001), sid
+
+
+def test_h15_slippage_defaults_unified():
+    """H15 滑点子项：回测默认滑点必须与 live 一致（paper_broker 5bps）。
+
+    原状：grid_trade / intraday_t 默认 0（零滑点回测），ma_swing 5，live 恒 5
+    ⇒ 回测与 live、策略之间的成本假设不在同一把尺子上。
+    """
+    from strategies import get_strategy
+    for sid in ("grid_trade", "ma_swing", "intraday_t"):
+        assert get_strategy(sid).default_params()["slippage_bps"] == pytest.approx(5.0), sid
+    assert PaperBrokerConfig().slippage_bps == pytest.approx(5.0)

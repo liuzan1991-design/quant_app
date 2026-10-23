@@ -48,7 +48,8 @@ class IntradayTStrategy(BaseStrategy):
                   group="cost"),
         ParamMeta("transfer_fee_rate", "过户费", 0.00001, "number", 0.0, 0.001, 0.00001,
                   group="cost"),
-        ParamMeta("slippage_bps", "滑点(bps)", 0, "number", 0, 100, 1,
+        # H15 滑点子项（2026-10-23）：0 → 5，与 live（paper_broker 5bps）同一把尺子。
+        ParamMeta("slippage_bps", "滑点(bps)", 5, "number", 0, 100, 1,
                   group="cost", help="1 bps=0.01%，买入加价、卖出减价；做T高频建议按实际设 5-10"),
     ]
 

@@ -23,8 +23,9 @@ ACTION_2024 = ca.CorporateAction(ex_date="2024-06-06", dividend_per_share=0.45,
 def _broker_with_position(cash: float = 916_087.0, qty: int = 100, cost: float = 839.1299885):
     broker = PaperBroker(cash, "2026-10-09")
     from core.paper_models import Position
+    # opened_date = 真实建仓日（D1 2026-09-09，底仓首笔成交），H50 锚点必需
     pos = Position(symbol="300308.SZ", quantity=qty, sellable_quantity=qty,
-                   average_cost=cost, market_price=774.10)
+                   average_cost=cost, market_price=774.10, opened_date="2026-09-09")
     broker.account.positions["300308.SZ"] = pos
     return broker
 
@@ -147,3 +148,68 @@ def test_store_roundtrip_and_legacy_snapshot(tmp_path):
                                                encoding="utf-8")
     legacy = store.load()
     assert legacy.account.applied_corporate_actions == {}
+
+
+# ===== H50（2026-10-23）：重放锚定建仓日，杜绝历史全量重放 =====
+
+def _write_cache(tmp_path, actions):
+    payload = {"code": "300308", "actions": [a.__dict__ for a in actions]}
+    (tmp_path / "corporate_actions_300308.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def test_h50_history_not_replayed(tmp_path, monkeypatch):
+    """applied 为空时只应用建仓日之后的事件：2013/2014 两次 10转8 不得重放。"""
+    monkeypatch.setattr(ca, "DATA_DIR", tmp_path)
+    _write_cache(tmp_path, [
+        ca.CorporateAction(ex_date="2013-05-17", dividend_per_share=0.1,
+                           bonus_ratio=0.8, plan_desc="10转8派1"),
+        ca.CorporateAction(ex_date="2014-10-08", dividend_per_share=0.0,
+                           bonus_ratio=0.8, plan_desc="10转8"),
+        D19_ACTION,
+    ])
+    broker = _broker_with_position()  # opened_date=2026-09-09
+    broker.start_new_trading_day("2026-10-23")
+    pos = broker.account.positions["300308.SZ"]
+    assert pos.quantity == 100, "历史送转不得重放到当前持仓"
+    assert pos.average_cost == pytest.approx(839.1299885 - 1.20)
+    assert broker.account.cash == pytest.approx(916_087.0 + 120.0)
+    assert broker.account.applied_corporate_actions["300308.SZ"] == "2026-10-12"
+
+
+def test_h50_legacy_no_anchor_skips(tmp_path, monkeypatch):
+    """历史快照无 opened_date 且 applied 为空 ⇒ 不重放任何历史（宁漏勿错）+ 留审计。"""
+    monkeypatch.setattr(ca, "DATA_DIR", tmp_path)
+    _write_cache(tmp_path, [D19_ACTION])
+    broker = _broker_with_position()
+    broker.account.positions["300308.SZ"].opened_date = ""
+    broker.start_new_trading_day("2026-10-23")
+    pos = broker.account.positions["300308.SZ"]
+    assert pos.quantity == 100 and pos.average_cost == pytest.approx(839.1299885)
+    assert broker.account.cash == pytest.approx(916_087.0)
+    assert "CORPORATE_ACTION_SKIPPED_NO_ANCHOR" in [e["event"] for e in broker.audit_log]
+
+
+def test_h50_opened_date_recorded_on_first_fill():
+    """首笔成交自动落 opened_date（新仓位不再依赖手工字段）。"""
+    from core.paper_models import Fill, OrderSide
+    import datetime as _dt
+    broker = PaperBroker(1_000_000.0, "2026-10-23")
+    fill = Fill(fill_id="f1", client_order_id="o1", symbol="300308.SZ",
+                side=OrderSide.BUY, quantity=100, price=572.01, fee=5.0,
+                filled_at=_dt.datetime(2026, 10, 23, 9, 30, 0))
+    broker._apply_fill(fill)
+    assert broker.account.positions["300308.SZ"].opened_date == "2026-10-23"
+
+
+def test_h50_action_after_open_date_still_applies(tmp_path, monkeypatch):
+    """建仓日之后的新事件照常应用（锚点不误伤未来除权）。"""
+    monkeypatch.setattr(ca, "DATA_DIR", tmp_path)
+    future = ca.CorporateAction(ex_date="2026-11-10", dividend_per_share=0.5,
+                                bonus_ratio=0.0, plan_desc="10派5")
+    _write_cache(tmp_path, [D19_ACTION, future])
+    broker = _broker_with_position()
+    broker.start_new_trading_day("2026-10-12")   # 先正常应用 10-12
+    assert broker.account.cash == pytest.approx(916_087.0 + 120.0)
+    broker.start_new_trading_day("2026-11-10")   # 未来除权日照常
+    assert broker.account.cash == pytest.approx(916_087.0 + 120.0 + 50.0)

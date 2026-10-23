@@ -83,6 +83,9 @@ class Position:
     market_price: float = 0.0
     today_bought_quantity: int = 0
     realized_pnl: float = 0.0
+    # H50：建仓日（首笔成交日期，ISO 字符串）。公司行为钩子以此锚定"只应用持仓期内"的
+    # 除权事件；空值（历史快照未知）⇒ 不重放任何历史，宁可漏、不可错。
+    opened_date: str = ""
 
     @property
     def market_value(self) -> float:

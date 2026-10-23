@@ -241,7 +241,20 @@ class PaperBroker:
             for symbol in symbols:
                 code = _ca.symbol_to_code(symbol)
                 last = self.account.applied_corporate_actions.get(symbol, "")
-                for action in _ca.pending_from_cache(code, last, trading_day):
+                position = self.account.positions.get(symbol)
+                # H50（2026-10-23）：重放上界锚定建仓日。否则 applied 为空时会把
+                # 缓存里建仓前的全部历史公司行为一次性重放到当前持仓（实测：100 股
+                # 被重放成 636 股、权益虚高 29.7 万）。锚点未知 ⇒ 不重放（宁漏勿错）。
+                if position is not None and not position.opened_date and not last:
+                    self.audit_log.append({
+                        "time": datetime.now(),
+                        "event": "CORPORATE_ACTION_SKIPPED_NO_ANCHOR",
+                        "symbol": symbol,
+                        "trading_day": trading_day,
+                    })
+                    continue
+                after = max(last, position.opened_date) if position is not None else last
+                for action in _ca.pending_from_cache(code, after, trading_day):
                     self.apply_corporate_action(action, symbol)
         except Exception:  # noqa: BLE001 —— 记账修正不应阻断交易主流程；留审计痕迹
             self.audit_log.append({
@@ -264,7 +277,11 @@ class PaperBroker:
         return commission + transfer + stamp
 
     def _apply_fill(self, fill: Fill) -> None:
-        position = self.account.positions.setdefault(fill.symbol, Position(symbol=fill.symbol))
+        position = self.account.positions.get(fill.symbol)
+        if position is None:
+            position = self.account.positions[fill.symbol] = Position(symbol=fill.symbol)
+            # H50：首笔成交日期 = 建仓日，公司行为钩子以此为历史重放的上界锚点。
+            position.opened_date = fill.filled_at.date().isoformat()
         position.market_price = fill.price
         value = fill.price * fill.quantity
         if fill.side == OrderSide.BUY:

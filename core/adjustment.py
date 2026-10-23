@@ -116,12 +116,11 @@ def prepare_signal_prices(df: pd.DataFrame, code: str = "") -> tuple[pd.DataFram
         # 不能写 reindex(dates).ffill()：reindex 先把索引裁成 dates，结果集里不再包含
         # 因子末日那一行；当 dates 全部晚于因子末日（live 每轮只喂当日窗口）时整列
         # NaN，ffill 无源可填 ⇒ 必然降级。用 method="ffill" 直接从源索引取值，
-        # 目标索引可重复/非单调；早于因子起点时仍以 bfill 兜底（与旧行为一致）。
+        # 目标索引可重复/非单调。
         series = factor.reindex(pd.DatetimeIndex(dates), method="ffill")
-        # 不做 bfill：早于因子起点的行拿不到因子，bfill 等于拿"未来"的复权因子
-        # 回填到过去（H16 指出的泄漏模式）。当前数据起点 2023-01 晚于因子起点
-        # 2012-07，恒为空操作；一旦真的越界，宁可降级并告警（下面会 WARN），
-        # 也不静默用未来值算出一份看起来正常的信号。
+        # ⚠️ 早于因子起点的行**不做 bfill**：bfill 等于拿"未来"的复权因子回填到过去
+        # （H16 指出的泄漏模式）。当前行情起点 2023-01 晚于因子起点 1990-12 ⇒ 恒为
+        # 空操作；一旦真的越界，宁可抛错降级 + WARN，也不静默用未来值算出"看起来正常"的信号。
         aligned = series.to_numpy(dtype=float)
         if not len(aligned) or np.isnan(aligned).any():
             raise ValueError("复权因子未覆盖全部日期（存在早于因子起点的 bar）")

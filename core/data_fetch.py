@@ -77,6 +77,10 @@ _SESSION = {
     "opened_at": 0.0,
     "half_open_inflight": False,
     "login_fail_at": 0.0,
+    # H37：待决登录线程复用。(thread, result_dict, started_at)；None=无待决。
+    # 不变量：任意时刻"已启动未结束"的原生 ad.login() ≤ 1。
+    "pending_login": None,
+    "login_threads_started": 0,    # 进程内累计新起的登录线程数（观测累积是否消失）
 }
 
 
@@ -111,7 +115,8 @@ def reset_session_state() -> None:
             "day": _today(), "rebuild_count": 0, "rebuild_rejected": 0,
             "last_rebuild_at": 0.0, "breaker_state": "closed", "breaker_opens": 0,
             "breaker_fails": 0, "opened_at": 0.0, "half_open_inflight": False,
-            "login_fail_at": 0.0,
+            "login_fail_at": 0.0, "pending_login": None,
+            "login_threads_started": 0,
         })
 
 
@@ -125,6 +130,11 @@ def session_stats() -> dict:
                 "breaker_fails": int(_SESSION["breaker_fails"]),
                 "rebuild_count": int(_SESSION["rebuild_count"]),
                 "rebuild_rejected": int(_SESSION["rebuild_rejected"]),
+                # H37：>1 即违反"登录线程恒 ≤1"不变量（正常应为 1 或更少）
+                "login_threads_started": int(_SESSION["login_threads_started"]),
+                "pending_login_alive": bool(
+                    _SESSION["pending_login"] is not None
+                    and _SESSION["pending_login"][0].is_alive()),
             }
     except Exception:  # noqa: BLE001 —— 可观测性代码不得成为新的失败点
         return {}
@@ -246,16 +256,58 @@ def _login():
     return _login_impl()
 
 
+def _redact(text, cred: dict) -> str:
+    """异常文案过滤凭证片段（H37-§8：SDK 报错不得携带 username/password/token）。"""
+    out = str(text)
+    for key in ("username", "password", "token"):
+        val = cred.get(key)
+        if val:
+            out = out.replace(str(val), f"<{key}>")
+    return out
+
+
 def _login_impl():
     ad = _import_ad()
-    # 单飞：整段"查缓存 → 登录 → 写缓存"持锁。
+    # 单飞：整段"查缓存 → 复用待决线程/登录 → 写缓存"持锁。
     # H34-1B：原先裸 dict 无锁 ⇒ 硬超时被放弃的线程与新一轮线程会并发登录，
     #         触发 AD 单点登录互踢（实测 TimeoutError/TypeError 交替出现）。
     with _AD_LOCK:
         if _AD_CACHE.get("ad") is not None:
             return _AD_CACHE["ad"]
-        # 失败冷却：多线程排队等锁时若前一个刚失败，不要接着一个个去登
-        # （每次 45s 且每次都会新增一个可能挂死的原生登录线程 = H37 的燃料）。
+
+        # ---- H37：待决登录线程复用 ----
+        # 超时被"放弃"的是等待而不是线程：旧线程仍卡在原生层，若下次再新起一个，
+        # 线程逐轮累积 → 26~44 个时进程在原生层 abort（6 次实证）。
+        # 改为：下次进来**继续等同一个线程**（fail fast 但永不新起第二个）。
+        pending = _SESSION["pending_login"]
+        if pending is not None:
+            thread, result, started_at = pending
+            if thread.is_alive():
+                remain = _LOGIN_TIMEOUT - (time.monotonic() - started_at)
+                if remain > 0:
+                    thread.join(timeout=remain)
+            if thread.is_alive():
+                # 总超时仍卡着：快速失败，**保留 pending**（§4：永不主动放弃）。
+                # 回收途径只有进程重启或服务端返回令线程自行退出。
+                _SESSION["login_fail_at"] = time.monotonic()
+                raise AdLoginTimeout(
+                    f"星耀登录超时（登录线程挂起 >{_LOGIN_TIMEOUT:.0f}秒，"
+                    "保留待复用，不新起线程）", stage="login")
+            _SESSION["pending_login"] = None
+            if "err" in result:
+                _SESSION["login_fail_at"] = time.monotonic()
+                raise AdLoginError(
+                    f"星耀登录失败：{type(result['err']).__name__}: {result['err']}",
+                    stage="login") from result["err"]
+            if "ad" in result:
+                # 卡住的线程最终成功 ⇒ 直接入缓存（相当于延迟完成的登录）
+                _AD_CACHE["ad"] = result["ad"]
+                _AD_CACHE.pop("calendar", None)
+                _SESSION["login_fail_at"] = 0.0
+                return _AD_CACHE["ad"]
+            # 线程结束但既无结果也无异常（不应发生）：落空，走下方新起路径。
+
+        # 失败冷却：仅约束"新起线程"（复用既有线程不产生新线程，不受冷却限制）。
         since_fail = time.monotonic() - _SESSION["login_fail_at"]
         if _SESSION["login_fail_at"] and since_fail < _LOGIN_FAIL_COOLDOWN:
             raise AdLoginTimeout(
@@ -274,24 +326,31 @@ def _login_impl():
                     ad.login(username=cred["username"], password=cred["password"],
                              host=cred["host"], port=int(cred["port"]))
                 result["ad"] = ad
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001 —— H37-§8：SystemExit 不再逃逸
+                # SDK tgw_login 打 "login fail" 后 sys.exit(0)，except Exception 接不住，
+                # 会被误报成"疑似网络不通"。转存后统一按登录失败处理（文案中立）。
                 result["err"] = exc
             finally:
                 socket.setdefaulttimeout(old)
 
         t = threading.Thread(target=_worker, daemon=True, name="ad-login")
         t.start()
+        _SESSION["login_threads_started"] += 1
+        _SESSION["pending_login"] = (t, result, time.monotonic())
         t.join(timeout=_LOGIN_TIMEOUT)
         if "err" in result:
+            _SESSION["pending_login"] = None
             _SESSION["login_fail_at"] = time.monotonic()
             raise AdLoginError(
-                f"星耀登录失败：{type(result['err']).__name__}: {result['err']}",
-                stage="login") from result["err"]
+                f"星耀登录失败：{type(result['err']).__name__}: "
+                f"{_redact(result['err'], cred)}", stage="login") from result["err"]
         if "ad" not in result:
+            # H37 核心：超时**不清 pending** —— 下次进来继续等同一个线程。
+            # 旧文案"疑似网络不通"删除：SystemExit 场景下该归因是误导（§8）。
             _SESSION["login_fail_at"] = time.monotonic()
             raise AdLoginTimeout(
-                f"星耀登录超时（>{_LOGIN_TIMEOUT}秒），疑似网络不通或服务器无响应",
-                stage="login")
+                f"星耀登录超时（>{_LOGIN_TIMEOUT:.0f}秒无响应；"
+                "登录线程保留待复用）", stage="login")
         _AD_CACHE["ad"] = result["ad"]
         _AD_CACHE.pop("calendar", None)   # 新会话 ⇒ 旧日历对象不再可信
         _SESSION["login_fail_at"] = 0.0

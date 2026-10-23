@@ -25,10 +25,13 @@ from core.risk_manager import RiskManager
 
 @dataclass(frozen=True)
 class PaperBrokerConfig:
-    commission_rate: float = 0.0001
-    min_commission: float = 0.0
-    stamp_tax_rate: float = 0.001
-    transfer_fee_rate: float = 0.00002
+    # H15（2026-10-23 修，A16 §2.5 待改清单）：口径依据见 A16实盘对账_设计方案.md §2.1/§2.4。
+    # ⚠️ 口径切换日 = 2026-10-23（D29 起的模拟成交按新费率；历史 paper 数据为旧费率，已发布数字留档不改）。
+    # 「免规费」按解读 A（万 0.8=全佣金）；若首单对账裁定 B，须另立项加规费科目。
+    commission_rate: float = 0.00008        # 万 0.8（用户 2026-09-27 确认）
+    min_commission: float = 1.0             # 最低 1 元
+    stamp_tax_rate: float = 0.0005          # 印花税，卖出单边（2023-08-28 减半）
+    transfer_fee_rate: float = 0.00001      # 过户费，双向（2022-04-29 下调）
     slippage_bps: float = 5.0
     max_volume_participation: float = 0.10
 

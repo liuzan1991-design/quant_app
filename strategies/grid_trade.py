@@ -156,7 +156,7 @@ class GridTradeStrategy(BaseStrategy):
                                        "shares": sold, "reason": "网格硬止损", "score": "",
                                        "fee": round(acc.last_fee, 2),
                                        "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
-                    grid_bought = max(0, grid_bought - sold // max(trade_shares, 1))
+                        grid_bought = max(0, grid_bought - sold // max(trade_shares, 1))
 
             # 尾盘平 T 仓（可选）
             if enable_close and h >= 1455:
@@ -169,7 +169,9 @@ class GridTradeStrategy(BaseStrategy):
                                        "shares": sold, "reason": "尾盘平T仓", "score": "",
                                        "fee": round(acc.last_fee, 2),
                                        "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
-                    grid_bought = 0
+                        # H18：未成交（T+1 不可卖）时不得清零，否则 fast 路径的 grid_bought
+                        # 与真实 T 仓脱钩（live 路径 core/grid_shared.py 在守卫内）。
+                        grid_bought = 0
                 continue
 
             # 卖出：涨回上一格（grid_bought>0 且价格回到对应档位）
@@ -188,7 +190,8 @@ class GridTradeStrategy(BaseStrategy):
                                            "reason": f"网格卖出(回到{grid_bought-1}档)", "score": "",
                                            "fee": round(acc.last_fee, 2),
                                            "t_pnl": round(acc.last_t_pnl, 2) if acc.last_t_pnl is not None else None})
-                        grid_bought -= 1
+                            # H18：只有真正成交才递减档位；未成交仍递减 ⇒ 档位与真实 T 仓脱钩。
+                            grid_bought -= 1
                     else:
                         rejected.append({"time": ts, "direction": "SELL", "price": cur,
                                          "shares": trade_shares,

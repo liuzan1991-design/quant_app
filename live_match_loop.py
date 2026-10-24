@@ -71,6 +71,9 @@ class Observer:
     engine: object = None
     broker: PaperBroker = None
     store: PaperStateStore = None
+    # H47：去重的**权威状态**是"每个交易日已处理到的最高时刻"（体积 KB 级），
+    # processed_times 只保留每日最高值，供 `max(...)` 这类既有调用继续可用。
+    day_upto: dict = field(default_factory=dict)
     processed_times: set = field(default_factory=set)
     equity_high: float = INIT_CASH
     signals: List[dict] = field(default_factory=list)
@@ -80,6 +83,20 @@ class Observer:
     day_high_equity: float = INIT_CASH
     max_drawdown_cumulative: float = 0.0
 
+    def _is_processed(self, t) -> bool:
+        """H47：bar 是否已处理 —— 按「当日已处理最高时刻」判定（与全量集合等价）。"""
+        t = pd.Timestamp(t)
+        cur = self.day_upto.get(t.date())
+        return cur is not None and t <= cur
+
+    def _mark_processed(self, t) -> None:
+        t = pd.Timestamp(t)
+        d = t.date()
+        cur = self.day_upto.get(d)
+        if cur is None or t > cur:
+            self.day_upto[d] = t
+        self.processed_times.add(t)   # 仅供 max(...) 类既有调用
+
     def watermark_path(self) -> Path:
         return self.store.root / "watermark.json"
 
@@ -87,7 +104,14 @@ class Observer:
         p = self.watermark_path()
         if p.exists():
             data = json.loads(p.read_text(encoding="utf-8"))
-            self.processed_times = set(pd.to_datetime(data.get("processed_times", [])))
+            # H47：优先读压缩后的按日水位；旧文件（21.9 万条列表）在此一次性派生，
+            # 下次 save 时自动迁移成 KB 级，不需要人工改文件。
+            upto = data.get("processed_upto_by_day") or {}
+            self.day_upto = {pd.Timestamp(k).date(): pd.Timestamp(v) for k, v in upto.items()}
+            legacy = pd.to_datetime(data.get("processed_times", []))
+            for t in legacy:
+                self._mark_processed(pd.Timestamp(t))
+            self.processed_times = set(self.day_upto.values())
             self.equity_high = float(data.get("equity_high", INIT_CASH))
             self.day_start_equity = float(data.get("day_start_equity", INIT_CASH))
             self.day_anchor_date = str(data.get("day_anchor_date", ""))
@@ -180,7 +204,9 @@ class Observer:
         p.write_text(json.dumps({
             "code": self.code,
             "strategy_id": self.strategy_id,
-            "processed_times": [t.isoformat() for t in sorted(self.processed_times)],
+            "processed_upto_by_day": {d.isoformat(): t.isoformat()
+                                      for d, t in sorted(self.day_upto.items())},
+            "processed_times": [t.isoformat() for t in sorted(set(self.day_upto.values()))],
             "equity_high": self.equity_high,
             "day_start_equity": self.day_start_equity,
             "day_anchor_date": self.day_anchor_date,
@@ -261,15 +287,25 @@ def _build_observers() -> List[Observer]:
 def _process_new_bars(obs: Observer, df: pd.DataFrame) -> dict:
     if df.empty:
         return {"new_bars": 0}
-    # 只处理未处理过的 bar
-    new_df = df[~df["time"].isin(obs.processed_times)].reset_index(drop=True)
+    # 只处理未处理过的 bar。H47：按「当日最高时刻」判定 —— 与全量集合语义等价，
+    # 但不需要把 3 年 × 240 根都留在内存/文件里。
+    times = pd.to_datetime(df["time"])
+    days = times.dt.normalize().dt.date
+    upto = days.map(lambda d: obs.day_upto.get(d))
+    new_df = df[~(upto.notna() & (times <= upto))].reset_index(drop=True)
+    if len(new_df) and obs.day_upto:
+        latest_day = max(obs.day_upto)
+        old_days = new_df["time"].dt.normalize().dt.date
+        if (old_days < latest_day).any():
+            _LOGGER.warning("H47：检测到早于已处理水位的补录 bar（%s 条），按未处理处理",
+                            int((old_days < latest_day).sum()))
     if new_df.empty:
         return {"new_bars": 0}
     replay = OfflineReplayEngine(obs.broker, store=obs.store)
     replay.run(new_df, obs.symbol, obs.engine.on_bar, autosave_every=0)
     obs.broker = replay.broker
     for _, row in new_df.iterrows():
-        obs.processed_times.add(pd.Timestamp(row["time"]))
+        obs._mark_processed(pd.Timestamp(row["time"]))
     obs.save_watermark()
     # 累积信号并落盘，供收盘后做信号对比。
     if obs.signal_path is not None and replay.signal_log:

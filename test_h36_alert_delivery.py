@@ -97,7 +97,8 @@ def test_h36_desktop_resolution_is_real() -> None:
     d = alerts.resolve_desktop_dir()
     if d is not None:
         assert d.is_dir(), f"解析到的桌面不存在: {d}"
-        assert alerts.DESKTOP_FILE is not None and alerts.DESKTOP_FILE.parent == d
+        # 注意：H55 的 autouse 夹具会把 DESKTOP_FILE 指向 tmp，这里只验解析函数本身；
+        # 生产路径由 `alerts.resolve_desktop_dir() / "量化系统告警.txt"` 决定。
 
 
 # ── 看门狗接线：告警真被送达、恢复真被撤销 ──
@@ -144,3 +145,24 @@ def test_h36_info_level_does_not_push_desktop(paths: Path) -> None:
     alerts.clear_alert("collect_stale")
     assert not desktop.exists(), "alert 清掉后横幅消失（即使 info 仍在）"
     assert "position_cap" in alerts.active_alerts()
+
+
+# ── H55：测试不得污染生产告警状态 ──
+def test_h55_alert_paths_isolated_in_tests() -> None:
+    from pathlib import Path
+    assert "live_outputs" not in str(alerts.ACTIVE_FILE), "测试必须写到 tmp，不是生产目录"
+    assert str(alerts.ACTIVE_FILE).lower().find("pytest") >= 0 or \
+        "Temp" in str(Path(alerts.ACTIVE_FILE)), f"预期在临时目录：{alerts.ACTIVE_FILE}"
+
+
+def test_h55_watchdog_stale_does_not_touch_production() -> None:
+    """不 mock 告警函数直接跑停滞分支：生产 ALERT_ACTIVE 必须一字不变。"""
+    from pathlib import Path
+    prod = Path(__file__).resolve().parent / "live_outputs" / "ALERT_ACTIVE.json"
+    before = prod.read_bytes() if prod.exists() else None
+    hb = {"status": "running", "started_at": "2026-10-24 04:30:00",
+          "last_success_at": "2026-10-24 07:43:26", "collect_errors": 7}
+    watchdog._report_success_staleness(hb, succ_age=1800, suffix="")
+    after = prod.read_bytes() if prod.exists() else None
+    assert before == after, "测试不得改写生产告警状态"
+    assert alerts.active_alerts(), "但隔离环境里应当写入了这条告警"

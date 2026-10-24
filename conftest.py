@@ -40,3 +40,22 @@ def _reset_ad_session_state():
     yield
     data_fetch.reset_session_state()
 
+
+
+@pytest.fixture(autouse=True)
+def _isolate_alerts(tmp_path, monkeypatch):
+    """H55：告警写盘一律隔离到 tmp。
+
+    起因：`test_watchdog_staleness.py` 跑 `watchdog.main()` 时没隔离告警模块，
+    真实 `raise_alert` 把 `live_outputs/ALERT_ACTIVE.json` 与**桌面横幅**都写了，
+    在周六（无采集）造出一条"采集已停摆 3001s"的假告警。
+    与 H19（测试触发真实登录）同族：**副作用的落点没被纳入测试边界**。
+    """
+    from core import alerts
+    root = tmp_path / "_alerts"
+    monkeypatch.setattr(alerts, "LIVE_DIR", root)
+    monkeypatch.setattr(alerts, "LOG_DIR", root / "logs")
+    monkeypatch.setattr(alerts, "ACTIVE_FILE", root / "ALERT_ACTIVE.json")
+    monkeypatch.setattr(alerts, "JSONL_FILE", root / "logs" / "alerts.jsonl")
+    monkeypatch.setattr(alerts, "DESKTOP_FILE", root / "Desktop" / "量化系统告警.txt")
+    yield

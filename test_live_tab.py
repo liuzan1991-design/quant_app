@@ -3,6 +3,11 @@
 
 原则：**界面可以崩（人看得见），但纯函数不许崩**——文件缺失/损坏必须降级，
 否则一个坏 json 就能让整个平台的实盘页白屏。
+
+2026-10-25 重写为只读仪表盘后追加两条纪律：
+* **回撤口径**：E1 累计回撤必须来自 `daily_history.jsonl`，`daily_summary.json`
+  只是兜底（后者曾给出 −25.16%，真值 −3.56%，差约 7 倍）。
+* **只读**：模块不得再暴露任何写入入口（配置编辑器已移除）。
 """
 from __future__ import annotations
 
@@ -15,6 +20,21 @@ from ui import live_tab
 
 APP = Path(__file__).resolve().parent
 LIVE_ROOT = APP / "live_outputs"
+SRC = APP / "ui" / "live_tab.py"
+
+
+def _mk_unit(root: Path, sym="300308.SZ", sid="grid_trade",
+             summary=None, history=None) -> Path:
+    d = root / sym / sid
+    d.mkdir(parents=True, exist_ok=True)
+    if summary is not None:
+        (d / "daily_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+    if history is not None:
+        (d / "daily_history.jsonl").write_text(
+            "\n".join(json.dumps(h, ensure_ascii=False) for h in history),
+            encoding="utf-8")
+    return d
 
 
 # ── 纯函数：collect_status ───────────────────────────────────────────────────
@@ -54,15 +74,44 @@ def test_collect_status_skips_logs_and_underscore_dirs(tmp_path: Path) -> None:
     assert names == {"300308.SZ"}, f"logs/_ 开头目录必须跳过，实际 {names}"
 
 
+def test_collect_status_reads_history(tmp_path: Path) -> None:
+    _mk_unit(tmp_path, history=[{"date": "2026-10-22", "equity": 975000.0},
+                                {"date": "2026-10-23", "equity": 977470.0}])
+    got = live_tab.collect_status(tmp_path)
+    assert len(got["units"][0]["history"]) == 2
+
+
+# ── 纯函数：history_frame ────────────────────────────────────────────────────
+def test_history_frame_sorts_dedups_and_survives_bad_line(tmp_path: Path) -> None:
+    d = _mk_unit(tmp_path)
+    # 乱序 + 重复日期（应取最后一条）+ 一条坏行（应跳过，不报废整份）
+    (d / "daily_history.jsonl").write_text(
+        "\n".join([
+            json.dumps({"date": "2026-10-23", "equity": 977470.0,
+                        "cumulative_drawdown": -0.035581}),
+            "{ 坏行",
+            json.dumps({"date": "2026-10-22", "equity": 975000.0,
+                        "cumulative_drawdown": -0.033000}),
+            json.dumps({"date": "2026-10-23", "equity": 977470.0,
+                        "cumulative_drawdown": -0.035581}),
+        ]), encoding="utf-8")
+    unit = live_tab.collect_status(tmp_path)["units"][0]
+    df = live_tab.history_frame(unit)
+    assert list(df["日期"]) == ["2026-10-22", "2026-10-23"], list(df["日期"])
+    assert df.iloc[-1]["累计回撤%"] == pytest.approx(-3.558)  # 展示口径 3 位小数
+
+
+def test_history_frame_empty_is_safe() -> None:
+    assert live_tab.history_frame({"history": []}).empty
+
+
 # ── 纯函数：snapshot_table ──────────────────────────────────────────────────
 def test_snapshot_table_flattens_fields(tmp_path: Path) -> None:
-    d = tmp_path / "300308.SZ" / "grid_trade"
-    d.mkdir(parents=True)
-    (d / "daily_summary.json").write_text(json.dumps({
+    d = _mk_unit(tmp_path, summary={
         "date": "2026-10-23", "equity": 977470.0, "cash": 916207.0, "cum_pnl": -24902.0,
         "data_quality": {"status": "complete", "gap_pct": 0.0},
         "position_cap": {"ratio": 0.0627},
-    }, ensure_ascii=False), encoding="utf-8")
+    })
     (d / "paper_state.json").write_text(json.dumps({
         "position": {"shares": 100, "cost": 837.93}}, ensure_ascii=False), encoding="utf-8")
     (d / "watermark.json").write_text(json.dumps({
@@ -86,7 +135,21 @@ def test_snapshot_table_empty_is_safe() -> None:
     assert df.empty
 
 
-# ── 纯函数：语义参数识别 ────────────────────────────────────────────────────
+def test_drawdown_prefers_history_over_summary(tmp_path: Path) -> None:
+    """E1 口径防回归：summary 给 −25.16%（错），history 给 −3.56%（真），
+    界面必须显示 −3.56%。"""
+    _mk_unit(
+        tmp_path,
+        summary={"date": "2026-10-23", "equity": 977470.0,
+                 "cumulative_drawdown": -0.2516},   # 错误口径
+        history=[{"date": "2026-10-23", "equity": 977470.0,
+                  "cumulative_drawdown": -0.035581}],  # 权威口径
+    )
+    df = live_tab.snapshot_table(live_tab.collect_status(tmp_path))
+    assert df.iloc[0]["累计回撤%"] == pytest.approx(-3.56)
+
+
+# ── 纯函数：语义参数识别（仅用于标注，界面不改参）────────────────────────────
 def test_semantic_keys_excludes_runtime() -> None:
     sem = live_tab.semantic_override_keys("grid_trade", {
         "slippage_bps": 5,          # 运行参数 ⇒ 不算
@@ -100,16 +163,16 @@ def test_semantic_keys_empty_when_only_runtime() -> None:
     assert live_tab.semantic_override_keys("grid_trade", {"slippage_bps": 8}) == []
 
 
-# ── UI 冒烟（不做重渲染，只验组件可构造） ────────────────────────────────────
-def test_param_controls_uses_param_meta() -> None:
-    """`_param_controls` 必须真的按 ParamMeta 生成，而不是返回空 dict。"""
-    from strategies import get_strategy
-    strat = get_strategy("grid_trade")
-    base = strat.default_params()
-    # 不依赖 Streamlit 运行上下文时，只验证元数据可被枚举
-    meta = getattr(strat, "param_meta", None) or []
-    assert len(meta) > 5, "grid_trade 应声明多个 ParamMeta"
-    assert all(m.key in base for m in meta if m.key in base), "元数据 key 必须与默认参数一致"
+# ── 纪律防回归：本页只读 ─────────────────────────────────────────────────────
+def test_module_has_no_write_entry() -> None:
+    """界面不得再出现写配置/写状态的入口（2026-10-25 拍板：UI 只读）。
+
+    判据两条，缺一不可：① 没有 render_config_editor；② 源码不出现 save/button。
+    """
+    assert not hasattr(live_tab, "render_config_editor"), "配置编辑器必须移除"
+    src = SRC.read_text(encoding="utf-8")
+    for bad in ("lc.save", "live_config.save", "st.button", "st.form_submit_button"):
+        assert bad not in src, f"只读页不应出现写入/提交入口：{bad}"
 
 
 # ── 防回归：控件 label 不得与侧边栏重复 ──────────────────────────────────────

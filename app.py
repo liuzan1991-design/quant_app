@@ -565,7 +565,7 @@ def main() -> None:
     with tab5:
         tabs.render_batch(batch_res["df"] if batch_res is not None else None)
     with tab6:
-        # H57-S2：只读展示实盘状态 + 编辑 live 配置（不启停进程，启停待 S3 接线）
+        # H57-S2：只读仪表盘（不写任何文件；改标的/参数/启停走命令行 + 回归）
         live_tab.render_live(APP_DIR / "live_outputs", APP_DIR / "data" / "live_config.json")
 
 

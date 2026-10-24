@@ -45,6 +45,7 @@ except Exception:
 
 import live_match_loop as match  # noqa: E402
 from core.close_timing import is_today_close_bar  # noqa: E402
+from core.trading_calendar import beijing_today, is_trading_day  # noqa: E402
 from core.corporate_actions import refresh_cache as _refresh_corporate_actions  # noqa: E402
 from core.market_collector import MarketCollector  # noqa: E402
 from core.data_fetch import format_failure_line  # noqa: E402
@@ -112,6 +113,15 @@ def _write_heartbeat(path: Path, started_at: datetime, status: str,
 
 def main() -> None:
     started_at = datetime.now()
+    # H38：非交易日**直接退出** —— 不采集、不写摘要/history、不刷心跳/health。
+    # 放在最前，是因为 2026-09-25（中秋周五）的污染正是「跑满 7 轮后每次都走收盘流程」；
+    # 日历判定收敛到 core.trading_calendar（唯一入口，禁止在此另写 weekday 判断）。
+    today_bj = beijing_today()
+    if not is_trading_day(today_bj):
+        _LOGGER.info("== %s 非交易日（交易日历），本次不采集、不写任何产物 ==", today_bj)
+        print(f"== {today_bj} 非交易日，跳过 ==")
+        return
+
     health_path = match.OUTPUT_DIR / "health.json"
     heartbeat_path = match.OUTPUT_DIR / "heartbeat.json"
     # 启动心跳：即使随后 init/build_observers/login 卡死或崩，也能看出"今天启动过但没采到数据"。

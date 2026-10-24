@@ -47,6 +47,8 @@ import json
 import os
 import subprocess
 import sys
+
+from core.trading_calendar import beijing_today, is_trading_day
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -80,7 +82,9 @@ def log(msg: str) -> None:
 
 
 def _in_window(now: datetime) -> bool:
-    if now.weekday() >= 5:      # 周六周日不巡检
+    # H38：交易日判定收敛到 core.trading_calendar（唯一入口）。
+    # 原先这里自判 `weekday() >= 5`，与 live_run 各自漂移 ⇒ 改一处漏两处。
+    if not is_trading_day(beijing_today(now)):
         return False
     return WINDOW_START <= (now.hour, now.minute) <= WINDOW_END
 

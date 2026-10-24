@@ -71,7 +71,8 @@ def test_h46_summary_raises_when_exceeded(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(live_match_loop, "_compare_signals", lambda obs: {})
     monkeypatch.setattr(live_match_loop, "_load_live", lambda code: live_match_loop.pd.DataFrame())
     raised = []
-    monkeypatch.setattr(live_match_loop, "raise_alert", lambda k, m: raised.append((k, m)))
+    monkeypatch.setattr(live_match_loop, "raise_alert",
+                        lambda k, m, level="alert": raised.append((k, m, level)))
     monkeypatch.setattr(live_match_loop, "clear_alert", lambda k: None)
 
     pos = SimpleNamespace(quantity=100, market_price=1_100.0)   # 110k / 权益 ~1.0M ⇒ 11%
@@ -85,3 +86,59 @@ def test_h46_summary_raises_when_exceeded(tmp_path: Path, monkeypatch) -> None:
     assert payload["position_cap"]["exceeded"] is True
     assert raised and raised[0][0] == "position_cap"
     assert "仅告警" in raised[0][1]
+
+
+# ── 告警分级（0~1pp ⇒ info，>1pp ⇒ alert）──
+def test_h46_grade_levels() -> None:
+    assert pc.grade(0.0627, 0.10) == {"exceeded": False, "excess_pp": -3.73, "level": "info"}
+    assert pc.grade(0.105, 0.10)["exceeded"] is True
+    assert pc.grade(0.105, 0.10)["level"] == "info", "超 0.5pp ⇒ info"
+    assert pc.grade(0.110, 0.10)["level"] == "info", "恰好 1pp 边界 ⇒ info"
+    assert pc.grade(0.115, 0.10)["level"] == "alert", "超 1.5pp ⇒ alert"
+    assert pc.grade(None, 0.10)["level"] == "info"
+
+
+def test_h46_summary_records_alert_level(tmp_path: Path, monkeypatch) -> None:
+    """摘要里必须能看出这条超限走的是 info 还是 alert。"""
+    monkeypatch.setattr(live_match_loop, "_compare_signals", lambda obs: {})
+    monkeypatch.setattr(live_match_loop, "_load_live", lambda code: live_match_loop.pd.DataFrame())
+    seen = []
+    monkeypatch.setattr(live_match_loop, "raise_alert",
+                        lambda k, m, level="alert": seen.append((k, level)))
+    monkeypatch.setattr(live_match_loop, "clear_alert", lambda k: None)
+    pos = SimpleNamespace(quantity=100, market_price=1_105.0)   # 110.5k / 1.0M ⇒ 11.05% = 超 1.05pp
+    account = SimpleNamespace(equity=lambda: 1_000_000.0, cash=889_500.0,
+                              positions={"300308.SZ": pos})
+    obs = live_match_loop.Observer(
+        code="300308", strategy_id="grid_trade", symbol="300308.SZ", params={},
+        broker=SimpleNamespace(account=account, orders={}, fills=[]),
+        store=SimpleNamespace(root=tmp_path))
+    payload = live_match_loop._write_daily_summary(obs)
+    assert payload["position_cap"]["alert_level"] == "alert"
+    assert seen and seen[0][1] == "alert"
+
+
+# ── 3a 退出条件（10 日 / 3 次超限，先到者为准）──
+def test_h46_watch_gate() -> None:
+    from core import cap_watch as cw
+    zero = [{"date": f"2026-11-{i:02d}", "ratio": 0.06, "cap": 0.10, "exceeded": False}
+            for i in range(1, 6)]
+    assert cw.evaluate_watch(zero)["status"] == "accumulating"
+    assert cw.evaluate_watch(zero)["remaining_days"] == 5
+
+    ten_zero = zero + [{"date": f"2026-11-{i:02d}", "ratio": 0.06, "cap": 0.10,
+                        "exceeded": False} for i in range(6, 11)]
+    got = cw.evaluate_watch(ten_zero)
+    assert got["status"] == "close_3b" and got["incidents"] == 0, "10 日零超限 ⇒ 关闭 3b"
+
+    three = zero + [{"date": "2026-11-06", "ratio": 0.11, "cap": 0.10, "exceeded": True},
+                    {"date": "2026-11-07", "ratio": 0.11, "cap": 0.10, "exceeded": True},
+                    {"date": "2026-11-08", "ratio": 0.11, "cap": 0.10, "exceeded": True}]
+    assert cw.evaluate_watch(three)["status"] == "decision", "3 次超限先到 ⇒ 直接进决策"
+
+    two_then_full = zero + [{"date": "2026-11-06", "ratio": 0.11, "cap": 0.10, "exceeded": True},
+                            {"date": "2026-11-07", "ratio": 0.12, "cap": 0.10, "exceeded": True}] + \
+                    [{"date": f"2026-11-{i:02d}", "ratio": 0.06, "cap": 0.10, "exceeded": False}
+                     for i in range(8, 12)]
+    got2 = cw.evaluate_watch(two_then_full)
+    assert got2["status"] == "decision" and got2["incidents"] == 2, "满 10 日但有 1~2 次 ⇒ 仍需评估"

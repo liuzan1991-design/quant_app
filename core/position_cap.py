@@ -44,3 +44,20 @@ def evaluate(position_value: float | None, equity: float | None,
             "excess_value": round(excess, 2), "price_for_cap": (
                 round(price_for_cap, 2) if price_for_cap else None),
             "status": "exceeded" if exceeded else "ok"}
+
+
+# ── 告警分级（用户 2026-10-24 拍板）──────────────────────────────────────────
+# 超限 0~1pp → info（只进状态文件与流水，不推桌面）；>1pp → alert（三通道全推）。
+# 理由：集中度是**慢变量**，用告警级推送会挤占真故障的注意力。
+ALERT_EXCESS_PP = 1.0
+
+
+def grade(ratio: float | None, cap: float = DEFAULT_CAP) -> dict:
+    """给定比值与上限，返回 (是否超限, 超限百分点, 告警级别)。"""
+    if ratio is None:
+        return {"exceeded": False, "excess_pp": None, "level": "info"}
+    excess_pp = (float(ratio) - cap) * 100.0
+    if excess_pp <= 0:
+        return {"exceeded": False, "excess_pp": round(excess_pp, 2), "level": "info"}
+    return {"exceeded": True, "excess_pp": round(excess_pp, 2),
+            "level": "info" if excess_pp <= ALERT_EXCESS_PP else "alert"}

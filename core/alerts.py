@@ -103,8 +103,14 @@ def _render_desktop(active: dict) -> None:
             if DESKTOP_FILE.exists():
                 DESKTOP_FILE.unlink()
             return
+        shown = {k: v for k, v in active.items()
+                 if str(v.get("level", LEVEL_ALERT)) in _DESKTOP_LEVELS}
+        if not shown:
+            if DESKTOP_FILE.exists():
+                DESKTOP_FILE.unlink()
+            return
         lines = ["量化系统告警（自动生成，告警清除后本文件自动删除）", "=" * 46]
-        for kind, item in sorted(active.items()):
+        for kind, item in sorted(shown.items()):
             lines += [f"【{kind}】自 {item.get('since')}（最近 {item.get('last_seen')}）",
                       f"  {item.get('message')}"]
         lines += ["", "处置：确认采集已恢复后，本文件会自动消失；若持续出现请联系助手排查。"]
@@ -114,19 +120,32 @@ def _render_desktop(active: dict) -> None:
         pass
 
 
-def raise_alert(kind: str, message: str, now: datetime | None = None) -> dict | None:
-    """登记并送达一条告警；`since` 保持首次触发时间（幂等）。失败返回 None，绝不抛。"""
+LEVEL_ALERT = "alert"
+LEVEL_INFO = "info"
+_DESKTOP_LEVELS = {LEVEL_ALERT}      # 只有 alert 级才推桌面横幅
+
+
+def raise_alert(kind: str, message: str, now: datetime | None = None,
+                level: str = LEVEL_ALERT) -> dict | None:
+    """登记并送达一条告警；`since` 保持首次触发时间（幂等）。失败返回 None，绝不抛。
+
+    `level`：
+      - `alert`（默认）：三通道全推（含桌面横幅）——用于"现在就要人处理"的事件；
+      - `info`：只写 `ALERT_ACTIVE.json` 与 `alerts.jsonl`，**不推桌面**——
+        用于慢变量（如集中度轻微超限），避免用告警级打扰。
+    """
     try:
         ts = _now(now)
+        lvl = LEVEL_INFO if str(level).lower() == LEVEL_INFO else LEVEL_ALERT
         active = _load()
         prev = active.get(kind) or {}
         active[kind] = {"since": prev.get("since", ts), "last_seen": ts,
-                        "message": message}
+                        "message": message, "level": lvl}
         _save(active)
         JSONL_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(JSONL_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": ts, "kind": kind, "message": message},
-                               ensure_ascii=False) + "\n")
+            f.write(json.dumps({"ts": ts, "kind": kind, "level": lvl,
+                                "message": message}, ensure_ascii=False) + "\n")
         _render_desktop(active)
         return active[kind]
     except Exception:  # noqa: BLE001
@@ -141,7 +160,7 @@ def clear_alert(kind: str) -> None:
             return
         active.pop(kind, None)
         _save(active)
-        _render_desktop(active)
+        _render_desktop(active)   # 内部按 level 过滤：只剩 info 时会撤掉横幅
     except Exception:  # noqa: BLE001
         pass
 

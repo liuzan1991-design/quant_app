@@ -124,3 +124,23 @@ def test_h36_watchdog_raises_when_never_succeeded(monkeypatch) -> None:
     hb = {"status": "running", "started_at": "2026-10-24 04:30:00", "collect_errors": 3}
     watchdog._report_success_staleness(hb, succ_age=None, suffix="")
     assert calls and "从未采集成功" in calls[0][1]
+
+
+def test_h36_info_level_does_not_push_desktop(paths: Path) -> None:
+    """info 级（慢变量）只写状态与流水，**不推桌面**；alert 级才推。"""
+    desktop = paths / "Desktop" / "量化系统告警.txt"
+    alerts.raise_alert("position_cap", "11.05% 超 0.5pp", level="info")
+    item = alerts.active_alerts()["position_cap"]
+    assert item["level"] == "info"
+    assert not desktop.exists(), "info 级不得推桌面横幅"
+    line = (paths / "logs" / "alerts.jsonl").read_text(encoding="utf-8").strip().split("\n")[0]
+    assert json.loads(line)["level"] == "info"
+
+    alerts.raise_alert("collect_stale", "采集停摆", level="alert")
+    assert desktop.exists()
+    body = desktop.read_text(encoding="utf-8")
+    assert "collect_stale" in body and "position_cap" not in body, "横幅只列 alert 级"
+
+    alerts.clear_alert("collect_stale")
+    assert not desktop.exists(), "alert 清掉后横幅消失（即使 info 仍在）"
+    assert "position_cap" in alerts.active_alerts()

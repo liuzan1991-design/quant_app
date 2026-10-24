@@ -29,7 +29,7 @@ from core.ma_swing_live import MaSwingLiveEngine  # noqa: E402
 from core.paper_broker import PaperBroker, PaperBrokerConfig  # noqa: E402
 from core.paper_replay import OfflineReplayEngine, StrategySignal  # noqa: E402
 from core.data_quality import day_bar_stats  # noqa: E402  （H35 缺口标记）
-from core.position_cap import evaluate as cap_evaluate, CAP_KIND  # noqa: E402  （H46-③）
+from core.position_cap import evaluate as cap_evaluate, grade as cap_grade, CAP_KIND  # noqa: E402  （H46-③）
 from core.alerts import clear_alert, raise_alert  # noqa: E402  （H46-③ 送达）
 from core.paper_store import PaperStateStore  # noqa: E402
 from core.risk_manager import RiskConfig, RiskManager  # noqa: E402
@@ -490,11 +490,17 @@ def _write_daily_summary(obs: Observer) -> dict:
     # ⚠️ 只监控与告警，**不减仓**（自动减仓需改 base_position 语义，属行为改动，另立）。
     cap = _position_cap_snapshot(obs)
     if cap is not None:
+        # 分级（用户 2026-10-24 拍板）：超限 0~1pp ⇒ info（不推桌面），>1pp ⇒ alert。
+        g = cap_grade(cap.get("ratio"), cap.get("cap"))
+        cap["excess_pp"] = g["excess_pp"]
+        cap["alert_level"] = g["level"]
         payload["position_cap"] = cap
-        if cap.get("exceeded"):
+        if g["exceeded"]:
             raise_alert(CAP_KIND,
                         f"{obs.code} 底仓/权益 {cap['ratio']:.2%} > {cap['cap']:.0%}"
-                        f"（超出 {cap['excess_value']:,.0f} 元）→ 仅告警，未减仓")
+                        f"（超 {g['excess_pp']:.2f}pp，超出 {cap['excess_value']:,.0f} 元）"
+                        f"→ 仅告警，未减仓",
+                        level=g["level"])
         else:
             clear_alert(CAP_KIND)
     # H46-③：把网格引擎的关键状态写进摘要。原摘要只有权益/订单计数，

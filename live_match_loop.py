@@ -28,6 +28,7 @@ from core.grid_shared_live import GridSharedLiveEngine  # noqa: E402
 from core.ma_swing_live import MaSwingLiveEngine  # noqa: E402
 from core.paper_broker import PaperBroker, PaperBrokerConfig  # noqa: E402
 from core.paper_replay import OfflineReplayEngine, StrategySignal  # noqa: E402
+from core.data_quality import day_bar_stats  # noqa: E402  （H35 缺口标记）
 from core.paper_store import PaperStateStore  # noqa: E402
 from core.risk_manager import RiskConfig, RiskManager  # noqa: E402
 from strategies.grid_trade import GridTradeStrategy  # noqa: E402
@@ -202,6 +203,17 @@ def _load_live(code: str) -> pd.DataFrame:
     if not f.exists():
         return pd.DataFrame()
     return pd.read_csv(f, parse_dates=["time"]).reset_index(drop=True)
+
+
+def _day_bar_count(code: str, day: str) -> int | None:
+    """当日实际 1m bar 数（用于 H35 缺口标记）。取不到 ⇒ None（**不是 0**）。"""
+    try:
+        df = _load_live(code)
+        if df is None or df.empty:
+            return None
+        return int((df["time"].dt.normalize() == pd.Timestamp(day)).sum())
+    except Exception:  # noqa: BLE001 —— 计数失败不得影响摘要写出
+        return None
 
 
 def _build_observers() -> List[Observer]:
@@ -414,6 +426,9 @@ def _write_daily_summary(obs: Observer) -> dict:
         "note": "绝对收益不与回测直接比，只比策略行为一致性",
         "signal_compare": _compare_signals(obs),
     }
+    # H35 另一半：**数据不完整日必须带缺口标记**（缺口≥5% ⇒ void/作废）。
+    # 否则 D11 那种 161/240 的日子会写出"看起来正常"的摘要，被误读成数据完整。
+    payload["data_quality"] = day_bar_stats(_day_bar_count(obs.code, payload["date"]))
     # H46-③：把网格引擎的关键状态写进摘要。原摘要只有权益/订单计数，
     # 「已停止交易」与「正常运行但无信号」在外部完全无法区分（10-15~10-19 即如此漏掉）。
     # 纯新增观测字段，不参与任何交易决策。

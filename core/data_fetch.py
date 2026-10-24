@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -30,6 +31,11 @@ APP_DIR = Path(__file__).resolve().parents[1]
 CRED_FILE = Path(r"D:\Codex输出\ad_credentials.json")
 STD_COLS = ["time", "open", "high", "low", "close", "volume", "amount"]
 _AD_CACHE = {}
+
+# ── P1-b：行情源开关（默认 ad，行为与接线前逐字节一致）──────────────
+# 取值 ad|qmt；QMT 分支失败**一律回退 AD**，不静默降级。
+_KLINE_SOURCE_ENV = "QUANT_KLINE_SOURCE"
+_KLINE_WARNED: set = set()
 
 # 登录软超时（秒）：断网时 ad.login() 会无限阻塞（第三方 SDK 不设超时），
 # 必须在线程里 join 超时，否则整个采集进程卡死在登录、不抛异常、无 traceback。
@@ -472,9 +478,49 @@ def _fetch_kline_inner(code: str, begin: str, end: str,
     return df[STD_COLS].copy()
 
 
+def _fetch_kline_qmt(code: str, begin: str, end: str, period: str,
+                     hard_timeout: Optional[float], source_fallback) -> pd.DataFrame:
+    """P1-b：QMT 行情分支。失败**一律回退 AD 并告警**（绝不静默降级为无数据）。
+
+    - 规范化的四条口径（标签 −1 分钟 / 量 ×100 / 竞价并入 09:30 / 尾盘 14:57 并入 14:56）
+      全部在 `core.qmt_kline.normalize_qmt_1m` 里，有独立单测。
+    - 缺根不静默：`attrs["gaps"]` 非空时告警（每日应为 240 根）。
+    """
+    if period != "min1":
+        _kline_warn(code, "period", f"[WARN] QMT 行情源暂只支持 min1（收到 {period}），回退 AD")
+        return source_fallback()
+    try:
+        from .qmt_kline import fetch_qmt_kline   # 延迟 import：AD 路径不加载 xtquant
+        if hard_timeout is None:
+            df = fetch_qmt_kline(code, begin, end)
+        else:
+            df = _run_with_deadline(lambda: fetch_qmt_kline(code, begin, end), hard_timeout)
+    except BaseException as exc:  # noqa: BLE001 —— 超时/连接/解析失败统一回退
+        _kline_warn(code, "fallback",
+                    f"[WARN] QMT 行情取数失败（{type(exc).__name__}: {exc}），本轮回退 AD")
+        return source_fallback()
+    gaps = getattr(df, "attrs", {}).get("gaps") or {}
+    if gaps:
+        _kline_warn(code, "gaps",
+                    f"[WARN] QMT 行情缺根（每日应 240 根）：{gaps} core={code} {begin}~{end}")
+    return df
+
+
+def _kline_warn(code: str, kind: str, message: str) -> None:
+    key = (code, kind, datetime.now().strftime("%Y-%m-%d"))
+    if key in _KLINE_WARNED:
+        return
+    _KLINE_WARNED.add(key)
+    print(message, flush=True)
+
+
 def fetch_kline(code: str, begin: str, end: str, period: str = "min1",
-                hard_timeout: Optional[float] = None) -> pd.DataFrame:
+                hard_timeout: Optional[float] = None,
+                source: Optional[str] = None) -> pd.DataFrame:
     """拉取 [begin, end]（YYYY-MM-DD）的K线数据，period 支持 min1/day 等，返回标准列 DataFrame。
+
+    `source`（或环境变量 `QUANT_KLINE_SOURCE`）可选 `ad`（默认）/`qmt`（P1-b 接线）。
+    QMT 分支失败**回退 AD**，不会静默返回空表。
 
     hard_timeout：
       - `None`（默认）：只加 socket 默认超时，不加上限 —— 历史批量补数走这条路，
@@ -494,6 +540,12 @@ def fetch_kline(code: str, begin: str, end: str, period: str = "min1",
     - 目的是不再新增"可能挂死的登录线程"（H37），不是省时间；
     - `calendar_error` / `kline_empty` 不计入游程（前者走重建，后者可能是休市）。
     """
+    src = (source or os.environ.get(_KLINE_SOURCE_ENV, "ad")).strip().lower()
+    if src == "qmt":
+        return _fetch_kline_qmt(
+            code, begin, end, period, hard_timeout,
+            lambda: fetch_kline(code, begin, end, period, hard_timeout, source="ad"))
+
     _roll_session_day()
     _breaker_before_call()      # 抛 AdCircuitOpen 时**尚未**改 socket 全局值
     old = socket.getdefaulttimeout()

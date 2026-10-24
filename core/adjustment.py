@@ -25,6 +25,67 @@ def _factor_file(code: str) -> Path:
     return DATA_DIR / f"factor_{code}.csv"
 
 
+# ── P1-a：可切换的第二因子源（QMT），默认仍走 AD ────────────────────────────
+# 开关：环境变量 QUANT_FACTOR_SOURCE=ad|qmt（进程级，便于小范围试跑）。
+# 约定：未设置/非法值 ⇒ ad（**默认行为与接线前逐字节一致**）。
+_FACTOR_SOURCE_ENV = "QUANT_FACTOR_SOURCE"
+
+
+def _factor_qmt_file(code: str) -> Path:
+    """QMT 口径因子缓存，**与 AD 缓存分开命名**，避免互相污染。"""
+    return DATA_DIR / f"factor_qmt_{code}.csv"
+
+
+def _qmt_code(code: str) -> str:
+    code = code.strip().upper()
+    return code if "." in code else f"{code}.SZ"
+
+
+def rebuild_factor_from_events(event_dates: list, drs: list,
+                               dates) -> "pd.Series":
+    """QMT 逐事件 `dr` → 与 AD **同向**的累计因子：`f(t) = 1 / Π{dr : event_date > t}`。
+
+    方向说明（H53 验证时踩过）：AD 因子是 `Π{事件≤t}`（随 t 递增，末值 6.61）；
+    QMT 原始重建是 `Π{事件>t}`（随 t 递减，末值 1.0）。下游只用比值
+    `f(t)/f(末)`，因此取倒数即可与 AD 完全等价，且保持**递增方向**——
+    这点很关键：`corporate_actions.verify_against_factor` 靠 `pct_change()>0`
+    找跳变日，方向反了会静默失效。
+    """
+    dates = pd.DatetimeIndex(dates)
+    out = []
+    for d in dates:
+        prod = 1.0
+        for ed, dr in zip(event_dates, drs):
+            if ed > d:
+                prod *= float(dr)
+        out.append(1.0 / prod)
+    return pd.Series(out, index=dates)
+
+
+def _fetch_factor_qmt(code: str) -> pd.Series:
+    """从 QMT 取逐事件复权信息并重建因子；日期骨架取 AD 缓存（保证两条源可比）。
+
+    只调 `xtdata.get_divid_factors`（行情通道），**不 import xttrader**。
+    """
+    skeleton = _read_cache(_factor_file(code))
+    if skeleton is None or not len(skeleton):
+        raise ValueError("缺少 AD 因子缓存作为日期骨架，无法重建 QMT 因子")
+    from xtquant import xtdata  # 延迟 import：纯 AD 路径不加载 xtquant
+
+    q = xtdata.get_divid_factors(_qmt_code(code))
+    if q is None or len(q) == 0:
+        _warn_once((code, "qmt_no_event"),
+                   f"[WARN] {code} QMT 未返回复权事件 ⇒ 因子恒 1.0（等同不复权）")
+        return pd.Series(1.0, index=skeleton.index)
+    if "dr" not in q.columns:
+        raise ValueError("QMT 返回缺少 dr 列，无法重建因子")
+    dt = (pd.to_datetime(q["time"], unit="ms").dt.tz_localize("UTC")
+          .dt.tz_convert("Asia/Shanghai").dt.tz_localize(None).dt.normalize())
+    order = dt.argsort()
+    return rebuild_factor_from_events(list(dt.iloc[order]), list(q["dr"].iloc[order]),
+                                      skeleton.index)
+
+
 def _warn_once(key: tuple[str, str], message: str) -> None:
     if key in _WARNED:
         return
@@ -78,13 +139,41 @@ def _write_cache(target: Path, series: pd.Series) -> None:
     os.replace(tmp, target)
 
 
-def load_backward_factor(code: str, refresh: bool = False) -> pd.Series:
+def _load_factor_qmt(code: str, refresh: bool = False) -> pd.Series:
+    """QMT 口径因子的加载/刷新/缓存；**任何失败一律回退 AD**（绝不降级为不复权）。"""
+    target = _factor_qmt_file(code)
+    cached = _read_cache(target)
+    if not refresh and not _cache_is_stale(cached):
+        return cached
+    key = (code, "qmt:" + pd.Timestamp.now().strftime("%Y-%m-%d"))
+    if not refresh and key in _REFRESH_ATTEMPTED:
+        return cached if cached is not None else load_backward_factor(code, refresh=refresh, source="ad")
+    _REFRESH_ATTEMPTED.add(key)
+    try:
+        series = _fetch_factor_qmt(code)
+    except Exception as exc:  # noqa: BLE001
+        _warn_once((code, "qmt_refresh"),
+                   f"[WARN] QMT 复权因子获取失败（{type(exc).__name__}: {exc}），"
+                   f"本次回退 AD 口径")
+        return load_backward_factor(code, refresh=refresh, source="ad")
+    _write_cache(target, series)
+    return series
+
+
+def load_backward_factor(code: str, refresh: bool = False,
+                         source: str | None = None) -> pd.Series:
     """读取后复权因子。
+
+    `source`（或环境变量 `QUANT_FACTOR_SOURCE`）可选 `ad`（默认）/`qmt`（P1-a 接线）。
+    QMT 分支的失败一律回退 AD，不会静默变成"不复权"。
 
     缓存过期会自动尝试刷新一次（进程内每 code 每天最多一次）；刷新失败时回退旧
     缓存并告警，不中断调用方。仅当既无可用缓存、取数又失败时抛异常，由
     prepare_signal_prices 降级并暂停异常日信号。
     """
+    src = (source or os.environ.get(_FACTOR_SOURCE_ENV, "ad")).strip().lower()
+    if src == "qmt":
+        return _load_factor_qmt(code, refresh=refresh)
     target = _factor_file(code)
     cached = _read_cache(target)
     if not refresh and not _cache_is_stale(cached):

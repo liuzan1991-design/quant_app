@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+_LOGGER = logging.getLogger(__name__)
 
 import pandas as pd
 
@@ -29,6 +32,7 @@ from core.ma_swing_live import MaSwingLiveEngine  # noqa: E402
 from core.paper_broker import PaperBroker, PaperBrokerConfig  # noqa: E402
 from core.paper_replay import OfflineReplayEngine, StrategySignal  # noqa: E402
 from core.data_quality import day_bar_stats  # noqa: E402  （H35 缺口标记）
+from core import live_config  # noqa: E402  （H57 配置驱动）
 from core.position_cap import evaluate as cap_evaluate, grade as cap_grade, CAP_KIND  # noqa: E402  （H46-③）
 from core.alerts import clear_alert, raise_alert  # noqa: E402  （H46-③ 送达）
 from core.paper_store import PaperStateStore  # noqa: E402
@@ -46,6 +50,64 @@ COMBOS = [
     ("300308", "grid_trade"),
     ("300308", "ma_swing"),
 ]
+
+# H57-S3：live 目前支持的策略（`_engine_for` 有对应分支）。
+# 配置里出现其它策略必须**明确报错**，不能静默跳过 —— 否则用户以为换上了，实际没跑。
+_SUPPORTED_LIVE_STRATEGIES = {"grid_trade", "ma_swing"}
+
+
+def _resolve_combos(cfg=None) -> list[tuple[str, str]]:
+    """组合来源。**无配置文件 ⇒ 原 COMBOS（行为逐字节不变）**。"""
+    cfg = cfg if cfg is not None else live_config.load()
+    if cfg is None:
+        return list(COMBOS)
+    combos = live_config.to_combos(cfg)
+    if not combos:
+        raise RuntimeError(
+            "live_config.json 中没有任何 enabled 的组合 —— 拒绝空跑。"
+            "若想停掉实盘，请直接停进程/禁任务，而不是把配置清空。")
+    unsupported = sorted({sid for _, sid in combos
+                          if sid not in _SUPPORTED_LIVE_STRATEGIES})
+    if unsupported:
+        raise RuntimeError(
+            f"配置含 live 尚未支持的策略 {unsupported}；"
+            f"当前仅支持 {sorted(_SUPPORTED_LIVE_STRATEGIES)}（补齐见 H57-S4）。"
+            f"拒绝静默跳过，否则会误以为已在运行。")
+    return combos
+
+
+def _record_applied_config(cfg, combos) -> None:
+    """H57-S3 最小护栏：每次 live 启动把**实际生效**的组合与参数覆盖落盘。
+
+    为什么必须有：配置一旦能在界面里改，"今天到底按什么参数跑的"就变成
+    必须可追溯的事实（否则事后无法解释差异）。这是 S5 完整审计的雏形。
+    """
+    try:
+        payload = {
+            "applied_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "live_config.json" if cfg is not None else "COMBOS(源码默认)",
+            "combos": [list(c) for c in combos],
+            "overrides": ({f"{c}×{s}": live_config.overrides_for(cfg, c, s)
+                           for c, s in combos} if cfg is not None else {}),
+        }
+        LIVE_DIR.mkdir(parents=True, exist_ok=True)
+        (LIVE_DIR / "config_applied.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:  # noqa: BLE001 —— 留痕失败不得影响启动
+        _LOGGER.warning("H57: 写入 config_applied.json 失败（忽略）", exc_info=True)
+
+
+def _params_for(cfg, code: str, sid: str, first_price: float) -> dict:
+    """默认参数 → freeze_params → 叠加配置覆盖（覆盖优先）。"""
+    base_params = (GridTradeStrategy.default_params() if sid == "grid_trade"
+                   else MaSwingStrategy.default_params())
+    params = freeze_params(sid, first_price, base_params)
+    if cfg is not None:
+        ov = live_config.overrides_for(cfg, code, sid)
+        if ov:
+            params.update(ov)
+            _LOGGER.info("[H57] %s×%s 应用配置覆盖: %s", code, sid, ov)
+    return params
 
 
 def _code_symbol(code: str) -> str:
@@ -265,7 +327,10 @@ def _position_cap_snapshot(obs: Observer) -> dict | None:
 
 def _build_observers() -> List[Observer]:
     observers = []
-    for code, sid in COMBOS:
+    cfg = live_config.load()
+    combos = _resolve_combos(cfg)
+    _record_applied_config(cfg, combos)
+    for code, sid in combos:
         df = _load_live(code)
         if df.empty:
             raise RuntimeError(f"{code} 无 live 行情，无法启动")
@@ -274,9 +339,7 @@ def _build_observers() -> List[Observer]:
         if trade_df.empty:
             raise RuntimeError(f"{code} 无交易段数据（起点 {TRADE_START_DATE.date()}）")
         first_price = float(trade_df["close"].iloc[0])
-        base_params = (GridTradeStrategy.default_params() if sid == "grid_trade"
-                       else MaSwingStrategy.default_params())
-        params = freeze_params(sid, first_price, base_params)
+        params = _params_for(cfg, code, sid, first_price)
         symbol = _code_symbol(code)
         obs = Observer(code=code, strategy_id=sid, symbol=symbol, params=params)
         obs.store = PaperStateStore(OUTPUT_DIR / symbol / sid)
@@ -360,9 +423,15 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
         return pd.DataFrame(columns=["time", "direction", "shares"])
     trade_df = df[df["time"] >= TRADE_START_DATE].reset_index(drop=True)
     first_price = float(trade_df["close"].iloc[0])
-    base_params = (GridTradeStrategy.default_params() if obs.strategy_id == "grid_trade"
-                   else MaSwingStrategy.default_params())
-    params = freeze_params(obs.strategy_id, first_price, base_params)
+    # H57-S3：**复用 obs.params**，不要重新 freeze。
+    # 否则 live_config 的参数覆盖在"基准信号"这条路上丢失，
+    # engine_consistency 就会拿错参数当参照物（§6.9 第 11 形态：机制存在但漏调用点）。
+    if obs.params:
+        params = {k: v for k, v in obs.params.items() if k != "warmup_end"}
+    else:
+        base_params = (GridTradeStrategy.default_params() if obs.strategy_id == "grid_trade"
+                       else MaSwingStrategy.default_params())
+        params = freeze_params(obs.strategy_id, first_price, base_params)
     strategy = (GridTradeStrategy() if obs.strategy_id == "grid_trade"
                 else MaSwingStrategy())
     result = strategy.run(df, INIT_CASH, params,

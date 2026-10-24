@@ -29,6 +29,8 @@ from core.ma_swing_live import MaSwingLiveEngine  # noqa: E402
 from core.paper_broker import PaperBroker, PaperBrokerConfig  # noqa: E402
 from core.paper_replay import OfflineReplayEngine, StrategySignal  # noqa: E402
 from core.data_quality import day_bar_stats  # noqa: E402  （H35 缺口标记）
+from core.position_cap import evaluate as cap_evaluate, CAP_KIND  # noqa: E402  （H46-③）
+from core.alerts import clear_alert, raise_alert  # noqa: E402  （H46-③ 送达）
 from core.paper_store import PaperStateStore  # noqa: E402
 from core.risk_manager import RiskConfig, RiskManager  # noqa: E402
 from strategies.grid_trade import GridTradeStrategy  # noqa: E402
@@ -239,6 +241,25 @@ def _day_bar_count(code: str, day: str) -> int | None:
             return None
         return int((df["time"].dt.normalize() == pd.Timestamp(day)).sum())
     except Exception:  # noqa: BLE001 —— 计数失败不得影响摘要写出
+        return None
+
+
+def _position_cap_snapshot(obs: Observer) -> dict | None:
+    """H46-③：底仓/权益 集中度快照（**只读**，不产生任何订单）。取不到 ⇒ None。"""
+    try:
+        acct = obs.broker.account
+        positions = getattr(acct, "positions", None) or {}
+        pos = positions.get(obs.symbol)
+        if pos is None:
+            return None
+        shares = int(getattr(pos, "quantity", 0) or 0)
+        price = float(getattr(pos, "market_price", 0) or 0)
+        if shares <= 0 or price <= 0:
+            return None
+        equity = float(acct.equity())
+        cash = float(getattr(acct, "cash", 0) or 0)
+        return cap_evaluate(shares * price, equity, shares=shares, cash=cash)
+    except Exception:  # noqa: BLE001 —— 监控失败不得影响摘要写出
         return None
 
 
@@ -465,6 +486,17 @@ def _write_daily_summary(obs: Observer) -> dict:
     # H35 另一半：**数据不完整日必须带缺口标记**（缺口≥5% ⇒ void/作废）。
     # 否则 D11 那种 161/240 的日子会写出"看起来正常"的摘要，被误读成数据完整。
     payload["data_quality"] = day_bar_stats(_day_bar_count(obs.code, payload["date"]))
+    # H46-③：底仓集中度（阈值与 RiskConfig.max_symbol_position_pct 同源 = 10%）。
+    # ⚠️ 只监控与告警，**不减仓**（自动减仓需改 base_position 语义，属行为改动，另立）。
+    cap = _position_cap_snapshot(obs)
+    if cap is not None:
+        payload["position_cap"] = cap
+        if cap.get("exceeded"):
+            raise_alert(CAP_KIND,
+                        f"{obs.code} 底仓/权益 {cap['ratio']:.2%} > {cap['cap']:.0%}"
+                        f"（超出 {cap['excess_value']:,.0f} 元）→ 仅告警，未减仓")
+        else:
+            clear_alert(CAP_KIND)
     # H46-③：把网格引擎的关键状态写进摘要。原摘要只有权益/订单计数，
     # 「已停止交易」与「正常运行但无信号」在外部完全无法区分（10-15~10-19 即如此漏掉）。
     # 纯新增观测字段，不参与任何交易决策。

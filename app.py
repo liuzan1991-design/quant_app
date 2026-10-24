@@ -19,7 +19,7 @@ from core.data import (STOCK_POOL, load_data, stock_name,  # noqa: E402
                        search_stocks, local_data_stocks, load_preset_pool)
 from core import batch, data_fetch, param_store, report, sensitivity  # noqa: E402
 from strategies import STRATEGIES, get_strategy, list_strategies  # noqa: E402
-from ui import charts, tabs  # noqa: E402
+from ui import charts, live_tab, tabs  # noqa: E402
 
 st.set_page_config(page_title="量化可视化回测平台", layout="wide", page_icon="📈")
 
@@ -536,8 +536,9 @@ def main() -> None:
     result = st.session_state.get("result")
     df_cur = st.session_state.get("df", df)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["📊 回测总览", "📈 K线分析", "🧾 交易明细", "🗄 数据管理", "📋 批量回测"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["📊 回测总览", "📈 K线分析", "🧾 交易明细", "🗄 数据管理", "📋 批量回测",
+         "🎛 实盘控制"])
     has_result = result is not None and st.session_state.get("run_sig") == sig and len(df_cur)
     with tab1:
         if has_result:
@@ -563,6 +564,9 @@ def main() -> None:
             st.info("先完成一次回测，再看数据管理")
     with tab5:
         tabs.render_batch(batch_res["df"] if batch_res is not None else None)
+    with tab6:
+        # H57-S2：只读展示实盘状态 + 编辑 live 配置（不启停进程，启停待 S3 接线）
+        live_tab.render_live(APP_DIR / "live_outputs", APP_DIR / "data" / "live_config.json")
 
 
 if __name__ == "__main__":

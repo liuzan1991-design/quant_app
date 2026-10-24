@@ -192,7 +192,7 @@ def render_config_editor(cfg_path: Path) -> None:
         for i, p in enumerate(list(cfg.positions)):
             c1, c2, c3 = st.columns([1.2, 4, 1])
             with c1:
-                p.enabled = st.checkbox("启用", value=p.enabled, key=f"en_{i}")
+                p.enabled = st.checkbox("实盘·启用", value=p.enabled, key=f"en_{i}")
             with c2:
                 st.markdown(f"`{p.code}` {stock_name(p.code)} × `{p.strategy_id}`"
                             + (f"　*{p.note}*" if p.note else ""))
@@ -214,11 +214,11 @@ def render_config_editor(cfg_path: Path) -> None:
             if rows:
                 labels = {r["code"]: f"{r['code']} {r['name']}"
                           + ("（本地有数据）" if r.get("has_data") else "") for r in rows}
-                code = st.selectbox("搜索结果", list(labels), format_func=lambda c: labels[c],
+                code = st.selectbox("实盘·搜索结果", list(labels), format_func=lambda c: labels[c],
                                     key="live_code_sel")
             else:
                 st.warning("没有匹配，试试 6 位代码")
-        sid = st.selectbox("策略", list(STRATEGIES), key="live_sid",
+        sid = st.selectbox("实盘·策略", list(STRATEGIES), key="live_sid",
                            format_func=lambda s: f"{get_strategy(s).name}（{s}）")
         strategy = get_strategy(sid)
         st.caption(strategy.description)
@@ -230,7 +230,7 @@ def render_config_editor(cfg_path: Path) -> None:
             sem = [k for k in overrides if k not in RUNTIME_KEYS]
             if sem:
                 st.warning(f"⚠️ 这些是**语义参数**，改动会使观察期样本不可比：{sem}")
-        note = st.text_input("备注（可选）", key="live_note")
+        note = st.text_input("实盘·备注（可选）", key="live_note")
 
         if st.button("加入配置", type="primary", key="live_add"):
             if not code:

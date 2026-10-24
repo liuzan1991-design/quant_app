@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ui import live_tab
 
 APP = Path(__file__).resolve().parent
@@ -108,3 +110,20 @@ def test_param_controls_uses_param_meta() -> None:
     meta = getattr(strat, "param_meta", None) or []
     assert len(meta) > 5, "grid_trade 应声明多个 ParamMeta"
     assert all(m.key in base for m in meta if m.key in base), "元数据 key 必须与默认参数一致"
+
+
+# ── 防回归：控件 label 不得与侧边栏重复 ──────────────────────────────────────
+@pytest.mark.slow
+def test_no_duplicate_select_label_with_sidebar() -> None:
+    """H57 回归：tab6 曾用 `st.selectbox("策略", …)`，与侧边栏同名，
+    导致 `test_ui_quick.py` 按 label 定位时取到错误控件（慢档 1 例失败）。
+
+    ⇒ 钉住：全 app 中 label == "策略" 的下拉必须**有且只有一个**。
+    """
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_file(str(APP / "app.py"), default_timeout=300)
+    at.run()
+    assert len(at.exception) == 0, [str(e.value)[:200] for e in at.exception]
+    labels = [s.label for s in at.selectbox]
+    assert labels.count("策略") == 1, f"存在同名下拉（侧边栏 vs 实盘tab）：{labels}"

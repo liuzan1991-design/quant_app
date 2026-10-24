@@ -49,6 +49,7 @@ import subprocess
 import sys
 
 from core.trading_calendar import beijing_today, is_trading_day
+from core.alerts import clear_alert, raise_alert   # H36 告警送达
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -151,15 +152,22 @@ def _report_success_staleness(hb: dict, succ_age: float | None, suffix: str) -> 
     """
     if succ_age is None:
         if hb.get("status") == "running":
-            log(f"[ALERT-STALE] 进程已启动但**从未采集成功**"
-                f"（started_at={hb.get('started_at')}, "
-                f"collect_err={hb.get('collect_errors')}）→ 仅告警，不重启{suffix}")
+            msg = (f"进程已启动但从未采集成功（started_at={hb.get('started_at')}, "
+                   f"collect_err={hb.get('collect_errors')}）→ 仅告警，不重启")
+            log(f"[ALERT-STALE] {msg}{suffix}")
+            # H36 送达：写 ALERT_ACTIVE.json + 桌面告警文件（不只写日志）
+            raise_alert("collect_stale", msg)
         return
     if succ_age > SUCCESS_STALE_SECONDS:
-        log(f"[ALERT-STALE] 循环存活但**采集已停摆 {succ_age:.0f}s**"
-            f"（> {SUCCESS_STALE_SECONDS}s）last_success={hb.get('last_success_at')} "
-            f"collect_err={hb.get('collect_errors')} status={hb.get('status')}"
-            f" → 仅告警，不重启{suffix}")
+        msg = (f"采集已停摆 {succ_age:.0f}s（> {SUCCESS_STALE_SECONDS}s）"
+               f"last_success={hb.get('last_success_at')} "
+               f"collect_err={hb.get('collect_errors')} status={hb.get('status')}"
+               f" → 仅告警，不重启")
+        log(f"[ALERT-STALE] 循环存活但**{msg}{suffix}")
+        raise_alert("collect_stale", msg)
+        return
+    # 恢复正常 ⇒ 自动撤销告警（桌面文件一并删除，避免"狼来了"残留）
+    clear_alert("collect_stale")
 
 
 def main() -> int:

@@ -47,13 +47,6 @@ CSS = """
 .dbhead{display:flex;align-items:baseline;justify-content:space-between;
   font-size:12.5px;color:#5f6b7a;margin:2px 0 6px;}
 .dbhead b{color:#16222f;font-weight:600;}
-[data-testid="stVerticalBlockBorderWrapper"]{
-  background:#ffffff;border:1px solid #e3ebf5 !important;border-radius:10px;
-  box-shadow:0 1px 2px rgba(22,34,47,.04);
-}
-div[data-testid="stDataFrame"] div[role="columnheader"]{
-  background:#eef4fb;color:#16222f;font-weight:600;
-}
 </style>
 """
 

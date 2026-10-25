@@ -25,29 +25,44 @@ st.set_page_config(page_title="量化可视化回测平台", layout="wide", page
 
 
 def inject_css(is_light: bool = True) -> None:
-    """注入自定义样式（线框图配色：青蓝主色 + 红涨绿跌；侧边栏随主题带浅灰/深色）。"""
+    """注入自定义样式（统一视觉：参照 free-stockdb 网页版）。
+
+    ⚠️ 配色只经 `is_light` 分支注入，**不改** `config.toml` 里的色值 ——
+    `toggle_theme()` 靠精确字符串替换那几行来切明暗，改了色值它就会静默失效。
+    """
     sidebar_bg = "#E9EDF3" if is_light else "var(--secondary-background-color)"
+    # 参照页：浅蓝灰底 + 白色卡片（深色模式下跟随主题变量，不硬编码白）
+    page_bg = "#F6F8FB" if is_light else "var(--background-color, #141922)"
+    card_bg = "#FFFFFF" if is_light else "var(--secondary-background-color, #1A2029)"
     css = """
     <style>
     html, body, .stApp, [data-testid="stAppViewContainer"],
     [data-testid="stMain"], [data-testid="stHeader"] {
-        background-color:var(--background-color, #FFFFFF) !important;
+        background-color:__PAGE_BG__ !important;
         color:var(--text-color);
     }
     [data-testid="stMainBlockContainer"] { background:transparent; }
-    .metric-grid { display:grid; grid-template-columns:repeat(8,1fr); gap:12px; margin:4px 0 18px; }
-    .metric-card { background:var(--secondary-background-color);
-                   border:1px solid rgba(160,170,185,0.35); border-radius:10px; padding:14px 16px; }
-    .metric-card .k { font-size:12px; color:var(--text-color); opacity:0.78; margin-bottom:6px; }
-    .metric-card .v { font-size:22px; font-weight:700; color:var(--text-color); }
-    .metric-card .v.up { color:#FF5252; }
-    .metric-card .v.down { color:#26A69A; }
+    .metric-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(128px,1fr));
+                   gap:10px; margin:4px 0 18px; }
+    .metric-card { background:__CARD_BG__;
+                   border:1px solid #E3EBF5; border-radius:10px; padding:10px 12px;
+                   overflow:hidden; }
+    .metric-card .k { font-size:12px; color:#5F6B7A; margin-bottom:5px;
+                      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .metric-card .v { font-size:16px; font-weight:600; color:#16222F;
+                      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .metric-card .v.up { color:#D9363E; }
+    .metric-card .v.down { color:#12805C; }
     .topbar { display:flex; align-items:center; justify-content:space-between;
-              height:50px; padding:0 20px; background:var(--secondary-background-color);
-              border:1px solid rgba(160,170,185,0.25); border-radius:10px; margin-bottom:16px; }
-    .topbar .logo { font-size:17px; font-weight:700; color:var(--primary-color); letter-spacing:1px; }
-    .topbar .right { font-size:12px; color:var(--text-color); opacity:0.75; }
-    .topbar .dot { color:#26A69A; }
+              gap:16px; height:50px; padding:0 18px; background:__CARD_BG__;
+              border:1px solid #E3EBF5; border-radius:10px; margin-bottom:14px; }
+    .topbar .logo { font-size:17px; font-weight:600; color:#16222F; letter-spacing:.5px;
+                    flex:0 0 auto; white-space:nowrap; }
+    .topbar .right { font-size:12px; color:#5F6B7A; flex:0 0 auto; white-space:nowrap; }
+    .topbar .dot { color:#0F6E56; }
+    [data-testid="stAlert"] { border-radius:10px; border:1px solid #D9E1EC;
+                              background:#EEF4FB; color:#16222F; }
+    [data-testid="stAlert"] p { color:#16222F; }
     .sidebar-sec { font-size:12px; color:var(--text-color); opacity:0.75;
                    margin:16px 0 4px; }
     .section-title { color:var(--primary-color); font-size:15px; font-weight:600;
@@ -56,17 +71,54 @@ def inject_css(is_light: bool = True) -> None:
     div[data-testid="stSidebar"] { background-color:__SIDEBAR_BG__;
                                    border-right:1px solid rgba(160,170,185,0.22); }
     div[data-testid="stSidebar"] .stButton button { width:100%; }
-    div[data-testid="stSidebar"] button[kind="primary"],
-    div[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {
-        background:#00B4D8; color:#08131A; font-weight:600; border:none; }
     div[data-testid="stSidebar"] .stAppDeployButton,
     div[data-testid="stSidebar"] footer { display:none; }
-    .stTabs [data-baseweb="tab"] { font-size:14px; padding:8px 18px; }
-    .stTabs [aria-selected="true"] { color:var(--primary-color) !important; }
     .block-container { padding-top:1.5rem; }
+
+    /* ── 统一视觉（2026-10-25，参照 free-stockdb 网页版）────────────────────
+       白卡片 / 浅蓝表头 / 深色主按钮 / 紧凑表 / 深色选中下划线。
+       只动外观，不碰任何控件结构与业务逻辑。                            */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        background:__CARD_BG__; border:1px solid #E3EBF5 !important;
+        border-radius:10px; box-shadow:0 1px 2px rgba(22,34,47,.045);
+        padding:16px 18px;
+    }
+    button[kind="primary"], button[data-testid="stBaseButton-primary"],
+    div[data-testid="stSidebar"] button[kind="primary"],
+    div[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {
+        background:#1B2B3A !important; color:#FFFFFF !important;
+        border:none !important; border-radius:8px; font-weight:500;
+        box-shadow:0 1px 2px rgba(22,34,47,.12);
+    }
+    button[kind="primary"]:hover, button[data-testid="stBaseButton-primary"]:hover,
+    div[data-testid="stSidebar"] button[kind="primary"]:hover {
+        background:#2C4054 !important;
+    }
+    button[kind="secondary"], button[data-testid="stBaseButton-secondary"] {
+        background:__CARD_BG__ !important; border:1px solid #D9E1EC !important;
+        color:#16222F !important; border-radius:8px;
+    }
+    button:disabled, button[disabled] { opacity:.45 !important; }
+    div[data-testid="stDataFrame"] { border:1px solid #E3EBF5; border-radius:8px; }
+    div[data-testid="stDataFrame"] div[role="columnheader"] {
+        background:#EEF4FB !important; color:#16222F !important; font-weight:600;
+    }
+    div[data-testid="stExpander"] details {
+        border:1px solid #E3EBF5 !important; border-radius:10px !important;
+        background:__CARD_BG__;
+    }
+    .stTabs [data-baseweb="tab-list"] { gap:2px; border-bottom:1px solid #E3EBF5; }
+    .stTabs [data-baseweb="tab"] { font-size:14px; padding:9px 16px; }
+    .stTabs [aria-selected="true"] {
+        color:#16222F !important; font-weight:600;
+        border-bottom:2px solid #1B2B3A !important;
+    }
+    h1, h2, h3 { color:#16222F; }
     </style>
     """
-    st.markdown(css.replace("__SIDEBAR_BG__", sidebar_bg), unsafe_allow_html=True)
+    st.markdown(css.replace("__SIDEBAR_BG__", sidebar_bg)
+                   .replace("__PAGE_BG__", page_bg)
+                   .replace("__CARD_BG__", card_bg), unsafe_allow_html=True)
 
 
 def toggle_theme() -> None:
@@ -138,8 +190,8 @@ def render_param_controls(strategy) -> dict:
 
 def sidebar() -> tuple:
     with st.sidebar:
-        st.markdown('<div style="font-size:20px;font-weight:700;color:#00B4D8;'
-                    'letter-spacing:1px;margin-bottom:2px;">量化可视化回测平台</div>'
+        st.markdown('<div style="font-size:19px;font-weight:600;color:#16222F;'
+                    'letter-spacing:.5px;margin-bottom:2px;">量化可视化回测平台</div>'
                     '<div style="font-size:12px;color:#A6AEB9;margin-bottom:6px;">'
                     '策略可插拔 · 本地运行 · 数据源：星耀数智</div>',
                     unsafe_allow_html=True)

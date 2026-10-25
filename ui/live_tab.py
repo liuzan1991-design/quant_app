@@ -176,11 +176,12 @@ def _render_health(status: dict) -> None:
     hb = status.get("heartbeat") or {}
     alerts = status.get("alerts") or {}
 
-    last_succ = hb.get("last_success_at") or "—"
+    # 卡片窄，只留到分钟（原来 [:19] 会被截成 "2026-10-2…"，看着像日期缺失）
+    last_succ = str(hb.get("last_success_at") or "—")[:16].replace("T", " ")
     cards = [
         ("进程状态", str(hb.get("status") or "—"), "flat"),
         ("心跳日期", str(hb.get("date") or "—"), "flat"),
-        ("最近采集成功", str(last_succ)[:19], "flat"),
+        ("最近采集成功", last_succ, "flat"),
         ("采集失败次数", str(hb.get("collect_errors", "—")), "flat"),
         ("活跃告警", str(len(alerts)), "down" if alerts else "up"),
     ]

@@ -233,3 +233,58 @@ def test_import_rd_loads_real_binding() -> None:
     """真实绑定能加载（本机已装 D:\\stockdb）。只验有 get_data，不调用、不依赖服务启动。"""
     rd = sk._import_rd()
     assert hasattr(rd, "get_data"), f"rd 不像 stockdb 查询客户端：{type(rd)}"
+
+
+# ── 实测暴露的两个坑（2026-10-25 装库后才发现）──────────────────────────
+def test_parse_int_date_is_not_epoch() -> None:
+    """stockdb 的 `date` 是**整数**：直接 to_datetime 会当 epoch 纳秒解成 1970 年。
+
+    这是静默错日期（不报错、日期全变成 1970），比 import 失败危险得多。
+    """
+    s = pd.Series([20260105, 20260803093000])
+    out = sk._parse_stockdb_time(s)
+    assert out.iloc[0] == pd.Timestamp("2026-01-05")
+    assert out.iloc[1] == pd.Timestamp("2026-08-03 09:30:00")
+
+
+def _day_241() -> pd.DataFrame:
+    """构造 stockdb 的真实 241 根形态：09:30–11:29 + 13:00–14:59（240）+ 15:00 收盘竞价。"""
+    times = ([pd.Timestamp("2026-08-03 09:30") + pd.Timedelta(minutes=i) for i in range(120)]
+             + [pd.Timestamp("2026-08-03 13:00") + pd.Timedelta(minutes=i) for i in range(120)])
+    rows = [{"date": int(t.strftime("%Y%m%d%H%M%S")), "open": 10.0, "high": 10.5,
+             "low": 9.5, "close": 10.0, "volume": 100.0, "amount": 1000.0} for t in times]
+    rows[-2] = {**rows[-2], "volume": 100.0}          # 14:58
+    rows[-1] = {**rows[-1], "close": 10.1, "volume": 100.0}   # 14:59
+    rows.append({"date": 20260803150000, "open": 10.2, "high": 10.2, "low": 10.2,
+                 "close": 10.2, "volume": 500.0, "amount": 5100.0})   # 15:00 竞价
+    return pd.DataFrame(rows)
+
+
+def test_realign_tail_241_to_240(monkeypatch) -> None:
+    """尾盘必须对齐成 AD 的 240 根：14:57 并入 14:56、15:00 改标 14:59、补两根零量。
+
+    依据实测（2026-08-03 300308 逐根核对）：AD 14:56 带上 14:57 段的量并留两根零量，
+    收盘竞价标 14:59；stockdb 把这些拆成 5 根（14:56/14:57/14:58/14:59/15:00）。
+    """
+    monkeypatch.setenv("STOCKDB_CALIBRATED", "1")
+    out = sk.normalize_stockdb_1m(_day_241())
+
+    assert len(out) == 240, f"应对齐成 240 根，实际 {len(out)}"
+    hm = out["time"].dt.strftime("%H:%M").tolist()
+    assert hm[-1] == "14:59", hm[-5:]
+    assert "15:00" not in hm
+
+    tail = out.set_index(out["time"].dt.strftime("%H:%M"))
+    assert tail.loc["14:57", "volume"] == 0
+    assert tail.loc["14:58", "volume"] == 0
+    assert tail.loc["14:59", "volume"] == 500, "收盘竞价应落在 14:59"
+    assert tail.loc["14:56", "volume"] == 200, "14:57 的量应并入 14:56（100+100）"
+
+
+def test_realign_skips_day_without_1500(monkeypatch) -> None:
+    """没有 15:00 的日子（数据缺失/非交易日）原样放过，交给 gaps 去报，不臆测。"""
+    monkeypatch.setenv("STOCKDB_CALIBRATED", "1")
+    raw = _day_241().iloc[:-1]          # 去掉 15:00 ⇒ 240 根
+    out = sk.normalize_stockdb_1m(raw)
+    assert len(out) == 240
+    assert out["time"].dt.strftime("%H:%M").iloc[-1] == "14:59"

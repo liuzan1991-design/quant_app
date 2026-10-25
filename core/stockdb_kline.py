@@ -129,26 +129,26 @@ def _import_rd():
     **不写 .pth、不动 site-packages**，只在当前进程内生效。
     """
     errs = []
-    for attempt in (0, 1):
-        for mod in ("stock_sdk", "stockdb"):     # stock_sdk 优先：它有查询 API
-            try:
-                m = __import__(mod, fromlist=["rd"])
-            except Exception as exc:  # noqa: BLE001
-                errs.append(f"{mod}: {type(exc).__name__}: {exc}")
-                continue
-            rd = getattr(m, "rd", None)
-            if rd is None:
-                errs.append(f"{mod}: 无 rd 属性")
-            elif not hasattr(rd, "get_data"):
-                errs.append(f"{mod}.rd 无 get_data（是底层KV客户端，不是查询接口）")
-            else:
-                return rd
-        if attempt:
-            break
-        p = pybao_dir()
-        if p is None or str(p) in sys.path:
-            break
+    # 先把 pybao 挂上 sys.path，再 import —— 不能"先试失败再补路径"：
+    # 第一次失败会留下半初始化的模块缓存（实测 stock_sdk 报 NameError: name 'rd'，
+    # stockdb 报无 rd 属性），补了路径也救不回来。
+    p = pybao_dir()
+    if p is not None and str(p) not in sys.path:
         sys.path.insert(0, str(p))
+
+    for mod in ("stock_sdk", "stockdb"):     # stock_sdk 优先：它有查询 API
+        try:
+            m = __import__(mod, fromlist=["rd"])
+        except Exception as exc:  # noqa: BLE001
+            errs.append(f"{mod}: {type(exc).__name__}: {exc}")
+            continue
+        rd = getattr(m, "rd", None)
+        if rd is None:
+            errs.append(f"{mod}: 无 rd 属性")
+        elif not hasattr(rd, "get_data"):
+            errs.append(f"{mod}.rd 无 get_data（是底层KV客户端，不是查询接口）")
+        else:
+            return rd
     raise StockdbError(
         "未找到可用的 stockdb 查询对象（" + "；".join(errs) + "）。"
         f"请确认已装到 {DEFAULT_PYBAO}，或用环境变量 {PYBAO_ENV} 指定 pybao 目录。"
@@ -162,13 +162,94 @@ def _pick_time_col(df: pd.DataFrame) -> str:
     raise StockdbError(f"返回中找不到时间列：{list(df.columns)}")
 
 
+def _parse_stockdb_time(s: pd.Series) -> pd.Series:
+    """解析 stockdb 的时间列。
+
+    ⚠️ 它给的 `date` 是**整数**：`20260105`（日线）或 `20260803093000`（分钟）。
+    直接 `pd.to_datetime(整数)` 会被当成 **epoch 纳秒** 解成 1970 年 —— 静默错日期，
+    比报错危险得多。所以按位数显式指定格式。
+    """
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s)
+    txt = s.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    for n, fmt in ((8, "%Y%m%d"), (12, "%Y%m%d%H%M"), (14, "%Y%m%d%H%M%S")):
+        m = txt.str.len() == n
+        if m.any():
+            out[m] = pd.to_datetime(txt[m], format=fmt, errors="coerce")
+    rest = out.isna() & ~txt.str.len().isin([8, 12, 14])
+    if rest.any():
+        out[rest] = pd.to_datetime(s[rest], errors="coerce")
+    return out
+
+
+def realign_tail_to_ad(df: pd.DataFrame) -> pd.DataFrame:
+    """把 stockdb 的 **241 根**尾盘结构对齐成 AD 的 **240 根**。
+
+    实测依据（2026-08-03 300308，逐根核对，不是猜）
+    -------------------------------------------------
+        AD : ... 14:56(141,966) 14:57(0) 14:58(0) 14:59(187,413 ← 收盘竞价)
+        SDB: ... 14:56(139,700) 14:57(2,300) 14:58(0) 14:59(0) 15:00(187,400 ← 收盘竞价)
+
+    AD 把 14:57 段的成交**并进 14:56**，再留 14:57/14:58 两根零量承接根，收盘竞价标在 14:59；
+    stockdb 把 14:57 单独留一根、收盘竞价标在 **15:00**，于是多一根（241 vs 240）。
+
+    做法：
+      ① 14:57 并入 14:56（open 取 14:56.open、close 取 14:57.close、high/low 取并集、量额相加）
+      ② 15:00 → 改标 14:59（收盘竞价）
+      ③ 补 14:57 / 14:58 两根零量承接根（价格 = ①的 close）
+
+    只对"当天存在 15:00 那根"的日子生效；结构不全的日子原样放过，让 `gaps` 去报。
+    """
+    if df.empty or "time" not in df.columns:
+        return df
+    rows = []
+    for day, g in df.groupby(df["time"].dt.normalize(), sort=True):
+        hm = g["time"].dt.strftime("%H:%M")
+        if "15:00" not in set(hm):
+            rows.append(g.copy())
+            continue
+        pos = {h: i for i, h in enumerate(hm)}
+        i56, i57 = pos.get("14:56"), pos.get("14:57")
+        if i56 is None or i57 is None:      # 尾盘残缺，不臆测
+            rows.append(g.copy())
+            continue
+        base = g.iloc[i56]
+        extra = g.iloc[i57]
+        px = float(extra["close"])
+        tail_hms = {"14:56", "14:57", "14:58", "14:59", "15:00"}
+        keep = g[~g["time"].dt.strftime("%H:%M").isin(tail_hms)]
+        merged = {
+            "time": day + pd.Timedelta(hours=14, minutes=56),
+            "open": float(base["open"]), "close": px,
+            "high": max(float(base["high"]), float(extra["high"])),
+            "low": min(float(base["low"]), float(extra["low"])),
+            "volume": float(base["volume"]) + float(extra["volume"]),
+            "amount": float(base["amount"]) + float(extra["amount"]),
+        }
+        zero = [{"time": day + pd.Timedelta(hours=14, minutes=m), "open": px, "high": px,
+                 "low": px, "close": px, "volume": 0.0, "amount": 0.0} for m in (57, 58)]
+        auc = g.iloc[pos["15:00"]]
+        auction = {
+            "time": day + pd.Timedelta(hours=14, minutes=59),
+            "open": float(auc["open"]), "high": float(auc["high"]),
+            "low": float(auc["low"]), "close": float(auc["close"]),
+            "volume": float(auc["volume"]), "amount": float(auc["amount"]),
+        }
+        rows.append(pd.concat([keep, pd.DataFrame([merged] + zero + [auction])],
+                              ignore_index=True))
+    out = pd.concat(rows, ignore_index=True)
+    return out.sort_values("time").reset_index(drop=True)
+
+
 def normalize_stockdb_1m(raw: pd.DataFrame, cal: dict | None = None) -> pd.DataFrame:
     """stockdb 原始 1m → 项目标准口径（纯函数，可单测）。
 
-    变换全部由**校准参数**驱动，代码里没有任何"猜"的常数：
-      - 时间：转 datetime → 平移 `label_shift_min` 分钟（对齐 AD 的 bar 起点口径）
+    变换全部由**校准参数**驱动，代码里没有"猜"的常数：
+      - 时间：按位数解析整数日期 → 平移 `label_shift_min` 分钟（对齐 AD 的 bar 起点口径）
       - 成交量：× `volume_mult`（对齐 AD 的"股"）
       - 其余价格列：直接转 float（复权已由取数时的 fq 决定）
+      - 尾盘：241 根 → 240 根（见 `realign_tail_to_ad`，实测差异）
     """
     cal = cal or calibration()
     df = raw.copy()
@@ -176,7 +257,7 @@ def normalize_stockdb_1m(raw: pd.DataFrame, cal: dict | None = None) -> pd.DataF
         raise StockdbError("stockdb 返回空表")
 
     tc = _pick_time_col(df)
-    df["time"] = pd.to_datetime(df[tc], errors="coerce")
+    df["time"] = _parse_stockdb_time(df[tc])
     if df["time"].isna().all():
         raise StockdbError(f"时间列 `{tc}` 全部解析失败，样本={df[tc].head(3).tolist()}")
     df = df.dropna(subset=["time"])
@@ -200,6 +281,7 @@ def normalize_stockdb_1m(raw: pd.DataFrame, cal: dict | None = None) -> pd.DataF
 
     df = (df.drop_duplicates(subset=["time"], keep="last")
             .sort_values("time").reset_index(drop=True))
+    df = realign_tail_to_ad(df)
     return df[STD_COLS].copy()
 
 

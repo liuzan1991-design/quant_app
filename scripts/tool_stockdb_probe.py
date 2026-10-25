@@ -84,7 +84,9 @@ def _hm_set(df: pd.DataFrame) -> set[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--code", default="300308")
-    ap.add_argument("--days", type=int, default=5, help="比对最近 N 个交易日")
+    ap.add_argument("--days", type=int, default=5, help="比对最近 N 个交易日（未给 --start/--end 时）")
+    ap.add_argument("--start", default="", help="比对起始日 YYYY-MM-DD 或 YYYYMMDD")
+    ap.add_argument("--end", default="", help="比对结束日 YYYY-MM-DD 或 YYYYMMDD")
     ap.add_argument("--ad-csv", default="")
     args = ap.parse_args()
 
@@ -110,8 +112,21 @@ def main() -> int:
         print("  没有 AD 基准就无法推口径（不能拿两套未知互相比）。换 --ad-csv 指定。")
         return 2
     ad = _load_ad(ad_csv)
-    ad_days = sorted(ad["time"].dt.strftime("%Y-%m-%d").unique())[-args.days:]
-    print(f"✓ AD 基准：{len(ad)} 行，比对日 {ad_days[0]} ~ {ad_days[-1]}")
+
+    def _norm(d: str) -> str:
+        d = d.strip().replace("-", "")
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+
+    if args.start and args.end:
+        s, e = _norm(args.start), _norm(args.end)
+        ad_days = [d for d in sorted(ad["time"].dt.strftime("%Y-%m-%d").unique())
+                   if s <= d <= e]
+        if not ad_days:
+            print(f"✗ AD 基准里没有 {s} ~ {e} 的数据")
+            return 2
+    else:
+        ad_days = sorted(ad["time"].dt.strftime("%Y-%m-%d").unique())[-args.days:]
+    print(f"✓ AD 基准：{len(ad)} 行，比对日 {ad_days[0]} ~ {ad_days[-1]}（{len(ad_days)} 日）")
 
     start, stop = ad_days[0].replace("-", ""), ad_days[-1].replace("-", "")
     try:
@@ -133,8 +148,16 @@ def main() -> int:
         print(f"✗ 找不到时间列，实际列={list(sdb.columns)}")
         return 2
     sdb = sdb.copy()
-    sdb["time"] = pd.to_datetime(sdb[tc], errors="coerce")
+    sdb["time"] = pd.to_datetime(sdb[tc].astype(str), errors="coerce") \
+        if not pd.api.types.is_datetime64_any_dtype(sdb[tc]) else pd.to_datetime(sdb[tc])
     sdb = sdb.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+
+    # 先按已知规则把尾盘 241 根对齐成 AD 的 240 根，否则尾盘那根会被误判成"口径不一致"
+    from core.stockdb_kline import realign_tail_to_ad
+    before = len(sdb)
+    sdb = realign_tail_to_ad(sdb)
+    if len(sdb) != before:
+        print(f"  （已做尾盘对齐：{before} 根 → {len(sdb)} 根）")
 
     # ① 标签口径
     ad_hms = _hm_set(ad[ad["time"].dt.strftime("%Y-%m-%d").isin(ad_days)])
@@ -147,8 +170,9 @@ def main() -> int:
         return int(hh) * 60 + int(mm)
 
     shift_guess = None
-    if ad_last != "—" and sdb_last != "—":
-        shift_guess = _m(sdb_last) - _m(ad_last)
+    if ad_first != "—" and sdb_first != "—":
+        # 用**首根**判标签口径：末根受收盘竞价归属影响（stockdb 曾放在 15:00），会误判
+        shift_guess = _m(sdb_first) - _m(ad_first)
 
     print("\n── ① 时间标签 ──")
     print(f"  AD      首/末 = {ad_first} / {ad_last}")

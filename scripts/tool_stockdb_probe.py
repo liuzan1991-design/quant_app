@@ -62,20 +62,19 @@ def _load_ad(path: Path) -> pd.DataFrame:
 
 
 def _import_rd():
-    """和适配器同样的双名尝试，返回 (rd, 命中名)。"""
-    errs = []
-    for mod in ("stockdb", "stock_sdk"):
-        try:
-            m = __import__(mod, fromlist=["rd"])
-            rd = getattr(m, "rd", None)
-            if rd is not None:
-                return rd, mod
-            errs.append(f"{mod}: 无 rd")
-        except Exception as exc:  # noqa: BLE001
-            errs.append(f"{mod}: {type(exc).__name__}")
-    print("✗ 未找到 stockdb SDK：" + "；".join(errs))
-    print("  解决：进发行包目录运行 `python pybao/安装.py`，或改用 HTTP 通道（本探针暂只测 SDK）。")
-    return None, None
+    """复用适配器里的 import 逻辑（含 pybao 路径自动加载），避免两套代码漂移。"""
+    from core.stockdb_kline import _import_rd as _imp
+    from core.stockdb_kline import pybao_dir
+
+    try:
+        rd = _imp()
+    except Exception as exc:  # noqa: BLE001
+        print(f"✗ {exc}")
+        print("  解决：把 stockdb 装到 D:\\stockdb\\stockdb，或设 STOCKDB_PYBAO "
+              "指向 pybao 目录（**无需运行 pybao/安装.py**）。")
+        return None, None
+    d = pybao_dir()
+    return rd, (str(d) if d else "?")
 
 
 def _hm_set(df: pd.DataFrame) -> set[str]:

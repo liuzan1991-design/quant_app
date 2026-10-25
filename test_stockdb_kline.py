@@ -111,13 +111,15 @@ def test_invalid_fq_rejected(monkeypatch) -> None:
 
 # ── 取数链路（注入假 SDK，不碰真库）─────────────────────────────────────────
 def _fake_sdk(monkeypatch, payload: pd.DataFrame, captured: dict) -> None:
+    """把假 SDK 同时注入两个模块名 —— 适配器按"有没有 get_data"挑，两个名字都会试。"""
     def get_data(**kw):  # noqa: ANN003
         captured.update(kw)
         return payload if kw.get("as_df") else payload.to_dict("records")
 
-    mod = types.ModuleType("stockdb")
-    mod.rd = types.SimpleNamespace(get_data=get_data)
-    monkeypatch.setitem(sys.modules, "stockdb", mod)
+    for name in ("stock_sdk", "stockdb"):
+        mod = types.ModuleType(name)
+        mod.rd = types.SimpleNamespace(get_data=get_data)
+        monkeypatch.setitem(sys.modules, name, mod)
 
 
 def test_fetch_uses_sdk_params_and_reports_gaps(monkeypatch, cal) -> None:
@@ -181,3 +183,53 @@ def test_default_source_unchanged(monkeypatch) -> None:
 
     data_fetch.fetch_kline("300308", "2026-10-22", "2026-10-22")
     assert touched["stockdb"] == 0, "默认源不得碰 stockdb 分支"
+
+
+# ── SDK 路径解析（不改本机 site-packages）──────────────────────────────────
+def test_pybao_dir_env_override(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(sk.PYBAO_ENV, str(tmp_path))
+    assert sk.pybao_dir() == tmp_path
+
+
+def test_pybao_dir_env_invalid_returns_none(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(sk.PYBAO_ENV, str(tmp_path / "nope"))
+    assert sk.pybao_dir() is None
+
+
+def test_pybao_dir_default_missing_returns_none(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv(sk.PYBAO_ENV, raising=False)
+    monkeypatch.setattr(sk, "DEFAULT_PYBAO", tmp_path / "nope")
+    assert sk.pybao_dir() is None
+
+
+def test_import_rd_error_points_at_env(monkeypatch, tmp_path) -> None:
+    """找不到 SDK 时，报错必须告诉人怎么修（而不是只说"没装"）。"""
+    monkeypatch.setattr(sk, "DEFAULT_PYBAO", tmp_path / "nope")
+    monkeypatch.delenv(sk.PYBAO_ENV, raising=False)
+    monkeypatch.setitem(sys.modules, "stockdb", None)   # 强制 import 失败
+    monkeypatch.setitem(sys.modules, "stock_sdk", None)
+    with pytest.raises(sk.StockdbError, match=sk.PYBAO_ENV):
+        sk._import_rd()
+
+
+def test_import_rd_rejects_object_without_get_data(monkeypatch, tmp_path) -> None:
+    """2026-10-25 实测踩过的坑：`stockdb.rd` 是底层 KV 客户端，**没有 get_data**。
+
+    若只按模块名挑，会拿到一个"看起来像客户端、但调 get_data 就 AttributeError"的对象；
+    这种错要到取数时才炸，比 import 失败难查得多 ⇒ 必须以 get_data 为判据。
+    """
+    monkeypatch.delenv(sk.PYBAO_ENV, raising=False)
+    monkeypatch.setattr(sk, "DEFAULT_PYBAO", tmp_path / "nope")
+    for name in ("stock_sdk", "stockdb"):
+        mod = types.ModuleType(name)
+        mod.rd = types.SimpleNamespace(get=1, vals=1, set=1)   # 只有底层方法
+        monkeypatch.setitem(sys.modules, name, mod)
+    with pytest.raises(sk.StockdbError, match="get_data"):
+        sk._import_rd()
+
+
+@pytest.mark.skipif(not sk.DEFAULT_PYBAO.is_dir(), reason="本机未装 stockdb")
+def test_import_rd_loads_real_binding() -> None:
+    """真实绑定能加载（本机已装 D:\\stockdb）。只验有 get_data，不调用、不依赖服务启动。"""
+    rd = sk._import_rd()
+    assert hasattr(rd, "get_data"), f"rd 不像 stockdb 查询客户端：{type(rd)}"

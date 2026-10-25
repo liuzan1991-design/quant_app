@@ -39,7 +39,9 @@ stockdb 的这三条**我还没有实测数据**（本机未安装）。因此�
 from __future__ import annotations
 
 import os
+import sys
 import time
+from pathlib import Path
 
 import pandas as pd
 
@@ -48,6 +50,13 @@ BARS_PER_DAY = 240                 # 09:30–11:29 + 13:00–14:59
 PRICE_COLS = ("open", "high", "low", "close")
 
 DEFAULT_HOST = "127.0.0.1:7899"
+
+# stockdb 的 Python 绑定（stockdb.pyd）在发行包的 pybao/ 目录里，不在 site-packages。
+# 官方做法是跑 pybao/安装.py 往用户 site-packages 写一个 .pth —— 那会改本机 Python 环境，
+# 这里改成**运行时按路径加载**，不动系统：
+#   ① 环境变量 STOCKDB_PYBAO 指定目录；② 否则用默认安装位置。
+PYBAO_ENV = "STOCKDB_PYBAO"
+DEFAULT_PYBAO = Path(r"D:\stockdb\stockdb\pybao")
 
 _TIME_CANDIDATES = ("date", "time", "datetime", "kline_time", "dt")
 
@@ -94,25 +103,55 @@ def require_calibrated() -> dict:
     return cal
 
 
-def _import_rd():
-    """取 stockdb 的 rd 对象。两种import名都试（仓库里两处文档写法不一致）。
+def pybao_dir() -> Path | None:
+    """stockdb 的 pybao 目录（含 stockdb.pyd）在哪；找不到返回 None。
 
-    `pybao/安装.py` 装完是 `from stockdb import rd`；`sdk_test.py` 写的是
-    `from stock_sdk import *`。两者都试，避免因版本差异误判"没装"。
+    优先环境变量 `STOCKDB_PYBAO`，否则默认安装位置 `D:\\stockdb\\stockdb\\pybao`。
+    """
+    raw = (os.environ.get(PYBAO_ENV) or "").strip()
+    if raw:
+        p = Path(raw)
+        return p if p.is_dir() else None
+    return DEFAULT_PYBAO if DEFAULT_PYBAO.is_dir() else None
+
+
+def _import_rd():
+    """取 stockdb 的**查询**对象（有 `get_data`）。
+
+    ⚠️ 这里有坑，2026-10-25 实测：
+      - `from stockdb import rd` → `builtins.StockdbClient`，只有 `get/vals/set/pipe`
+        这类**底层键值**方法，**没有 `get_data`**；
+      - `from stock_sdk import rd` → `_DefaultRdProxy`，才有 `get_data/get_data_async`。
+    文档里两种写法都出现过，所以不能只按模块名挑 —— **以有没有 `get_data` 为准**。
+    只按 `stockdb` 挑会在取数时才炸（AttributeError），比 import 失败更难查。
+
+    `pybao/` 不在 site-packages 里，首次 import 失败时把它临时插进 `sys.path` 再试一次 ——
+    **不写 .pth、不动 site-packages**，只在当前进程内生效。
     """
     errs = []
-    for mod in ("stockdb", "stock_sdk"):
-        try:
-            m = __import__(mod, fromlist=["rd"])
+    for attempt in (0, 1):
+        for mod in ("stock_sdk", "stockdb"):     # stock_sdk 优先：它有查询 API
+            try:
+                m = __import__(mod, fromlist=["rd"])
+            except Exception as exc:  # noqa: BLE001
+                errs.append(f"{mod}: {type(exc).__name__}: {exc}")
+                continue
             rd = getattr(m, "rd", None)
-            if rd is not None:
+            if rd is None:
+                errs.append(f"{mod}: 无 rd 属性")
+            elif not hasattr(rd, "get_data"):
+                errs.append(f"{mod}.rd 无 get_data（是底层KV客户端，不是查询接口）")
+            else:
                 return rd
-            errs.append(f"{mod}: 无 rd 属性")
-        except Exception as exc:  # noqa: BLE001
-            errs.append(f"{mod}: {type(exc).__name__}: {exc}")
+        if attempt:
+            break
+        p = pybao_dir()
+        if p is None or str(p) in sys.path:
+            break
+        sys.path.insert(0, str(p))
     raise StockdbError(
-        "未找到 stockdb SDK（" + "；".join(errs) + "）。"
-        "请先运行 ./pybao/安装.py，或改用 HTTP 通道。"
+        "未找到可用的 stockdb 查询对象（" + "；".join(errs) + "）。"
+        f"请确认已装到 {DEFAULT_PYBAO}，或用环境变量 {PYBAO_ENV} 指定 pybao 目录。"
     )
 
 

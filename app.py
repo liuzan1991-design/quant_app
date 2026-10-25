@@ -19,7 +19,7 @@ from core.data import (STOCK_POOL, load_data, stock_name,  # noqa: E402
                        search_stocks, local_data_stocks, load_preset_pool)
 from core import batch, data_fetch, param_store, report, sensitivity  # noqa: E402
 from strategies import STRATEGIES, get_strategy, list_strategies  # noqa: E402
-from ui import charts, live_tab, tabs  # noqa: E402
+from ui import charts, data_board, live_tab, tabs  # noqa: E402
 
 st.set_page_config(page_title="量化可视化回测平台", layout="wide", page_icon="📈")
 
@@ -536,10 +536,13 @@ def main() -> None:
     result = st.session_state.get("result")
     df_cur = st.session_state.get("df", df)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["📊 回测总览", "📈 K线分析", "🧾 交易明细", "🗄 数据管理", "📋 批量回测",
-         "🎛 实盘控制"])
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["🗂 数据看板", "📊 回测总览", "📈 K线分析", "🧾 交易明细", "🗄 数据管理",
+         "📋 批量回测", "🎛 实盘控制"])
     has_result = result is not None and st.session_state.get("run_sig") == sig and len(df_cur)
+    with tab0:
+        # 视觉参照 free-stockdb 的「多周期股票数据视图看板」（ui/data_board.py 顶部有出处）
+        data_board.render_board(code)
     with tab1:
         if has_result:
             tabs.render_overview(result, df_cur, code, start, end)

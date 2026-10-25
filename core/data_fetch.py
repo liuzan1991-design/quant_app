@@ -33,7 +33,9 @@ STD_COLS = ["time", "open", "high", "low", "close", "volume", "amount"]
 _AD_CACHE = {}
 
 # ── P1-b：行情源开关（默认 ad，行为与接线前逐字节一致）──────────────
-# 取值 ad|qmt；QMT 分支失败**一律回退 AD**，不静默降级。
+# 取值 ad|qmt|stockdb；非 ad 分支失败**一律回退 AD**，不静默降级。
+# H58：stockdb 需先过 `scripts/tool_stockdb_probe.py` 口径实测并设 STOCKDB_CALIBRATED=1，
+#      否则适配器内部直接抛错 ⇒ 本分支必然回退 AD（不会输出未校准数据）。
 _KLINE_SOURCE_ENV = "QUANT_KLINE_SOURCE"
 _KLINE_WARNED: set = set()
 
@@ -506,6 +508,36 @@ def _fetch_kline_qmt(code: str, begin: str, end: str, period: str,
     return df
 
 
+def _fetch_kline_stockdb(code: str, begin: str, end: str, period: str,
+                         hard_timeout: Optional[float], source_fallback) -> pd.DataFrame:
+    """H58：free-stockdb 数据源分支。失败/未校准**一律回退 AD 并告警**。
+
+    ⚠️ 与 QMT 分支的关键差别：stockdb 的标签口径 / 成交量单位 / 复权基准**尚未实测**，
+    因此 `core.stockdb_kline` 内部有硬闸 —— `STOCKDB_CALIBRATED != "1"` 时直接抛错。
+    即使有人误设 `QUANT_KLINE_SOURCE=stockdb`，本分支也只会回退 AD，
+    **不会把未校准的 K 线交给策略**（H53/H54 教训：口径错比没数据危险）。
+
+    - 三条口径换算全部在 `core.stockdb_kline.normalize_stockdb_1m`（纯函数，有单测）；
+    - 缺根不静默：`attrs["gaps"]` 非空时告警（每日应为 240 根）。
+    """
+    try:
+        from .stockdb_kline import fetch_stockdb_kline   # 延迟 import：AD 路径不加载 SDK
+        if hard_timeout is None:
+            df = fetch_stockdb_kline(code, begin, end, period)
+        else:
+            df = _run_with_deadline(
+                lambda: fetch_stockdb_kline(code, begin, end, period), hard_timeout)
+    except BaseException as exc:  # noqa: BLE001 —— 未校准/未安装/超时/解析失败统一回退
+        _kline_warn(code, "fallback",
+                    f"[WARN] stockdb 取数失败（{type(exc).__name__}: {exc}），本轮回退 AD")
+        return source_fallback()
+    gaps = getattr(df, "attrs", {}).get("gaps") or {}
+    if gaps:
+        _kline_warn(code, "gaps",
+                    f"[WARN] stockdb 缺根（每日应 240 根）：{gaps} core={code} {begin}~{end}")
+    return df
+
+
 def _kline_warn(code: str, kind: str, message: str) -> None:
     key = (code, kind, datetime.now().strftime("%Y-%m-%d"))
     if key in _KLINE_WARNED:
@@ -519,8 +551,8 @@ def fetch_kline(code: str, begin: str, end: str, period: str = "min1",
                 source: Optional[str] = None) -> pd.DataFrame:
     """拉取 [begin, end]（YYYY-MM-DD）的K线数据，period 支持 min1/day 等，返回标准列 DataFrame。
 
-    `source`（或环境变量 `QUANT_KLINE_SOURCE`）可选 `ad`（默认）/`qmt`（P1-b 接线）。
-    QMT 分支失败**回退 AD**，不会静默返回空表。
+    `source`（或环境变量 `QUANT_KLINE_SOURCE`）可选 `ad`（默认）/`qmt`（P1-b 接线）/
+    `stockdb`（H58 接线，需先校准口径）。非 `ad` 分支失败**回退 AD**，不会静默返回空表。
 
     hard_timeout：
       - `None`（默认）：只加 socket 默认超时，不加上限 —— 历史批量补数走这条路，
@@ -543,6 +575,10 @@ def fetch_kline(code: str, begin: str, end: str, period: str = "min1",
     src = (source or os.environ.get(_KLINE_SOURCE_ENV, "ad")).strip().lower()
     if src == "qmt":
         return _fetch_kline_qmt(
+            code, begin, end, period, hard_timeout,
+            lambda: fetch_kline(code, begin, end, period, hard_timeout, source="ad"))
+    if src == "stockdb":
+        return _fetch_kline_stockdb(
             code, begin, end, period, hard_timeout,
             lambda: fetch_kline(code, begin, end, period, hard_timeout, source="ad"))
 

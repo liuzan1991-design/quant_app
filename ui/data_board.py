@@ -12,9 +12,14 @@
   表头行左「代码 [周期] 起 至 止」、右「N 行」；
   主体是斑马纹紧凑表格，数字右对齐，涨幅红绿。
 
-本页忠实照搬**结构与视觉语言**，但数据换成你自己的本地分钟线（`data/live/` 优先），
-并且**不伪造没有的字段** —— 他的表里有换手率/总股本/流通市值/PE/PB，那些需要股本与财务数据，
-本地没有，所以不列空列装样子。
+本页忠实照搬**结构与视觉语言**，但数据换成你自己的本地分钟线（`data/live/` 优先）。
+
+字段来源说明（2026-10-26 更新）
+------------------------------
+早先版本不列换手率/市值/PE/PB，因为本地没有来源。现在 **stockdb 提供日频元数据**
+（`turnover` / `total_mv` / `float_mv` / `pe_ttm` / `pb` / `is_st`），
+所以这些列**在 stockdb 覆盖到的日期上真实显示**，未覆盖的行留空 —— 仍不伪造、不填充。
+stockdb 不可用时整组列隐藏，页面行为与加列之前完全一致。
 
 纯函数（`resample_bars` / `daily_aggregate` / `board_frame`）与渲染分离，可单测。
 """
@@ -26,6 +31,7 @@ import pandas as pd
 import streamlit as st
 
 from core.data import stock_name
+from core.stockdb_daily import coverage_note, enrich, fetch_daily_fields
 
 APP = Path(__file__).resolve().parents[1]
 
@@ -144,23 +150,38 @@ def _render_board(code: str, freq_label: str, start, end) -> None:
     bars = resample_bars(sel, freq)
     table = board_frame(bars, code, freq)
 
+    # 日频展示字段（换手率/市值/PE/PB/是否ST）：stockdb 有就补列，没有就原样退回
+    fields = fetch_daily_fields(code, f"{start:%Y%m%d}", f"{end:%Y%m%d}")
+    if fields is not None and not fields.empty and not table.empty:
+        table = enrich(table, fields, "日期/时间")
+    day_keys = table["日期/时间"].astype(str).str[:8] if not table.empty else []
+    note = coverage_note(fields, day_keys)
+
     st.markdown(f'<div class="dbstat">数据载入并合并成功！'
                 f'<span style="color:#8896a8;margin-left:10px;">本地实际覆盖至 '
                 f'{sel["time"].max():%Y-%m-%d %H:%M}</span></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="dbstat" style="color:#8896a8;">{note}</div>',
+                unsafe_allow_html=True)
     st.markdown(
         f'<div class="dbhead"><span><b>{code}</b> [{freq}] '
         f'{start:%Y-%m-%d} 至 {end:%Y-%m-%d}</span>'
         f'<span>{len(table)} 行</span></div>', unsafe_allow_html=True)
 
+    fmt = {
+        "成交量": st.column_config.NumberColumn(format="%d"),
+        "成交额": st.column_config.NumberColumn(format="%d"),
+        "涨幅%": st.column_config.NumberColumn(format="%.2f"),
+        "振幅%": st.column_config.NumberColumn(format="%.2f"),
+        "量比": st.column_config.NumberColumn(format="%.2f"),
+        "换手率%": st.column_config.NumberColumn(format="%.2f"),
+        "总市值(亿)": st.column_config.NumberColumn(format="%.1f"),
+        "流通市值(亿)": st.column_config.NumberColumn(format="%.1f"),
+        "市盈率TTM": st.column_config.NumberColumn(format="%.2f"),
+        "市净率": st.column_config.NumberColumn(format="%.2f"),
+    }
     st.dataframe(
         table, width="stretch", hide_index=True, height=520,
-        column_config={
-            "成交量": st.column_config.NumberColumn(format="%d"),
-            "成交额": st.column_config.NumberColumn(format="%d"),
-            "涨幅%": st.column_config.NumberColumn(format="%.2f"),
-            "振幅%": st.column_config.NumberColumn(format="%.2f"),
-            "量比": st.column_config.NumberColumn(format="%.2f"),
-        })
+        column_config={k: v for k, v in fmt.items() if k in table.columns})
     # 导出按钮在筛选卡片里（与参考页一致：按钮成对出现），这里只备好内容
     st.session_state["db_csv"] = table.to_csv(index=False)
     st.session_state["db_fname"] = f"{code}_{freq}_{start:%Y%m%d}_{end:%Y%m%d}.csv"
@@ -219,5 +240,6 @@ def render_board(default_code: str = "300308") -> None:
                     unsafe_allow_html=True)
         return
     _render_board(state["code"], state["freq"], state["start"], state["end"])
-    st.caption("注：换手率 / 股本 / 市值 / 市盈率 / 市净率 需股本与财务数据，本地无此来源，"
-               "故不设空列。量比在日K口径下为「当日量 ÷ 前5日均量」。")
+    st.caption("注：换手率 / 市值 / 市盈率 / 市净率 / 是否ST 来自 stockdb 的日频字段，"
+               "只在库覆盖到的日期显示，其余留空、不做填充；stockdb 不可用时整组隐藏。"
+               "量比仍按本地口径：日K 为「当日量 ÷ 前5日均量」，分时口径不计算。")

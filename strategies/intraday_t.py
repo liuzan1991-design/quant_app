@@ -66,6 +66,24 @@ class IntradayTStrategy(BaseStrategy):
         prepared, corporate_dates, adjustment = prepare_signal_prices(df, raw_code)
         prepared.attrs["adjustment"] = adjustment
         prepared.attrs["corporate_action_dates"] = corporate_dates
+
+        # 前置拦资金不足：底仓是**固定股数**而非按资金比例，
+        # 不够时 backtest_generic.py:721 会每根 bar 静默 `continue`，
+        # 最终 equity_curve 为空 ⇒ 下游取 "equity" 列时抛 KeyError，
+        # 用户侧只看到 WORKER_FAILED，完全不知道是钱不够（真实发生过）。
+        base_position = int(p.get("base_position") or 0)
+        if base_position > 0 and len(prepared):
+            first_price = float(prepared["close"].iloc[0])
+            need = first_price * base_position
+            if float(init_cash) < need:
+                affordable = int(float(init_cash) // first_price) if first_price > 0 else 0
+                raise ValueError(
+                    f"初始资金不足：底仓 {base_position} 股 × 首根价 {first_price:.2f} "
+                    f"= {need:,.0f} 元，当前只有 {float(init_cash):,.0f} 元。"
+                    f"请把初始资金提到 ≥ {need:,.0f} 元，"
+                    f"或把「底仓股数」调到 {affordable} 股以内。"
+                )
+
         acc, trades, eq = bg.run_backtest(prepared, init_cash, p)
 
         return self._build_result(acc, trades, eq, prepared, init_cash, p)
@@ -92,6 +110,13 @@ class IntradayTStrategy(BaseStrategy):
         days = int(pd.to_datetime(df["time"]).dt.date.nunique())
         annual = (1 + total_return) ** (252 / max(days, 1)) - 1
         eq2 = eq.copy()
+        if eq2.empty or "equity" not in eq2.columns:
+            # 兜底：任何原因导致没有权益记录，都要给出可读原因，
+            # 而不是让 KeyError: 'equity' 冒到上层变成一个光秃秃的 WORKER_FAILED。
+            raise ValueError(
+                "回测未产生任何权益记录（equity_curve 为空）。"
+                "常见原因：① 初始资金不足以建立底仓；② 区间内无有效交易日；"
+                "③ 区间内每根 bar 都被前置条件跳过。")
         peak = eq2["equity"].cummax()
         dd = ((eq2["equity"] - peak) / peak)
         mdd = float(dd.min())

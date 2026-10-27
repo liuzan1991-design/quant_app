@@ -73,6 +73,14 @@ WINDOW_START = (4, 35)           # 本地时间窗口起（盘前 5 分钟）
 WINDOW_END = (10, 30)            # 本地时间窗口止（收盘缓冲结束后预留）
 MARKET_CLOSE_HHMM = "14:59"      # 北京时间的收盘最后一根 bar
 
+# ---- H60：僵尸采集的受控重启 ----
+# 2026-10-27 实证：04:32 首枪 kline_empty，进程此后每天照刷 updated_at（age 恒小），
+# 全天 422 次失败、0 成功，watchdog 只发 ALERT-STALE **不重启**，白丢 6 小时盘中数据，
+# 直到 10:10 进程自己死掉才被拉起。故新增"活着但从未采到数"的受控重启：
+ZOMBIE_MIN_AGE = 30 * 60         # 启动满 30 分钟仍 0 成功（≈60 轮，远超正常首轮耗时）
+ZOMBIE_MIN_ERRORS = 30           # 且失败轮次 ≥30（排除"刚启动慢一轮"误杀）
+ZOMBIE_MAX_RESTARTS = 3          # 每日受控重启上限（防重启风暴；今天是 1 次就救回）
+
 
 def log(msg: str) -> None:
     WATCHDOG_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -170,6 +178,114 @@ def _report_success_staleness(hb: dict, succ_age: float | None, suffix: str) -> 
     clear_alert("collect_stale")
 
 
+def _zombie_restart_decision(hb: dict, succ_age: float | None,
+                             now: datetime | None = None) -> tuple[bool, str]:
+    """判定"活着但从未采集成功"是否该做进程级重启（H60，纯函数，便于单测）。
+
+    只在**从未成功**时出手（`succ_age is None`）。已有成功记录后的陈旧走 H36 告警旁路：
+    2026-10-19 实证当日 5 次人工重启全败（RSS 涨到 ~2GB 后进程消失），
+    那段故障不是"换进程能解"，盲目重启只会制造僵尸进程。
+    """
+    if succ_age is not None:
+        return False, "已有成功记录 ⇒ 归 H36 陈旧告警，不做进程重启"
+    if hb.get("status") != "running":
+        return False, f"status={hb.get('status')}（非 running）"
+    started = _parse_dt(hb.get("started_at") or "")
+    if started is None:
+        return False, "started_at 不可解析"
+    age = ((now or datetime.now()) - started).total_seconds()
+    if age < ZOMBIE_MIN_AGE:
+        return False, f"启动仅 {age / 60:.0f} 分钟（< {ZOMBIE_MIN_AGE / 60:.0f}）"
+    errs = int(hb.get("collect_errors") or 0)
+    if errs < ZOMBIE_MIN_ERRORS:
+        return False, f"失败仅 {errs} 次（< {ZOMBIE_MIN_ERRORS}）"
+    return True, f"启动 {age / 60:.0f} 分钟 0 成功、失败 {errs} 次"
+
+
+def _restart_budget_path(day: str) -> Path:
+    return WATCHDOG_LOG.parent / f"watchdog_restarts_{str(day).replace('-', '')}.json"
+
+
+def _restart_budget(day: str) -> int:
+    try:
+        p = _restart_budget_path(day)
+        if p.exists():
+            return int((json.loads(p.read_text(encoding="utf-8")) or {}).get("count") or 0)
+    except Exception as e:  # noqa: BLE001
+        log(f"[WARN] 重启额度读取失败: {e!r}")
+    return 0
+
+
+def _bump_restart_budget(day: str, reason: str) -> int:
+    p = _restart_budget_path(day)
+    used = _restart_budget(day) + 1
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"count": used, "last_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+                                 "reason": reason}, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log(f"[WARN] 重启额度写入失败: {e!r}")
+    return used
+
+
+def _sleep(seconds: float) -> None:
+    """单点 sleep（测试可替换，避免用例真等）。"""
+    import time
+    time.sleep(seconds)
+
+
+def _kill_live_run(procs: list) -> bool:
+    """逐个强杀 live_run 进程。返回是否全部返回码为 0。"""
+    ok = True
+    for pid, _cmd in procs:
+        if pid is None:
+            ok = False
+            continue
+        try:
+            r = subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                               capture_output=True, timeout=30)
+            log(f"[动作] taskkill {pid} 返回码={r.returncode}")
+            ok = ok and r.returncode == 0
+        except Exception as e:  # noqa: BLE001
+            log(f"[ERROR] taskkill {pid} 失败: {e!r}")
+            ok = False
+    return ok
+
+
+def _maybe_restart_zombie(hb: dict, succ_age: float | None, suffix: str = "") -> bool:
+    """H60：活着但从未采到数 ⇒ 杀进程 + schtasks 拉起。带每日额度与残留校验。"""
+    need, reason = _zombie_restart_decision(hb, succ_age)
+    if not need:
+        log(f"[判定] 僵尸重启不触发：{reason}{suffix}")
+        return False
+
+    day = str(hb.get("date") or f"{datetime.now():%Y-%m-%d}")
+    used = _restart_budget(day)
+    if used >= ZOMBIE_MAX_RESTARTS:
+        log(f"[ALERT-ZOMBIE] {reason} → 今日受控重启已用 {used}/{ZOMBIE_MAX_RESTARTS}，"
+            f"不再重启{suffix}")
+        return False
+
+    procs = _live_run_processes()
+    log(f"[ALERT-ZOMBIE] {reason} → 进程 {[p[0] for p in procs] or '无'} 空转，"
+        f"执行受控重启（今日第 {used + 1}/{ZOMBIE_MAX_RESTARTS} 次）{suffix}")
+    _bump_restart_budget(day, reason)
+
+    if procs:
+        if not _kill_live_run(procs):
+            log("[ERROR] 部分进程未能终止 ⇒ 放弃本次重启（双实例会互相覆盖同一 CSV）")
+            return False
+        _sleep(3)
+        left = _live_run_processes()
+        if left:
+            log(f"[ERROR] 仍残留进程 {[p[0] for p in left]} ⇒ 放弃重启（双实例风险）")
+            return False
+
+    _restart(f"僵尸采集：{reason}")
+    return True
+
+
 def main() -> int:
     dry = "--dry-run" in sys.argv
     force = "--ignore-window" in sys.argv   # 测试用：跳过时间窗限制
@@ -212,6 +328,10 @@ def main() -> int:
         # 循环还活着。但"活着"≠"在采数"—— H36 的盲区正藏在这一句之后：
         # 采集停摆时 updated_at 照刷、age 恒小，旧版会直接判健康退出。
         _report_success_staleness(hb, succ_age, suffix)
+        # H60：活着但**从未采到数** ⇒ 受控重启（杀进程 + 拉起），否则会像 10-27 那样
+        # 空转到收盘。只处理 succ_age is None，其余仍留给 H36 告警旁路。
+        if not dry:
+            _maybe_restart_zombie(hb, succ_age, suffix)
         return 0   # 健康
 
     # ---- 心跳静默：分三种情况处置 ----

@@ -92,6 +92,34 @@ _SESSION = {
 }
 
 
+# H60：当日重建额度耗尽时的回调。默认 None ⇒ 行为与旧版一致（只累加 rebuild_rejected）。
+# 只有 live 进程会注册（live_run.py）；回测/批量补数**绝不注册**，因此不可能因额度耗尽退出。
+_EXHAUSTED_HOOK = None
+_EXHAUSTED_FIRED = {"day": ""}   # 每日只触发一次，防 252 次 rejected 刷出 252 次回调
+
+
+def set_exhausted_hook(fn) -> None:
+    """注册"当日重建额度耗尽"回调（H60）。
+
+    2026-10-27 实证：04:32 首枪 kline_empty → 422 次失败；重建 20 次触顶后
+    `rebuild_rejected=252`，进程空转到 10:10 才死，**白丢 6 小时盘中数据**。
+    重建只清 `_AD_CACHE`（Python 引用），清不掉原生登录线程 ⇒ 同进程内重建无解，
+    只能换进程。故由调用方（live_run）注册"额度耗尽 ⇒ 主动退出"。
+    """
+    global _EXHAUSTED_HOOK
+    _EXHAUSTED_HOOK = fn
+
+
+def _fire_exhausted(detail: dict) -> None:
+    hook = _EXHAUSTED_HOOK
+    if hook is None:
+        return
+    try:
+        hook(detail)
+    except Exception:  # noqa: BLE001 —— 回调不得成为新的失败点
+        pass
+
+
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -118,7 +146,10 @@ def reset_session_state() -> None:
     `monkeypatch.setattr(data_fetch, "_AD_CACHE", {})` + 手工塞 ad 的桩法。
     """
     with _AD_LOCK:
+        global _EXHAUSTED_HOOK
         _AD_CACHE.pop("calendar", None)
+        _EXHAUSTED_HOOK = None          # 测试隔离：回调不跨用例泄漏
+        _EXHAUSTED_FIRED["day"] = ""
         _SESSION.update({
             "day": _today(), "rebuild_count": 0, "rebuild_rejected": 0,
             "last_rebuild_at": 0.0, "breaker_state": "closed", "breaker_opens": 0,
@@ -157,19 +188,34 @@ def _rebuild_session(reason: str) -> bool:
     """
     try:
         now = time.monotonic()
+        detail = None
         with _AD_LOCK:
             if _SESSION["day"] != _today():
                 _roll_session_day()
             if _SESSION["rebuild_count"] >= REBUILD_DAILY_CAP:
                 _SESSION["rebuild_rejected"] += 1
-                return False
-            if now - _SESSION["last_rebuild_at"] < REBUILD_MIN_INTERVAL:
+                # H60：额度触顶 ⇒ 每日只回调一次（调用方据此退出进程换新会话）
+                if _EXHAUSTED_FIRED["day"] != _today():
+                    _EXHAUSTED_FIRED["day"] = _today()
+                    detail = {
+                        "day": _SESSION["day"],
+                        "reason": reason,
+                        "rebuild_count": int(_SESSION["rebuild_count"]),
+                        "rebuild_rejected": int(_SESSION["rebuild_rejected"]),
+                        "breaker_state": _SESSION["breaker_state"],
+                        "breaker_opens": int(_SESSION["breaker_opens"]),
+                        "login_threads_started": int(_SESSION["login_threads_started"]),
+                    }
+            elif now - _SESSION["last_rebuild_at"] < REBUILD_MIN_INTERVAL:
                 _SESSION["rebuild_rejected"] += 1
-                return False
-            _AD_CACHE.clear()          # ad 引用 + calendar 缓存一起失效
-            _SESSION["last_rebuild_at"] = now
-            _SESSION["rebuild_count"] += 1
-            return True
+            else:
+                _AD_CACHE.clear()          # ad 引用 + calendar 缓存一起失效
+                _SESSION["last_rebuild_at"] = now
+                _SESSION["rebuild_count"] += 1
+                return True
+        if detail is not None:
+            _fire_exhausted(detail)
+        return False
     except Exception:  # noqa: BLE001
         return False
 

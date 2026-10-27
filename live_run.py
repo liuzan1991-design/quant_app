@@ -49,6 +49,8 @@ from core.trading_calendar import beijing_today, is_trading_day  # noqa: E402
 from core.corporate_actions import refresh_cache as _refresh_corporate_actions  # noqa: E402
 from core.market_collector import MarketCollector  # noqa: E402
 from core.data_fetch import format_failure_line  # noqa: E402
+from core import data_fetch as _ad_fetch  # noqa: E402
+from core.live_exhaust import make_hook as _make_exhaust_hook  # noqa: E402
 
 # COMBOS 里同一 code 可能对应多个策略，去重保留出现顺序（日志里不再出现重复 code）。
 CODES = list(dict.fromkeys(c for c, _ in match.COMBOS))
@@ -111,6 +113,20 @@ def _write_heartbeat(path: Path, started_at: datetime, status: str,
         _LOGGER.exception("[heartbeat] 心跳写入失败")
 
 
+# H60：当日重建额度耗尽 ⇒ 主动退出，交计划任务/看门狗拉起新进程。
+# 策略本体在 core/live_exhaust.py（可单测、无副作用）；这里只负责注入日志与退出动作。
+def _flush_logs() -> None:
+    for _h in list(_LOGGER.handlers):
+        try:
+            _h.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        _CONSOLE_LOG.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> None:
     started_at = datetime.now()
     # H38：非交易日**直接退出** —— 不采集、不写摘要/history、不刷心跳/health。
@@ -127,6 +143,10 @@ def main() -> None:
     # 启动心跳：即使随后 init/build_observers/login 卡死或崩，也能看出"今天启动过但没采到数据"。
     _write_heartbeat(heartbeat_path, started_at, status="starting",
                      last_success_at=None, collect_errors=0, match_errors=0)
+    # H60：注册"额度耗尽 ⇒ 主动退出"回调。只注册在 live 进程；
+    # 默认不注册时 data_fetch 行为与旧版完全一致（回测/补数不受影响）。
+    _ad_fetch.set_exhausted_hook(
+        _make_exhaust_hook(LOG_DIR, _LOGGER, flush=_flush_logs))
 
     # 启动段之前不在 try/except 里，断网/损坏曾导致静默退出、无 traceback。
     try:

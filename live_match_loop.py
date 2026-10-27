@@ -37,6 +37,8 @@ from core.position_cap import evaluate as cap_evaluate, grade as cap_grade, CAP_
 from core.alerts import clear_alert, raise_alert  # noqa: E402  （H46-③ 送达）
 from core.paper_store import PaperStateStore  # noqa: E402
 from core.risk_manager import RiskConfig, RiskManager  # noqa: E402
+from core.price_limit import add_limit_columns  # noqa: E402  （H61 涨跌停）
+from core.data import stock_name  # noqa: E402  （H61 ST 判定）
 from strategies.grid_trade import GridTradeStrategy  # noqa: E402
 from strategies.ma_swing import MaSwingStrategy  # noqa: E402
 
@@ -115,8 +117,11 @@ def _code_symbol(code: str) -> str:
 
 
 def _risk() -> RiskManager:
+    # 2026-10-27（用户拍板 B）：单标的集中度 10% → 15%。
+    # 依据：100 万权益下 10% = 10 万，300308（577 元）仅够 173 股 ⇒ 建仓 100 股后
+    # 一格都加不进去；301717（279 元）也只够 3 手（底仓+2 档）。15% 才留出网格档位。
     return RiskManager(RiskConfig(
-        max_symbol_position_pct=0.10, max_account_position_pct=0.90,
+        max_symbol_position_pct=0.15, max_account_position_pct=0.90,
         max_order_value_pct=0.10, max_daily_loss_pct=0.02,
         max_symbol_cumulative_loss_pct=0.05))
 
@@ -320,7 +325,9 @@ def _position_cap_snapshot(obs: Observer) -> dict | None:
             return None
         equity = float(acct.equity())
         cash = float(getattr(acct, "cash", 0) or 0)
-        return cap_evaluate(shares * price, equity, shares=shares, cash=cash)
+        # 上限显式取风控配置，避免 position_cap 的常量与 RiskConfig 各自漂移（"同源"注释不等于同源）
+        cap = _risk().config.max_symbol_position_pct
+        return cap_evaluate(shares * price, equity, shares=shares, cash=cash, cap=cap)
     except Exception:  # noqa: BLE001 —— 监控失败不得影响摘要写出
         return None
 
@@ -368,6 +375,26 @@ def _build_observers() -> List[Observer]:
     return observers
 
 
+def _with_price_limits(full_df: pd.DataFrame, new_df: pd.DataFrame,
+                       symbol: str) -> pd.DataFrame:
+    """H61：给待处理的 bar 补 `limit_up` / `limit_down`。
+
+    前收必须取自**全量 df**：跨日时第一条 new bar 若只看 new_df，拿不到"上一交易日收盘"
+    ⇒ 当日首根无限价 ⇒ `risk_manager` 的涨停禁买在当天第一根就失效。
+    """
+    if new_df.empty:
+        return new_df
+    try:
+        priced = add_limit_columns(full_df, symbol, name=stock_name(symbol.split(".")[0]))
+    except Exception:  # noqa: BLE001 —— 涨跌停算不出来不该阻断撮合
+        _LOGGER.warning("H61：涨跌停列计算失败，本轮不启涨停保护", exc_info=True)
+        return new_df
+    limits = priced[["time", "limit_up", "limit_down"]].drop_duplicates("time")
+    out = new_df.copy()
+    out["time"] = pd.to_datetime(out["time"])
+    return out.merge(limits, on="time", how="left")
+
+
 def _process_new_bars(obs: Observer, df: pd.DataFrame) -> dict:
     if df.empty:
         return {"new_bars": 0}
@@ -385,6 +412,9 @@ def _process_new_bars(obs: Observer, df: pd.DataFrame) -> dict:
                             int((old_days < latest_day).sum()))
     if new_df.empty:
         return {"new_bars": 0}
+    # H61：补涨跌停列（前收取自全量 df）→ `paper_replay` 会自动读进 MarketSnapshot，
+    # 从而让 `risk_manager.py` 的「涨停禁买」真正生效（此前 live 恒 None = 死保护）。
+    new_df = _with_price_limits(df, new_df, obs.symbol)
     replay = OfflineReplayEngine(obs.broker, store=obs.store)
     replay.run(new_df, obs.symbol, obs.engine.on_bar, autosave_every=0)
     obs.broker = replay.broker

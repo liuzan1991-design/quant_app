@@ -16,7 +16,11 @@
 """
 from __future__ import annotations
 
-DEFAULT_CAP = 0.10       # 与 RiskConfig.max_symbol_position_pct 同源
+from core.risk_manager import RiskConfig as _RiskConfig
+
+# 单一来源：默认取自 RiskConfig，避免"同源"注释与实现各自漂移。
+# 2026-10-27（用户拍板 B）：10% → 15%。live 侧另显式传 cap（live_match_loop._position_cap_snapshot）。
+DEFAULT_CAP = _RiskConfig().max_symbol_position_pct
 CAP_KIND = "position_cap"
 
 

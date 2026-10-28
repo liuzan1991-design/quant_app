@@ -31,6 +31,41 @@ class IntradayTSharedState:
         self.__dict__.update(IntradayTSharedState(base_ready=base_ready).__dict__)
         self.current_day = None
 
+    # H68（2026-10-28）：补序列化。缺这两个方法时，live 侧 `save_engine_state` 每次
+    # 都抛 AttributeError（第一个分支找不到 to_dict，回退分支又找不到 .state）
+    # ⇒ 引擎状态**从未落盘**，重启后 buy_count_today / t_avg_cost / 冷却计时全部归零。
+    def to_dict(self) -> dict:
+        def _dump(v):
+            # datetime 是 date 的子类，必须先判 datetime，否则会被记成纯日期
+            if isinstance(v, datetime):
+                return {"__dt__": v.isoformat()}
+            if isinstance(v, date):
+                return {"__d__": v.isoformat()}
+            if isinstance(v, (list, tuple)):
+                return [_dump(x) for x in v]
+            if isinstance(v, dict):
+                return {k: _dump(x) for k, x in v.items()}
+            return v
+
+        return {f: _dump(getattr(self, f)) for f in type(self).__dataclass_fields__}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IntradayTSharedState":
+        def _load(v):
+            if isinstance(v, dict):
+                if set(v) == {"__dt__"}:
+                    return datetime.fromisoformat(v["__dt__"])
+                if set(v) == {"__d__"}:
+                    return date.fromisoformat(v["__d__"])
+                return {k: _load(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [_load(x) for x in v]
+            return v
+
+        kw = {k: _load(v) for k, v in (d or {}).items()
+              if k in cls.__dataclass_fields__}
+        return cls(**kw)
+
 
 class IntradayTSharedEngine:
     """只负责信号与状态；成交账户由调用方传入并必须提供 buy/sell/equity 接口。"""

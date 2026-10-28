@@ -48,7 +48,26 @@ LIVE_DIR = APP_DIR / "data" / "live"
 OUTPUT_DIR = APP_DIR / "live_outputs"
 
 # 观察期统一交易起点：底仓建仓价、信号、成交都从这天起；之前是预热段只喂指标。
+# ⚠️ 这只是**兜底常量**：实际起点由 `_trade_start_date(cfg)` 决定（H67）。
 TRADE_START_DATE = pd.Timestamp("2026-09-07")
+
+
+def _trade_start_date(cfg=None) -> pd.Timestamp:
+    """纸面交易起点：`live_config.paper_start_date` 优先，其次模块兜底常量。
+
+    2026-10-28（用户拍板 A）：原起点硬编码 09-07，纸面永远比实盘早跑 50 天
+    —— 底仓成本 303.16 vs 现价 278，账面 -3% 是历史包袱、不是真实成绩。
+    改为「首次生效日」后才反映真实跟踪；无配置/字段为空 ⇒ 行为逐字节不变
+    （回测与既有用例不受影响）。
+    """
+    raw = getattr(cfg, "paper_start_date", None) if cfg is not None else None
+    if raw:
+        try:
+            return pd.Timestamp(str(raw))
+        except (ValueError, TypeError):   # 脏数据不阻断启动：回落兜底并留痕
+            _LOGGER.warning("[H67] paper_start_date=%r 无法解析，回落 %s",
+                            raw, TRADE_START_DATE.date())
+    return TRADE_START_DATE
 
 COMBOS = [
     ("300308", "grid_trade"),
@@ -195,6 +214,9 @@ class Observer:
     # processed_times 只保留每日最高值，供 `max(...)` 这类既有调用继续可用。
     day_upto: dict = field(default_factory=dict)
     processed_times: set = field(default_factory=set)
+    # H70：本观察单元的**资金基准**（配置值）。所有 cum_pnl / 回撤 / 峰值都以它为分母，
+    # 不能再混用模块常量 INIT_CASH —— 那是"无配置时的兜底"，不是运行口径。
+    initial_cash: float = INIT_CASH
     equity_high: float = INIT_CASH
     signals: List[dict] = field(default_factory=list)
     day_start_equity: float = INIT_CASH
@@ -232,17 +254,17 @@ class Observer:
             for t in legacy:
                 self._mark_processed(pd.Timestamp(t))
             self.processed_times = set(self.day_upto.values())
-            self.equity_high = float(data.get("equity_high", INIT_CASH))
-            self.day_start_equity = float(data.get("day_start_equity", INIT_CASH))
+            self.equity_high = float(data.get("equity_high", self.initial_cash))
+            self.day_start_equity = float(data.get("day_start_equity", self.initial_cash))
             self.day_anchor_date = str(data.get("day_anchor_date", ""))
-            self.day_high_equity = float(data.get("day_high_equity", INIT_CASH))
+            self.day_high_equity = float(data.get("day_high_equity", self.initial_cash))
             self.max_drawdown_cumulative = float(data.get("max_drawdown_cumulative", 0.0))
 
     def reset_daily_metrics(self, day: str) -> None:
         """按交易日期重置日内基准；同日重启必须保留，跨日才允许重置。"""
         if self.day_anchor_date == day:
             return
-        equity = self.broker.account.equity() if self.broker is not None else INIT_CASH
+        equity = self.broker.account.equity() if self.broker is not None else self.initial_cash
         self.day_start_equity = equity
         self.day_high_equity = equity
         self.day_anchor_date = day
@@ -257,7 +279,11 @@ class Observer:
         self.save_engine_state()
 
     def save_engine_state(self) -> None:
-        if self.strategy_id == "grid_trade":
+        # H68(2026-10-28)：intraday_t 接入时漏了这条分支 —— 它的 state 挂在
+        # `engine.engine.state`（IntradayTSharedEngine），与 grid 同构、与 ma_swing 不同。
+        # 漏掉的后果：每次存快照都抛 AttributeError，引擎状态**从未落盘** ⇒
+        # 重启后 buy_count_today / t_avg_cost / 冷却计时全部归零，等于每天重新开始计数。
+        if self.strategy_id in ("grid_trade", "intraday_t"):
             state = self.engine.engine.state.to_dict()
         else:
             state = self.engine.state.to_dict()
@@ -272,6 +298,9 @@ class Observer:
         if self.strategy_id == "grid_trade":
             from core.grid_shared import GridSharedState
             self.engine.engine.state = GridSharedState.from_dict(state)
+        elif self.strategy_id == "intraday_t":
+            from core.intraday_t_shared import IntradayTSharedState
+            self.engine.engine.state = IntradayTSharedState.from_dict(state)
         else:
             from core.ma_swing_live import MaSwingLiveState
             self.engine.state = MaSwingLiveState.from_dict(state)
@@ -336,7 +365,7 @@ class Observer:
 
 
 def _engine_for(obs: Observer, df: pd.DataFrame):
-    obs.params.setdefault("warmup_end", str(TRADE_START_DATE.date()))
+    obs.params.setdefault("warmup_end", str(_trade_start_date(getattr(obs, "cfg", None)).date()))
     if obs.strategy_id == "grid_trade":
         return GridSharedLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id, df=df)
     if obs.strategy_id == "intraday_t":
@@ -397,9 +426,9 @@ def _build_observers() -> List[Observer]:
         if df.empty:
             raise RuntimeError(f"{code} 无 live 行情，无法启动")
         # 交易段：观察期统一起点（09-07）及之后；之前是预热段只喂指标。
-        trade_df = df[df["time"] >= TRADE_START_DATE].reset_index(drop=True)
+        trade_df = df[df["time"] >= _trade_start_date(cfg)].reset_index(drop=True)
         if trade_df.empty:
-            raise RuntimeError(f"{code} 无交易段数据（起点 {TRADE_START_DATE.date()}）")
+            raise RuntimeError(f"{code} 无交易段数据（起点 {_trade_start_date(cfg).date()}）")
         first_price = float(trade_df["close"].iloc[0])
         params = _params_for(cfg, code, sid, first_price)
         symbol = _code_symbol(code)
@@ -420,10 +449,22 @@ def _build_observers() -> List[Observer]:
             obs.broker = _broker(pd.Timestamp(trade_df["time"].iloc[0]).date().isoformat(), cfg)
             obs.engine = _engine_for(obs, df)
             obs.processed_times = set()
-            obs.equity_high = INIT_CASH
-            obs.day_start_equity = INIT_CASH
+            # H69（2026-10-28）：**新建账户时交易段之前的 bar 属预热，必须标为已处理**。
+            # 漏这一步的后果：`_process_new_bars` 的水位为空 ⇒ new_df = 全量 df
+            # ⇒ 首次就把 12,240 根历史全当新数据回放。实测 intraday_t 在 08-11 就开仓，
+            # 成交价 385.66 / 393.50 完全脱离当日 269~281 区间，成本与权益全部失真。
+            _head = df[df["time"] < trade_df["time"].iloc[0]]
+            if len(_head):
+                for _d, _g in _head.groupby(_head["time"].dt.normalize().dt.date):
+                    obs._mark_processed(pd.Timestamp(_g["time"].max()))
+                _LOGGER.info("H69：%s×%s 预热段 %d 根已标为已处理（%s ~ %s）",
+                             code, sid, len(_head),
+                             _head["time"].iloc[0], _head["time"].iloc[-1])
+            obs.initial_cash = _initial_cash(obs)
+            obs.equity_high = obs.initial_cash
+            obs.day_start_equity = obs.initial_cash
             obs.day_anchor_date = ""
-            obs.day_high_equity = INIT_CASH
+            obs.day_high_equity = obs.initial_cash
             obs.max_drawdown_cumulative = 0.0
         obs.reset_daily_metrics(datetime.now().strftime("%Y-%m-%d"))
         observers.append(obs)
@@ -506,7 +547,7 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
     df = _load_live(obs.code)
     if df.empty:
         return pd.DataFrame(columns=["time", "direction", "shares"])
-    trade_df = df[df["time"] >= TRADE_START_DATE].reset_index(drop=True)
+    trade_df = df[df["time"] >= _trade_start_date(getattr(obs, "cfg", None))].reset_index(drop=True)
     first_price = float(trade_df["close"].iloc[0])
     # H57-S3：**复用 obs.params**，不要重新 freeze。
     # 否则 live_config 的参数覆盖在"基准信号"这条路上丢失，
@@ -521,7 +562,7 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
         params = freeze_params(obs.strategy_id, first_price, base_params)
     strategy = _STRATEGY_CLASSES[obs.strategy_id]()
     result = strategy.run(df, _initial_cash(obs), params,
-                          context={"code": obs.code, "warmup_end": str(TRADE_START_DATE.date())})
+                          context={"code": obs.code, "warmup_end": str(_trade_start_date(getattr(obs, "cfg", None)).date())})
     trades = result.trades.copy()
     trades["time"] = pd.to_datetime(trades["time"])
     return trades[["time", "direction", "shares"]]
@@ -607,7 +648,7 @@ def _write_daily_summary(obs: Observer) -> dict:
             finalize()
     equity = obs.broker.account.equity()
     day_pnl = equity - obs.day_start_equity
-    cum_pnl = equity - INIT_CASH
+    cum_pnl = equity - obs.initial_cash
     day_dd = 0.0
     if obs.day_high_equity > 0:
         day_dd = (equity - obs.day_high_equity) / obs.day_high_equity

@@ -68,6 +68,10 @@ class LiveConfig:
     risk_pct: float = 0.10
     positions: list = field(default_factory=list)
     risk: dict = field(default_factory=dict)  # 覆盖 RiskConfig 的字段
+    # 纸面交易起点（YYYY-MM-DD）。None ⇒ 回落到模块常量 TRADE_START_DATE。
+    # 2026-10-28：原起点硬编码 2026-09-07，导致纸面永远比实盘早跑 50 天
+    # （底仓成本 303.16 vs 现价 278，账面 -3% 属历史包袱，不是真实成绩）。
+    paper_start_date: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +81,7 @@ class LiveConfig:
             "risk_pct": self.risk_pct,
             "positions": [p.to_dict() for p in self.positions],
             "risk": dict(self.risk),
+            "paper_start_date": self.paper_start_date,
         }
 
 
@@ -98,6 +103,16 @@ def validate(cfg: LiveConfig) -> list[str]:
         errs.append(f"risk_pct 必须在 (0, 1] 内，当前 {cfg.risk_pct}")
     if cfg.initial_cash is not None and float(cfg.initial_cash) <= 0:
         errs.append(f"initial_cash 必须 > 0，当前 {cfg.initial_cash}")
+
+    # 纸面起点：格式必须是 YYYY-MM-DD，且不能在未来（未来日没有可回放的行情）
+    if cfg.paper_start_date:
+        try:
+            _start = datetime.strptime(str(cfg.paper_start_date), "%Y-%m-%d").date()
+        except ValueError:
+            errs.append(f"paper_start_date 必须是 YYYY-MM-DD，当前 {cfg.paper_start_date!r}")
+        else:
+            if _start > datetime.now().date():
+                errs.append(f"paper_start_date={_start} 在未来，没有行情可回放")
 
     seen: set = set()
     for i, p in enumerate(cfg.positions):
@@ -151,7 +166,9 @@ def from_dict(d: dict) -> LiveConfig:
                       initial_cash=d.get("initial_cash"),
                       risk_pct=float(d.get("risk_pct", 0.10)),
                       positions=pos,
-                      risk=dict(d.get("risk") or {}))
+                      risk=dict(d.get("risk") or {}),
+                      paper_start_date=(str(d["paper_start_date"]).strip()
+                                        if d.get("paper_start_date") else None))
 
 
 def load(path: Path | None = None) -> LiveConfig | None:

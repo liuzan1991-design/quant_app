@@ -72,6 +72,9 @@ class LiveConfig:
     # 2026-10-28：原起点硬编码 2026-09-07，导致纸面永远比实盘早跑 50 天
     # （底仓成本 303.16 vs 现价 278，账面 -3% 属历史包袱，不是真实成绩）。
     paper_start_date: Optional[str] = None
+    # H72：live 采集主源。ad = 星耀（默认历史口径）/ qmt = 迅投本地客户端。
+    # QMT 失败会自动回退 AD；AD 的"单点会话"约束（H34/H37/H44）在 QMT 上不存在。
+    kline_source: str = "qmt"
 
     def to_dict(self) -> dict:
         return {
@@ -82,6 +85,7 @@ class LiveConfig:
             "positions": [p.to_dict() for p in self.positions],
             "risk": dict(self.risk),
             "paper_start_date": self.paper_start_date,
+            "kline_source": self.kline_source,
         }
 
 
@@ -103,6 +107,9 @@ def validate(cfg: LiveConfig) -> list[str]:
         errs.append(f"risk_pct 必须在 (0, 1] 内，当前 {cfg.risk_pct}")
     if cfg.initial_cash is not None and float(cfg.initial_cash) <= 0:
         errs.append(f"initial_cash 必须 > 0，当前 {cfg.initial_cash}")
+
+    if str(cfg.kline_source).strip().lower() not in ("ad", "qmt", "stockdb"):
+        errs.append(f"kline_source 只能是 ad / qmt / stockdb，当前 {cfg.kline_source!r}")
 
     # 纸面起点：格式必须是 YYYY-MM-DD，且不能在未来（未来日没有可回放的行情）
     if cfg.paper_start_date:
@@ -168,7 +175,8 @@ def from_dict(d: dict) -> LiveConfig:
                       positions=pos,
                       risk=dict(d.get("risk") or {}),
                       paper_start_date=(str(d["paper_start_date"]).strip()
-                                        if d.get("paper_start_date") else None))
+                                        if d.get("paper_start_date") else None),
+                      kline_source=str(d.get("kline_source") or "qmt").strip().lower())
 
 
 def load(path: Path | None = None) -> LiveConfig | None:

@@ -117,3 +117,17 @@ def test_p1b_non_min1_falls_back(monkeypatch) -> None:
     monkeypatch.setattr(data_fetch, "_fetch_kline_inner", lambda *a, **k: sentinel)
     got = data_fetch.fetch_kline("300308", "2026-01-01", "2026-01-01", period="day")
     assert got is sentinel
+
+
+# ── H72：`date` 对象不能被静默吃掉（2026-10-28 实测踩坑）────────────────────
+def test_p1b_accepts_date_object() -> None:
+    """`beijing_today()` 返回 `datetime.date`，而 `date.replace('-', '')` 会抛
+    "TypeError: 'str' object cannot be interpreted as an integer"（2026-10-28 实测踩到）。
+    这里钉住 `_yyyymmdd`：date / datetime / Timestamp / str 四种入参都得转成 YYYYMMDD。
+    """
+    import datetime as _dt
+    f = qmt_kline._yyyymmdd
+    assert f(_dt.date(2026, 1, 1)) == "20260101"
+    assert f(_dt.datetime(2026, 1, 2, 15, 30)) == "20260102"
+    assert f(pd.Timestamp("2026-03-04 09:30")) == "20260304"
+    assert f("2026-03-05") == "20260305", "字符串行为必须与历史完全一致"

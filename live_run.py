@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
 import traceback
@@ -51,6 +52,7 @@ from core.market_collector import MarketCollector  # noqa: E402
 from core.data_fetch import format_failure_line  # noqa: E402
 from core import data_fetch as _ad_fetch  # noqa: E402
 from core.live_exhaust import make_hook as _make_exhaust_hook  # noqa: E402
+from core import live_config  # noqa: E402  （H72）
 
 # COMBOS 里同一 code 可能对应多个策略，去重保留出现顺序（日志里不再出现重复 code）。
 CODES = list(dict.fromkeys(c for c, _ in match.COMBOS))   # 兜底：无配置时的硬编码组合
@@ -142,6 +144,31 @@ def _flush_logs() -> None:
         pass
 
 
+def _apply_kline_source() -> str:
+    """H72：把 `live_config.kline_source` 写进 `QUANT_KLINE_SOURCE` 环境变量。
+
+    必须在**第一轮采集之前**调用 —— `data_fetch.fetch_kline` 每次调用都读该环境变量，
+    所以此处设置即生效。
+
+    返回实际生效的主源（"ad" / "qmt" / "stockdb"）：
+    - 有配置且配置里给了值 ⇒ 用配置值；
+    - 无配置 / 读配置抛错 ⇒ **不写环境变量**，沿用 `fetch_kline` 的默认 "ad"
+      （历史行为逐字节不变，避免"没配就把主源改了"的静默切换）。
+    """
+    try:
+        cfg = live_config.load()
+        src = str(getattr(cfg, "kline_source", "") or "").strip().lower() if cfg else ""
+    except Exception:  # noqa: BLE001 —— 读配置失败不该阻断启动
+        _LOGGER.exception("[H72] 读取 kline_source 失败，沿用默认 ad")
+        return "ad"
+    if src:
+        os.environ["QUANT_KLINE_SOURCE"] = src
+        _LOGGER.info("[H72] live 行情主源 = %s（来自 live_config）", src)
+        return src
+    _LOGGER.info("[H72] live 行情主源 = 默认 ad（live_config 未指定）")
+    return "ad"
+
+
 def main() -> None:
     started_at = datetime.now()
     # H38：非交易日**直接退出** —— 不采集、不写摘要/history、不刷心跳/health。
@@ -158,6 +185,9 @@ def main() -> None:
     # 启动心跳：即使随后 init/build_observers/login 卡死或崩，也能看出"今天启动过但没采到数据"。
     _write_heartbeat(heartbeat_path, started_at, status="starting",
                      last_success_at=None, collect_errors=0, match_errors=0)
+    # H72：行情主源必须在**第一轮采集之前**写进环境变量（实现见 `_apply_kline_source`）。
+    _apply_kline_source()
+
     # H60：注册"额度耗尽 ⇒ 主动退出"回调。只注册在 live 进程；
     # 默认不注册时 data_fetch 行为与旧版完全一致（回测/补数不受影响）。
     _ad_fetch.set_exhausted_hook(

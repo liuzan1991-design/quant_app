@@ -445,6 +445,12 @@ def _build_observers() -> List[Observer]:
         obs = Observer(code=code, strategy_id=sid, symbol=symbol, params=params, cfg=cfg)
         obs.store = PaperStateStore(OUTPUT_DIR / symbol / sid)
         obs.signal_path = OUTPUT_DIR / symbol / sid / "signals.jsonl"
+        # H70-fix（2026-10-28）：资金基准必须在**两个分支之前**统一设置。
+        # 此前只在「新建账户」分支设，走「恢复快照」分支时 initial_cash 仍是默认
+        # INIT_CASH(100万) ⇒ cum_pnl = equity - 100万 = -698,166，
+        # 而 day_pnl 用的是 30 万 ⇒ 同一天出现两个基准（当天实为 +1,834）。
+        # 这个 bug 曾被"新建策略"掩盖过一次：新建分支设对了，旧策略没设。
+        obs.initial_cash = _initial_cash(obs)
 
         # 优先恢复已有账户快照与水位线，实现重启续跑、不重复建仓。
         existing_broker = obs.store.load()

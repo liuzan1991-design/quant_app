@@ -32,6 +32,13 @@ BARS_PER_DAY = 240          # 09:30–11:29 + 13:00–14:59
 PRICE_COLS = ("open", "high", "low", "close")
 
 
+def _yyyymmdd(day) -> str:
+    """`date` / `datetime` / `Timestamp` / `str` → `YYYYMMDD`（QMT 只吃这个格式）。"""
+    if hasattr(day, "strftime"):
+        return day.strftime("%Y%m%d")
+    return str(day).replace("-", "").strip()
+
+
 def qmt_code(code: str) -> str:
     code = code.strip().upper()
     return code if "." in code else f"{code}.SZ"
@@ -106,7 +113,10 @@ def fetch_qmt_kline(code: str, begin: str, end: str) -> pd.DataFrame:
     from xtquant import xtdata  # 延迟 import
 
     sym = qmt_code(code)
-    b, e = begin.replace("-", ""), end.replace("-", "")
+    # ⚠️ 只接受 YYYY-MM-DD 字符串：`beijing_today()` 返回 `datetime.date`，
+    # 它的 `.replace(年,月,日)` 会静默吃掉 "-"/"" 并抛
+    # "TypeError: 'str' object cannot be interpreted as an integer"（2026-10-28 实测踩到）。
+    b, e = _yyyymmdd(begin), _yyyymmdd(end)
     xtdata.download_history_data(sym, "1m", b, e)
     data = xtdata.get_market_data_ex(
         ["time", "open", "high", "low", "close", "volume", "amount"],

@@ -91,6 +91,11 @@ def _record_applied_config(cfg, combos) -> None:
             "combos": [list(c) for c in combos],
             "overrides": ({f"{c}×{s}": live_config.overrides_for(cfg, c, s)
                            for c, s in combos} if cfg is not None else {}),
+            # H64：实盘口径也留痕 —— 资金基准与风控上限改动会直接改变下单规模，
+            # 事后必须能从这一行解释"今天为什么下了这个量"。
+            "initial_cash": (cfg.initial_cash if cfg is not None else None),
+            "risk_pct": (cfg.risk_pct if cfg is not None else None),
+            "risk": (dict(cfg.risk) if cfg is not None else {}),
         }
         LIVE_DIR.mkdir(parents=True, exist_ok=True)
         (LIVE_DIR / "config_applied.json").write_text(
@@ -100,10 +105,16 @@ def _record_applied_config(cfg, combos) -> None:
 
 
 def _params_for(cfg, code: str, sid: str, first_price: float) -> dict:
-    """默认参数 → freeze_params → 叠加配置覆盖（覆盖优先）。"""
+    """默认参数 → freeze_params → 叠加配置覆盖（覆盖优先）。
+
+    H64：`init_cash` / `risk_pct` 来自 live_config（无配置 ⇒ 用模块常量，行为不变）。
+    """
     base_params = (GridTradeStrategy.default_params() if sid == "grid_trade"
                    else MaSwingStrategy.default_params())
-    params = freeze_params(sid, first_price, base_params)
+    params = freeze_params(
+        sid, first_price, base_params,
+        init_cash=(cfg.initial_cash if cfg is not None else None),
+        risk_pct=(cfg.risk_pct if cfg is not None else None))
     if cfg is not None:
         ov = live_config.overrides_for(cfg, code, sid)
         if ov:
@@ -116,18 +127,41 @@ def _code_symbol(code: str) -> str:
     return f"{code}.SH" if code.startswith("68") else f"{code}.SZ"
 
 
-def _risk() -> RiskManager:
-    # 2026-10-27（用户拍板 B）：单标的集中度 10% → 15%。
-    # 依据：100 万权益下 10% = 10 万，300308（577 元）仅够 173 股 ⇒ 建仓 100 股后
-    # 一格都加不进去；301717（279 元）也只够 3 手（底仓+2 档）。15% 才留出网格档位。
-    return RiskManager(RiskConfig(
-        max_symbol_position_pct=0.15, max_account_position_pct=0.90,
+def _risk(cfg=None) -> RiskManager:
+    """风控配置：**源码默认** + `live_config.risk` 覆盖（H64）。
+
+    2026-10-27（用户拍板 B）：单标的集中度 10% → 15%；
+    2026-10-28（D2）：再定到 **20%**，并接入配置层（面板可改）。
+    `cfg.risk` 只允许覆盖 `RiskConfig` 的既有字段，未知键直接忽略（不静默扩大面）。
+    """
+    base = dict(
+        max_symbol_position_pct=0.20, max_account_position_pct=0.90,
         max_order_value_pct=0.10, max_daily_loss_pct=0.02,
-        max_symbol_cumulative_loss_pct=0.05))
+        max_symbol_cumulative_loss_pct=0.05)
+    if cfg is not None and getattr(cfg, "risk", None):
+        for k, v in dict(cfg.risk).items():
+            if k in RiskConfig.__dataclass_fields__:
+                base[k] = v
+            else:
+                _LOGGER.warning("[H64] live_config.risk 含未知字段 %s（已忽略）", k)
+    return RiskManager(RiskConfig(**base))
 
 
-def _broker(day: str) -> PaperBroker:
-    return PaperBroker(INIT_CASH, day, risk_manager=_risk(),
+def _initial_cash(obs=None) -> float:
+    """H64：资金基准 = `cfg.initial_cash`，无配置回落到 `INIT_CASH`。
+
+    用 `getattr` 而非直接取属性：既有测试用 SimpleNamespace 造 obs，不带 cfg。
+    """
+    cfg = getattr(obs, "cfg", None)
+    if cfg is not None and getattr(cfg, "initial_cash", None):
+        return float(cfg.initial_cash)
+    return float(INIT_CASH)
+
+
+def _broker(day: str, cfg=None) -> PaperBroker:
+    """纸面账户：初始资金取 `cfg.initial_cash`，无配置回落到 `INIT_CASH`（H64）。"""
+    cash = float(cfg.initial_cash) if (cfg is not None and getattr(cfg, "initial_cash", None)) else INIT_CASH
+    return PaperBroker(cash, day, risk_manager=_risk(cfg),
                        config=PaperBrokerConfig(slippage_bps=5, max_volume_participation=0.10))
 
 
@@ -140,6 +174,7 @@ class Observer:
     engine: object = None
     broker: PaperBroker = None
     store: PaperStateStore = None
+    cfg: object = None      # H64：live_config（None ⇒ 源码默认口径）
     # H47：去重的**权威状态**是"每个交易日已处理到的最高时刻"（体积 KB 级），
     # processed_times 只保留每日最高值，供 `max(...)` 这类既有调用继续可用。
     day_upto: dict = field(default_factory=dict)
@@ -326,7 +361,7 @@ def _position_cap_snapshot(obs: Observer) -> dict | None:
         equity = float(acct.equity())
         cash = float(getattr(acct, "cash", 0) or 0)
         # 上限显式取风控配置，避免 position_cap 的常量与 RiskConfig 各自漂移（"同源"注释不等于同源）
-        cap = _risk().config.max_symbol_position_pct
+        cap = _risk(obs.cfg).config.max_symbol_position_pct
         return cap_evaluate(shares * price, equity, shares=shares, cash=cash, cap=cap)
     except Exception:  # noqa: BLE001 —— 监控失败不得影响摘要写出
         return None
@@ -348,7 +383,7 @@ def _build_observers() -> List[Observer]:
         first_price = float(trade_df["close"].iloc[0])
         params = _params_for(cfg, code, sid, first_price)
         symbol = _code_symbol(code)
-        obs = Observer(code=code, strategy_id=sid, symbol=symbol, params=params)
+        obs = Observer(code=code, strategy_id=sid, symbol=symbol, params=params, cfg=cfg)
         obs.store = PaperStateStore(OUTPUT_DIR / symbol / sid)
         obs.signal_path = OUTPUT_DIR / symbol / sid / "signals.jsonl"
 
@@ -362,7 +397,7 @@ def _build_observers() -> List[Observer]:
             obs.engine = _engine_for(obs, df)
             obs.restore_engine_state()
         else:
-            obs.broker = _broker(pd.Timestamp(trade_df["time"].iloc[0]).date().isoformat())
+            obs.broker = _broker(pd.Timestamp(trade_df["time"].iloc[0]).date().isoformat(), cfg)
             obs.engine = _engine_for(obs, df)
             obs.processed_times = set()
             obs.equity_high = INIT_CASH
@@ -464,7 +499,7 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
         params = freeze_params(obs.strategy_id, first_price, base_params)
     strategy = (GridTradeStrategy() if obs.strategy_id == "grid_trade"
                 else MaSwingStrategy())
-    result = strategy.run(df, INIT_CASH, params,
+    result = strategy.run(df, _initial_cash(obs), params,
                           context={"code": obs.code, "warmup_end": str(TRADE_START_DATE.date())})
     trades = result.trades.copy()
     trades["time"] = pd.to_datetime(trades["time"])

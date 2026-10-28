@@ -31,7 +31,7 @@ def freeze_params(strategy_id: str, first_price: float, base_params: dict,
     cash = float(init_cash) if init_cash else INIT_CASH
     pct = float(risk_pct) if risk_pct else RISK_PCT
     params = dict(base_params)
-    if strategy_id in ("grid_trade", "intraday_t"):
+    if strategy_id in ("grid_trade", "intraday_t", "sentiment_t"):
         # H65：intraday_t 的仓位参数与 grid 同构（base_position / max_position），
         # 只把"每笔股数"的 key 换成 fixed_shares —— 不统一冻结会导致面板改了钱
         # 却仍按策略默认 1000 股建仓（§6.9 第 11 形态）。

@@ -30,6 +30,7 @@ from core.adjustment import prepare_signal_prices  # noqa: E402
 from core.grid_shared_live import GridSharedLiveEngine  # noqa: E402
 from core.ma_swing_live import MaSwingLiveEngine  # noqa: E402
 from core.intraday_t_shared_live import IntradayTSharedLiveEngine  # noqa: E402  （H65）
+from core.sentiment_t_shared_live import SentimentTSharedLiveEngine  # noqa: E402  （H71）
 from core.paper_broker import PaperBroker, PaperBrokerConfig  # noqa: E402
 from core.paper_replay import OfflineReplayEngine, StrategySignal  # noqa: E402
 from core.data_quality import day_bar_stats  # noqa: E402  （H35 缺口标记）
@@ -43,6 +44,7 @@ from core.data import stock_name  # noqa: E402  （H61 ST 判定）
 from strategies.grid_trade import GridTradeStrategy  # noqa: E402
 from strategies.ma_swing import MaSwingStrategy  # noqa: E402
 from strategies.intraday_t import IntradayTStrategy  # noqa: E402  （H65）
+from strategies.sentiment_t import SentimentTStrategy  # noqa: E402  （H71）
 
 LIVE_DIR = APP_DIR / "data" / "live"
 OUTPUT_DIR = APP_DIR / "live_outputs"
@@ -76,10 +78,12 @@ COMBOS = [
 
 # H57-S3：live 目前支持的策略（`_engine_for` 有对应分支）。
 # 配置里出现其它策略必须**明确报错**，不能静默跳过 —— 否则用户以为换上了，实际没跑。
-# H65（2026-10-28）：面板可选的 live 策略。
-# sentiment_t 暂不放行：`sentiment_t_shared_live` 会经 sentiment_data 拉**指数分钟线**，
-# 那是额外的 AD 登录，会与采集抢单点会话（H37/H44 的老雷）。要放行须先解决数据源。
-_SUPPORTED_LIVE_STRATEGIES = {"grid_trade", "ma_swing", "intraday_t"}
+# H65/H71（2026-10-28）：面板可选的 live 策略。
+# H71 更正 H65：`sentiment_data._fetch_and_cache` 是**缓存优先** —— 缓存命中直接返回、
+# 不碰 AD；只有缺口才调 fetch_kline，且复用 live 进程内同一会话（不是"额外登录"）。
+# 真实代价：启动时补指数缺口（缺几天补几天），之后纯内存查表。
+# 降级风险：指数加载失败时 status_map 为空 ⇒ 退化为普通做T，**必须留痕不能静默**。
+_SUPPORTED_LIVE_STRATEGIES = {"grid_trade", "ma_swing", "intraday_t", "sentiment_t"}
 
 
 def _resolve_combos(cfg=None) -> list[tuple[str, str]]:
@@ -134,6 +138,7 @@ _STRATEGY_CLASSES = {
     "grid_trade": GridTradeStrategy,
     "ma_swing": MaSwingStrategy,
     "intraday_t": IntradayTStrategy,
+    "sentiment_t": SentimentTStrategy,
 }
 
 
@@ -283,7 +288,7 @@ class Observer:
         # `engine.engine.state`（IntradayTSharedEngine），与 grid 同构、与 ma_swing 不同。
         # 漏掉的后果：每次存快照都抛 AttributeError，引擎状态**从未落盘** ⇒
         # 重启后 buy_count_today / t_avg_cost / 冷却计时全部归零，等于每天重新开始计数。
-        if self.strategy_id in ("grid_trade", "intraday_t"):
+        if self.strategy_id in ("grid_trade", "intraday_t", "sentiment_t"):
             state = self.engine.engine.state.to_dict()
         else:
             state = self.engine.state.to_dict()
@@ -298,7 +303,7 @@ class Observer:
         if self.strategy_id == "grid_trade":
             from core.grid_shared import GridSharedState
             self.engine.engine.state = GridSharedState.from_dict(state)
-        elif self.strategy_id == "intraday_t":
+        elif self.strategy_id in ("intraday_t", "sentiment_t"):
             from core.intraday_t_shared import IntradayTSharedState
             self.engine.engine.state = IntradayTSharedState.from_dict(state)
         else:
@@ -372,6 +377,11 @@ def _engine_for(obs: Observer, df: pd.DataFrame):
         # H65：与 grid 同构（都吃 df 做 prepare），复权在引擎内部走 prepare_signal_prices
         return IntradayTSharedLiveEngine(obs.symbol, obs.params,
                                          strategy_id=obs.strategy_id, df=df)
+    if obs.strategy_id == "sentiment_t":
+        # H71：签名是 (symbol, params, df, strategy_id) —— 位置顺序与 intraday_t 不同，
+        # 必须全部走关键字，否则会把 df 当 strategy_id 传进去。
+        return SentimentTSharedLiveEngine(obs.symbol, obs.params,
+                                          df=df, strategy_id=obs.strategy_id)
     prepared, events, _adj = prepare_signal_prices(df, obs.code)
     return MaSwingLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id,
                              prepared_df=prepared, corporate_action_dates=events)

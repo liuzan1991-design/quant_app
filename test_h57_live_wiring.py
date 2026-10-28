@@ -70,11 +70,13 @@ def test_config_override_applied(cfg_path: Path) -> None:
 
 # ── ③ 拒绝静默跳过 ──────────────────────────────────────────────────────────
 def test_unsupported_strategy_raises(cfg_path: Path) -> None:
-    # H65：intraday_t 已获支持，改用仍未放行的 sentiment_t 作为"不支持"样本
-    _write(cfg_path, [{"code": "300308", "strategy_id": "sentiment_t", "enabled": True}])
+    # H65：intraday_t 已获支持 → 换 sentiment_t；H71：sentiment_t 也放行 ⇒
+    # 四个注册策略全部支持，必须用一个**真实不存在**的名字才能测到这条守卫。
+    # （这条用例的价值是"配置里写错策略名必须显式报错、不能静默跳过"，与具体名字无关）
+    _write(cfg_path, [{"code": "300308", "strategy_id": "no_such_strategy", "enabled": True}])
     with pytest.raises(RuntimeError) as exc:
         L._resolve_combos()
-    assert "尚未支持" in str(exc.value) and "sentiment_t" in str(exc.value)
+    assert "尚未支持" in str(exc.value) and "no_such_strategy" in str(exc.value)
 
 
 def test_all_disabled_raises(cfg_path: Path) -> None:

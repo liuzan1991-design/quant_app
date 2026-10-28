@@ -33,7 +33,10 @@
 --------------
 1. **时间窗**：仅在本地 04:35–10:30 生效（盘前到收盘缓冲结束），窗口外一律不动
 2. **进程存在性**：若仍有 python 进程持有 live_run.py，判定为"卡死"而非"死亡"
-   —— 此时 schtasks /Run 会因 IgnoreNew 静默失效，故**只告警、不动作**
+   —— 此时直接 `schtasks /Run` 会因 IgnoreNew 静默失效，故 **2026-10-28 起改为「先 `taskkill` 再 /Run」**（H62）：
+   当日实证进程在 04:35 后**零日志悬挂**、心跳停在 04:35，靠"进程恰好死了"才被 ALERT-DEAD 救到；
+   若它挂着不死，就会重演 10-27 白等 6 小时。**只对"当日从未成功"的悬挂下手**，
+   已有成功记录的悬挂仍只告警（防在收盘流程中强杀）。
 3. **正常收盘识别**：若今日水位已达 14:59，说明已正常收盘，**不重启**
 
 用法
@@ -286,6 +289,53 @@ def _maybe_restart_zombie(hb: dict, succ_age: float | None, suffix: str = "") ->
     return True
 
 
+def _maybe_restart_hang(hb: dict, succ_age: float | None, procs: list,
+                        suffix: str = "", dry: bool = False) -> bool:
+    """H62：心跳静默但**进程还活着**（悬挂）⇒ taskkill + 重启。
+
+    当日实证（2026-10-28）：04:35:19 之后进程**零日志**悬挂，心跳停在 04:35；
+    05:00 因"进程恰好死了"被 ALERT-DEAD 拉起 —— 换句话说，**这一天是靠运气救回来的**。
+    若它挂着不死，就是 10-27 那种"白等 6 小时"（当时 HANG 分支只告警）。
+
+    保守边界：**只对"当日从未成功"的悬挂下手**。已有成功记录的悬挂可能是收盘流程未走完，
+    强杀会留下半截状态（摘要/水位写一半），故维持"只告警、需人工"。
+    """
+    if not procs:
+        log(f"[判定] HANG 重启不触发：无 live_run 进程（走死亡分支）{suffix}")
+        return False
+    if succ_age is not None:
+        log(f"[ALERT-HANG] 进程 {[p[0] for p in procs]} 存活但心跳静默，"
+            f"且当日已有成功记录（last_success={hb.get('last_success_at')}）"
+            f"⇒ 不自动重启，需人工判断{suffix}")
+        return False
+    if dry:
+        log(f"[判定] HANG 重启被 dry-run 抑制（进程 {[p[0] for p in procs]} 悬挂）{suffix}")
+        return False
+
+    day = str(hb.get("date") or f"{datetime.now():%Y-%m-%d}")
+    used = _restart_budget(day)
+    if used >= ZOMBIE_MAX_RESTARTS:
+        log(f"[ALERT-HANG] 悬挂重启：今日受控重启已用 {used}/{ZOMBIE_MAX_RESTARTS}，"
+            f"不再重启{suffix}")
+        return False
+
+    log(f"[ALERT-HANG] 进程 {[p[0] for p in procs]} 存活但当日 0 成功 ⇒ "
+        f"执行受控重启（今日第 {used + 1}/{ZOMBIE_MAX_RESTARTS} 次）{suffix}")
+    _bump_restart_budget(day, "心跳静默但进程存活且当日 0 成功")
+
+    if not _kill_live_run(procs):
+        log("[ERROR] 部分进程未能终止 ⇒ 放弃本次重启（双实例会互相覆盖同一 CSV）")
+        return False
+    _sleep(3)
+    left = _live_run_processes()
+    if left:
+        log(f"[ERROR] 仍残留进程 {[p[0] for p in left]} ⇒ 放弃重启（双实例风险）")
+        return False
+
+    _restart("悬挂：心跳静默但进程存活且当日 0 成功")
+    return True
+
+
 def main() -> int:
     dry = "--dry-run" in sys.argv
     force = "--ignore-window" in sys.argv   # 测试用：跳过时间窗限制
@@ -340,10 +390,10 @@ def main() -> int:
         f"{[p[0] for p in procs] if procs else ''}{suffix}")
 
     if procs:
-        # 进程还在但心跳停刷 → 卡死。schtasks /Run 会被 IgnoreNew 忽略，故只告警。
+        # 进程还在但心跳停刷 → 卡死。H62：不再只告警 —— 当日 0 成功的悬挂会 taskkill 后重启。
         log(f"[ALERT-HANG] 心跳静默 {age:.0f}s 但仍有 live_run 进程存活 "
-            f"{[p[0] for p in procs]} → 疑为卡死，**不自动重启**（IgnoreNew 会使其失效）。"
-            f"需人工处置{suffix}")
+            f"{[p[0] for p in procs]} → 疑为卡死{suffix}")
+        _maybe_restart_hang(hb, succ_age, procs, suffix, dry=dry)
         return 0
 
     if _today_watermark_reached_close():

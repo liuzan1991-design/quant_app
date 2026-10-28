@@ -75,6 +75,11 @@ class LiveConfig:
     # H72：live 采集主源。ad = 星耀（默认历史口径）/ qmt = 迅投本地客户端。
     # QMT 失败会自动回退 AD；AD 的"单点会话"约束（H34/H37/H44）在 QMT 上不存在。
     kline_source: str = "qmt"
+    # H73：**跨策略**单标总持仓上限（占总资金比例）。
+    # None ⇒ 不启用（历史行为：每个「标的×策略」各有一份 initial_cash，
+    # 四策略跑同一只票相当于 4 倍资金 —— 纸面能跑，实盘同一账户会叠加，接实盘前必须开）。
+    # 启用后：同一标的在**所有策略合计**的持仓市值不得超过 cross_symbol_cap × initial_cash。
+    cross_symbol_cap: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +91,7 @@ class LiveConfig:
             "risk": dict(self.risk),
             "paper_start_date": self.paper_start_date,
             "kline_source": self.kline_source,
+            "cross_symbol_cap": self.cross_symbol_cap,
         }
 
 
@@ -110,6 +116,19 @@ def validate(cfg: LiveConfig) -> list[str]:
 
     if str(cfg.kline_source).strip().lower() not in ("ad", "qmt", "stockdb"):
         errs.append(f"kline_source 只能是 ad / qmt / stockdb，当前 {cfg.kline_source!r}")
+
+    # H73：跨策略上限。None = 关闭；开了必须在 (0, 1] 且 initial_cash 必须显式给出
+    # （没有资金基准就没法算"占比"，静默按默认 100 万算等于埋雷）。
+    if cfg.cross_symbol_cap is not None:
+        try:
+            cap = float(cfg.cross_symbol_cap)
+        except (TypeError, ValueError):
+            errs.append(f"cross_symbol_cap 必须是数字，当前 {cfg.cross_symbol_cap!r}")
+        else:
+            if not (0 < cap <= 1):
+                errs.append(f"cross_symbol_cap 必须在 (0, 1] 内，当前 {cap}")
+        if cfg.initial_cash is None:
+            errs.append("启用 cross_symbol_cap 必须同时给出 initial_cash（否则占比无从计算）")
 
     # 纸面起点：格式必须是 YYYY-MM-DD，且不能在未来（未来日没有可回放的行情）
     if cfg.paper_start_date:
@@ -176,7 +195,9 @@ def from_dict(d: dict) -> LiveConfig:
                       risk=dict(d.get("risk") or {}),
                       paper_start_date=(str(d["paper_start_date"]).strip()
                                         if d.get("paper_start_date") else None),
-                      kline_source=str(d.get("kline_source") or "qmt").strip().lower())
+                      kline_source=str(d.get("kline_source") or "qmt").strip().lower(),
+                      cross_symbol_cap=(float(d["cross_symbol_cap"])
+                                        if d.get("cross_symbol_cap") is not None else None))
 
 
 def load(path: Path | None = None) -> LiveConfig | None:

@@ -85,9 +85,11 @@ def test_live_path_feeds_limit_up(monkeypatch):
     captured = {}
 
     class _FakeReplay:
-        def __init__(self, broker, store=None):
+        # H73：签名必须与真的 OfflineReplayEngine 对齐（含 gate），否则替身失真
+        def __init__(self, broker, store=None, gate=None):
             self.broker = broker
             self.signal_log = []
+            self.gate = gate
 
         def run(self, df, symbol, handler, autosave_every=0):
             captured["df"] = df.copy()
@@ -114,9 +116,11 @@ def test_live_path_survives_limit_failure(monkeypatch):
     captured = {}
 
     class _FakeReplay:
-        def __init__(self, broker, store=None):
+        # H73：签名必须与真的 OfflineReplayEngine 对齐（含 gate），否则替身失真
+        def __init__(self, broker, store=None, gate=None):
             self.broker = broker
             self.signal_log = []
+            self.gate = gate
 
         def run(self, df, symbol, handler, autosave_every=0):
             captured["n"] = len(df)

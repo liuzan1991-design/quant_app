@@ -46,11 +46,22 @@ class SignalOrderAdapter:
 class OfflineReplayEngine:
     """按历史时间顺序逐根推送 K 线，使用 bar 时间作为逻辑时钟。"""
 
-    def __init__(self, broker: PaperBroker, store: Optional[PaperStateStore] = None):
+    def __init__(self, broker: PaperBroker, store: Optional[PaperStateStore] = None,
+                 gate: Optional[Callable[[StrategySignal, float, int], bool]] = None):
+        """`gate`（H73）：买入前的最后一道闸。签名 `(signal, price, own_shares) -> bool`。
+
+        `None` ⇒ 不拦截（历史行为）。返回 False ⇒ 该信号记为 REJECTED，不下单、不撮合。
+        """
         self.broker = broker
         self.store = store
+        self.gate = gate
         self.processed_bars = 0
         self.signal_log = []
+
+    def _own_shares(self, symbol: str) -> int:
+        """本账户当前持有的该标的股数（闸门判"还能买多少"要用）。"""
+        pos = self.broker.account.positions.get(symbol)
+        return int(getattr(pos, "quantity", 0) or 0) if pos is not None else 0
 
     @staticmethod
     def normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
@@ -98,6 +109,21 @@ class OfflineReplayEngine:
                 # 同bar卖出后立即再买入时，快速回测的 SimAccount 已同步回收现金；
                 # PaperBroker 市价单在当前实现中会立即成交，这里显式用同一快照撮合，
                 # 保证策略计算下一笔买入数量前账户现金已经更新。
+                # H73：跨策略闸门（gate=None ⇒ 不拦截）。只拦买入，卖出永远放行。
+                if (signal.side == OrderSide.BUY and self.gate is not None
+                        and not self.gate(signal, execution_reference, self._own_shares(symbol))):
+                    self.signal_log.append({
+                        "signal_time": signal.signal_time,
+                        "strategy_id": signal.strategy_id,
+                        "symbol": signal.symbol,
+                        "side": signal.side.value,
+                        "quantity": signal.quantity,
+                        "reason": f"{signal.reason}|跨策略单标上限拒绝",
+                        "client_order_id": "",
+                        "order_status": OrderStatus.REJECTED.value,
+                        "filled_quantity": 0,
+                    })
+                    continue
                 request = SignalOrderAdapter.to_order(signal)
                 order = self.broker.submit_order(request, snapshot, ts)
                 if order.status in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED}:

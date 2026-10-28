@@ -35,6 +35,7 @@ from core.paper_broker import PaperBroker, PaperBrokerConfig  # noqa: E402
 from core.paper_replay import OfflineReplayEngine, StrategySignal  # noqa: E402
 from core.data_quality import day_bar_stats  # noqa: E402  （H35 缺口标记）
 from core import live_config  # noqa: E402  （H57 配置驱动）
+from core import cross_risk  # noqa: E402  （H73 跨策略闸门）
 from core.position_cap import evaluate as cap_evaluate, grade as cap_grade, CAP_KIND  # noqa: E402  （H46-③）
 from core.alerts import clear_alert, raise_alert  # noqa: E402  （H46-③ 送达）
 from core.paper_store import PaperStateStore  # noqa: E402
@@ -507,7 +508,8 @@ def _with_price_limits(full_df: pd.DataFrame, new_df: pd.DataFrame,
     return out.merge(limits, on="time", how="left")
 
 
-def _process_new_bars(obs: Observer, df: pd.DataFrame) -> dict:
+def _process_new_bars(obs: Observer, df: pd.DataFrame,
+                      ledger: "cross_risk.CrossSymbolLedger | None" = None) -> dict:
     if df.empty:
         return {"new_bars": 0}
     # 只处理未处理过的 bar。H47：按「当日最高时刻」判定 —— 与全量集合语义等价，
@@ -527,7 +529,7 @@ def _process_new_bars(obs: Observer, df: pd.DataFrame) -> dict:
     # H61：补涨跌停列（前收取自全量 df）→ `paper_replay` 会自动读进 MarketSnapshot，
     # 从而让 `risk_manager.py` 的「涨停禁买」真正生效（此前 live 恒 None = 死保护）。
     new_df = _with_price_limits(df, new_df, obs.symbol)
-    replay = OfflineReplayEngine(obs.broker, store=obs.store)
+    replay = OfflineReplayEngine(obs.broker, store=obs.store, gate=_gate_for(obs, ledger))
     replay.run(new_df, obs.symbol, obs.engine.on_bar, autosave_every=0)
     obs.broker = replay.broker
     for _, row in new_df.iterrows():
@@ -544,17 +546,72 @@ def _process_new_bars(obs: Observer, df: pd.DataFrame) -> dict:
     return {"new_bars": len(new_df), "signals": len(replay.signal_log)}
 
 
+def _obs_key(obs: Observer) -> str:
+    return f"{obs.code}×{obs.strategy_id}"
+
+
+def _gate_for(obs: Observer, ledger: "cross_risk.CrossSymbolLedger | None"):
+    """H73：把「跨策略台账」包装成回放引擎要的 `gate(signal, price, own_shares) -> bool`。
+
+    ledger 为 None（未配置 cross_symbol_cap）⇒ 返回 None ⇒ 回放不装闸，行为不变。
+    """
+    if ledger is None:
+        return None
+    key = _obs_key(obs)
+
+    def _gate(signal, price, own_shares) -> bool:
+        ok = ledger.check(signal.symbol, int(signal.quantity), float(price), key,
+                          own_shares, strategy_id=obs.strategy_id,
+                          at=str(getattr(signal, "signal_time", "")))
+        if not ok:
+            _LOGGER.warning("[H73] %s 买入 %s 股被跨策略闸门拒绝（合计超单标上限）",
+                            key, signal.quantity)
+        return ok
+
+    return _gate
+
+
+def _build_cross_ledger(observers: List[Observer]):
+    """H73：按 `live_config.cross_symbol_cap` 建跨策略台账；未配置 ⇒ None。"""
+    cfg = None
+    for obs in observers:
+        if getattr(obs, "cfg", None) is not None:
+            cfg = obs.cfg
+            break
+    cap = float(getattr(cfg, "cross_symbol_cap", None) or 0) if cfg is not None else 0
+    if not cap:
+        return None
+    base = float(getattr(cfg, "initial_cash", None) or 0)
+    if base <= 0:
+        return None
+    ledger = cross_risk.CrossSymbolLedger(cap, base)
+    for obs in observers:
+        pos = obs.broker.account.positions.get(obs.symbol) if obs.broker is not None else None
+        ledger.update(_obs_key(obs), obs.symbol,
+                      int(getattr(pos, "quantity", 0) or 0) if pos is not None else 0)
+    return ledger
+
+
 def _run_once(observers: List[Observer], out) -> Dict[str, dict]:
     summary = {}
+    # H73：整轮开始前给所有观察者建一次台账（未配置 ⇒ None ⇒ 不装闸）
+    ledger = _build_cross_ledger(observers)
     for obs in observers:
         df = _load_live(obs.code)
-        result = _process_new_bars(obs, df)
+        result = _process_new_bars(obs, df, ledger=ledger)
+        if ledger is not None and obs.broker is not None:
+            pos = obs.broker.account.positions.get(obs.symbol)
+            ledger.update(_obs_key(obs), obs.symbol,
+                          int(getattr(pos, "quantity", 0) or 0) if pos is not None else 0)
         summary[f"{obs.code}×{obs.strategy_id}"] = {
             "新bar": result.get("new_bars", 0),
             "累计订单": len(obs.broker.orders),
             "累计成交": len(obs.broker.fills),
             "账户权益": round(obs.broker.account.equity(), 2),
         }
+    if ledger is not None and ledger.rejects:
+        summary["跨策略闸门拒绝"] = {"笔数": len(ledger.rejects),
+                                "明细": ledger.rejects[:10]}
     return summary
 
 

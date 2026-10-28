@@ -18,7 +18,7 @@ from core.paper_models import (
 
 @dataclass(frozen=True)
 class RiskConfig:
-    max_symbol_position_pct: float = 0.15
+    max_symbol_position_pct: float = 0.20
     max_account_position_pct: float = 0.70
     max_daily_loss_pct: float = 0.01
     max_symbol_cumulative_loss_pct: float = 0.05

@@ -135,14 +135,15 @@ def test_live_path_survives_limit_failure(monkeypatch):
 
 
 # ---------------------------------------------------------------- 6. B 项集中度
-def test_symbol_position_cap_is_15pct():
-    assert live_match_loop._risk().config.max_symbol_position_pct == pytest.approx(0.15)
-    assert position_cap.DEFAULT_CAP == pytest.approx(0.15)
+def test_symbol_position_cap_is_20pct():
+    # 2026-10-28 D2：15% → 20%
+    assert live_match_loop._risk().config.max_symbol_position_pct == pytest.approx(0.20)
+    assert position_cap.DEFAULT_CAP == pytest.approx(0.20)
 
 
 def test_position_cap_monitor_uses_risk_config():
     """监控上限必须与风控同源，不能各写一个常量。"""
     snap = position_cap.evaluate(150_000, 1_000_000, shares=1000, cash=0,
                                  cap=live_match_loop._risk().config.max_symbol_position_pct)
-    assert snap["cap"] == pytest.approx(0.15)
+    assert snap["cap"] == pytest.approx(0.20)
     assert snap["exceeded"] is False

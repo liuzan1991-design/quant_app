@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """H46-③：底仓集中度监控（只监控与告警，**不改交易行为**）。
 
-阈值口径：与 `RiskConfig.max_symbol_position_pct = 0.15` 同源
+阈值口径：与 `RiskConfig.max_symbol_position_pct = 0.20` 同源
 （2026-10-27 用户拍板 B：10% → 15%，本文件断言同步更新，不是放宽掩盖）。
 反例（本次讨论中出现过的两种错误口径）：
 - 12%（初版文档）⇒ 比既有上限还宽，等于放行超限；
@@ -24,7 +24,7 @@ def test_h46_cap_math_thresholds() -> None:
     assert got["ratio"] == pytest.approx(0.0627, abs=1e-4)
     assert got["exceeded"] is False
     assert got["status"] == "ok"
-    assert got["price_for_cap"] == pytest.approx(1616.84, abs=0.05), "15% 需股价 ~1617"
+    assert got["price_for_cap"] == pytest.approx(2290.52, abs=0.05), "20% 需股价 ~2291"
 
 
 def test_h46_cap_wrong_thresholds_rejected_by_numbers() -> None:
@@ -37,9 +37,9 @@ def test_h46_cap_wrong_thresholds_rejected_by_numbers() -> None:
 
 
 def test_h46_cap_exceeded_and_excess_value() -> None:
-    got = pc.evaluate(160_000, 1_000_000, shares=100, cash=840_000)
+    got = pc.evaluate(220_000, 1_000_000, shares=100, cash=780_000)
     assert got["exceeded"] is True and got["status"] == "exceeded"
-    assert got["excess_value"] == pytest.approx(10_000), "160k - 15%×1M"
+    assert got["excess_value"] == pytest.approx(20_000), "220k - 20%×1M"
 
 
 def test_h46_cap_unknown_not_treated_as_ok() -> None:
@@ -76,7 +76,7 @@ def test_h46_summary_raises_when_exceeded(tmp_path: Path, monkeypatch) -> None:
                         lambda k, m, level="alert": raised.append((k, m, level)))
     monkeypatch.setattr(live_match_loop, "clear_alert", lambda k: None)
 
-    pos = SimpleNamespace(quantity=100, market_price=1_650.0)   # 165k / 权益 1.0M ⇒ 16.5%
+    pos = SimpleNamespace(quantity=100, market_price=2_200.0)   # 220k / 权益 1.0M ⇒ 22%
     account = SimpleNamespace(equity=lambda: 1_000_000.0, cash=890_000.0,
                               positions={"300308.SZ": pos})
     obs = live_match_loop.Observer(
@@ -107,7 +107,7 @@ def test_h46_summary_records_alert_level(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(live_match_loop, "raise_alert",
                         lambda k, m, level="alert": seen.append((k, level)))
     monkeypatch.setattr(live_match_loop, "clear_alert", lambda k: None)
-    pos = SimpleNamespace(quantity=100, market_price=1_660.0)   # 166k / 1.0M ⇒ 16.6% = 超 1.6pp
+    pos = SimpleNamespace(quantity=100, market_price=2_160.0)   # 216k / 1.0M ⇒ 21.6% = 超 1.6pp
     account = SimpleNamespace(equity=lambda: 1_000_000.0, cash=889_500.0,
                               positions={"300308.SZ": pos})
     obs = live_match_loop.Observer(

@@ -70,10 +70,11 @@ def test_config_override_applied(cfg_path: Path) -> None:
 
 # ── ③ 拒绝静默跳过 ──────────────────────────────────────────────────────────
 def test_unsupported_strategy_raises(cfg_path: Path) -> None:
-    _write(cfg_path, [{"code": "300308", "strategy_id": "intraday_t", "enabled": True}])
+    # H65：intraday_t 已获支持，改用仍未放行的 sentiment_t 作为"不支持"样本
+    _write(cfg_path, [{"code": "300308", "strategy_id": "sentiment_t", "enabled": True}])
     with pytest.raises(RuntimeError) as exc:
         L._resolve_combos()
-    assert "尚未支持" in str(exc.value) and "intraday_t" in str(exc.value)
+    assert "尚未支持" in str(exc.value) and "sentiment_t" in str(exc.value)
 
 
 def test_all_disabled_raises(cfg_path: Path) -> None:
@@ -93,7 +94,8 @@ def test_base_signals_reuses_obs_params(monkeypatch) -> None:
             return SimpleNamespace(
                 trades=pd.DataFrame(columns=["time", "direction", "shares"]))
 
-    monkeypatch.setattr(L, "GridTradeStrategy", lambda: FakeStrat())
+    # H65：策略实例化改走注册表，桩也要打在注册表上（打在 L.GridTradeStrategy 上不再生效）
+    monkeypatch.setitem(L._STRATEGY_CLASSES, "grid_trade", lambda: FakeStrat())
     monkeypatch.setattr(L, "_load_live", lambda code: pd.DataFrame({
         "time": pd.to_datetime(["2026-10-23 09:31:00"]),
         "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],

@@ -29,6 +29,7 @@ from core.live_params import freeze_params, INIT_CASH  # noqa: E402
 from core.adjustment import prepare_signal_prices  # noqa: E402
 from core.grid_shared_live import GridSharedLiveEngine  # noqa: E402
 from core.ma_swing_live import MaSwingLiveEngine  # noqa: E402
+from core.intraday_t_shared_live import IntradayTSharedLiveEngine  # noqa: E402  （H65）
 from core.paper_broker import PaperBroker, PaperBrokerConfig  # noqa: E402
 from core.paper_replay import OfflineReplayEngine, StrategySignal  # noqa: E402
 from core.data_quality import day_bar_stats  # noqa: E402  （H35 缺口标记）
@@ -41,6 +42,7 @@ from core.price_limit import add_limit_columns  # noqa: E402  （H61 涨跌停�
 from core.data import stock_name  # noqa: E402  （H61 ST 判定）
 from strategies.grid_trade import GridTradeStrategy  # noqa: E402
 from strategies.ma_swing import MaSwingStrategy  # noqa: E402
+from strategies.intraday_t import IntradayTStrategy  # noqa: E402  （H65）
 
 LIVE_DIR = APP_DIR / "data" / "live"
 OUTPUT_DIR = APP_DIR / "live_outputs"
@@ -55,7 +57,10 @@ COMBOS = [
 
 # H57-S3：live 目前支持的策略（`_engine_for` 有对应分支）。
 # 配置里出现其它策略必须**明确报错**，不能静默跳过 —— 否则用户以为换上了，实际没跑。
-_SUPPORTED_LIVE_STRATEGIES = {"grid_trade", "ma_swing"}
+# H65（2026-10-28）：面板可选的 live 策略。
+# sentiment_t 暂不放行：`sentiment_t_shared_live` 会经 sentiment_data 拉**指数分钟线**，
+# 那是额外的 AD 登录，会与采集抢单点会话（H37/H44 的老雷）。要放行须先解决数据源。
+_SUPPORTED_LIVE_STRATEGIES = {"grid_trade", "ma_swing", "intraday_t"}
 
 
 def _resolve_combos(cfg=None) -> list[tuple[str, str]]:
@@ -104,13 +109,24 @@ def _record_applied_config(cfg, combos) -> None:
         _LOGGER.warning("H57: 写入 config_applied.json 失败（忽略）", exc_info=True)
 
 
+# H65：策略类注册表。**所有需要 default_params 的地方都从这里取**，
+# 否则新增策略时 else 分支会把 ma_swing 的默认参数错给别的策略。
+_STRATEGY_CLASSES = {
+    "grid_trade": GridTradeStrategy,
+    "ma_swing": MaSwingStrategy,
+    "intraday_t": IntradayTStrategy,
+}
+
+
 def _params_for(cfg, code: str, sid: str, first_price: float) -> dict:
     """默认参数 → freeze_params → 叠加配置覆盖（覆盖优先）。
 
     H64：`init_cash` / `risk_pct` 来自 live_config（无配置 ⇒ 用模块常量，行为不变）。
     """
-    base_params = (GridTradeStrategy.default_params() if sid == "grid_trade"
-                   else MaSwingStrategy.default_params())
+    cls = _STRATEGY_CLASSES.get(sid)
+    if cls is None:
+        raise RuntimeError(f"未注册的 live 策略 {sid}（见 _STRATEGY_CLASSES）")
+    base_params = cls.default_params()
     params = freeze_params(
         sid, first_price, base_params,
         init_cash=(cfg.initial_cash if cfg is not None else None),
@@ -323,6 +339,10 @@ def _engine_for(obs: Observer, df: pd.DataFrame):
     obs.params.setdefault("warmup_end", str(TRADE_START_DATE.date()))
     if obs.strategy_id == "grid_trade":
         return GridSharedLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id, df=df)
+    if obs.strategy_id == "intraday_t":
+        # H65：与 grid 同构（都吃 df 做 prepare），复权在引擎内部走 prepare_signal_prices
+        return IntradayTSharedLiveEngine(obs.symbol, obs.params,
+                                         strategy_id=obs.strategy_id, df=df)
     prepared, events, _adj = prepare_signal_prices(df, obs.code)
     return MaSwingLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id,
                              prepared_df=prepared, corporate_action_dates=events)
@@ -494,11 +514,12 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
     if obs.params:
         params = {k: v for k, v in obs.params.items() if k != "warmup_end"}
     else:
-        base_params = (GridTradeStrategy.default_params() if obs.strategy_id == "grid_trade"
-                       else MaSwingStrategy.default_params())
+        cls = _STRATEGY_CLASSES.get(obs.strategy_id)
+        if cls is None:
+            raise RuntimeError(f"未注册的 live 策略 {obs.strategy_id}")
+        base_params = cls.default_params()
         params = freeze_params(obs.strategy_id, first_price, base_params)
-    strategy = (GridTradeStrategy() if obs.strategy_id == "grid_trade"
-                else MaSwingStrategy())
+    strategy = _STRATEGY_CLASSES[obs.strategy_id]()
     result = strategy.run(df, _initial_cash(obs), params,
                           context={"code": obs.code, "warmup_end": str(TRADE_START_DATE.date())})
     trades = result.trades.copy()

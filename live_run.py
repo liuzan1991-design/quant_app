@@ -53,7 +53,22 @@ from core import data_fetch as _ad_fetch  # noqa: E402
 from core.live_exhaust import make_hook as _make_exhaust_hook  # noqa: E402
 
 # COMBOS 里同一 code 可能对应多个策略，去重保留出现顺序（日志里不再出现重复 code）。
-CODES = list(dict.fromkeys(c for c, _ in match.COMBOS))
+CODES = list(dict.fromkeys(c for c, _ in match.COMBOS))   # 兜底：无配置时的硬编码组合
+
+
+def _resolve_codes() -> list:
+    """H65：采集标的必须与 `_build_observers` 用**同一份配置**。
+
+    2026-10-28 事故：`_build_observers` 已按 live_config 跑 301717，但 `CODES` 仍是
+    硬编码的 300308 ⇒ `init_from_history` 只给 300308 建了 live 文件，301717 没有
+    ⇒ 启动直接 RuntimeError「301717 无 live 行情」。属 §6.9 第 11 形态（机制存在但
+    漏调用点）。
+    """
+    try:
+        return list(dict.fromkeys(c for c, _ in match._resolve_combos()))
+    except Exception:  # noqa: BLE001 —— 配置异常时保持旧行为，由 _build_observers 报错
+        _LOGGER.exception("[H65] 解析配置组合失败，回落 CODES")
+        return list(CODES)
 POLL_INTERVAL = 30
 # 14:59 最后一根 bar 后，连续这么多次采集都没有新 bar，才判定收盘。
 CLOSE_QUIET_ROUNDS = 6
@@ -148,11 +163,14 @@ def main() -> None:
     _ad_fetch.set_exhausted_hook(
         _make_exhaust_hook(LOG_DIR, _LOGGER, flush=_flush_logs))
 
+    # H65：采集标的与 _build_observers 必须同源（否则 301717 的 live 文件不会被初始化）
+    codes = _resolve_codes()
+
     # 启动段之前不在 try/except 里，断网/损坏曾导致静默退出、无 traceback。
     try:
         collector = MarketCollector(dry_run=False)
         # 观察期启动时，用历史 CSV 初始化 live 文件（幂等），之后采集追加不覆盖。
-        for code in CODES:
+        for code in codes:
             collector.init_from_history(code)
         observers = match._build_observers()
     except Exception:
@@ -162,7 +180,7 @@ def main() -> None:
         raise
 
     # H40：启动时刷新公司行为缓存（低频记账事件，TTL 7 天；失败降级旧缓存，仅告警不阻断当日运行）。
-    for _code in CODES:
+    for _code in codes:
         try:
             _, _fresh = _refresh_corporate_actions(_code)
             _LOGGER.info("公司行为缓存 code=%s fresh=%s", _code, _fresh)
@@ -176,13 +194,13 @@ def main() -> None:
     last_collected = {}
     last_success_at = None
 
-    _LOGGER.info("== 观察期启动 == codes=%s", CODES)
+    _LOGGER.info("== 观察期启动 == codes=%s", codes)
     match_errors = 0  # 连续撮合异常计数；超过阈值说明状态已坏，退出交计划任务重启
     while True:
         round_t0 = time.monotonic()
         # 采集当天实时数据
         try:
-            collected = collector.run_once(CODES, datetime.now().strftime("%Y-%m-%d"))
+            collected = collector.run_once(codes, datetime.now().strftime("%Y-%m-%d"))
             last_collected = dict(collected) if isinstance(collected, dict) else {}
             last_success_at = datetime.now()
             _write_heartbeat(heartbeat_path, started_at, status="running",

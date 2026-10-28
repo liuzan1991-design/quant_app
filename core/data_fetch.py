@@ -2,6 +2,7 @@
 """星耀数智（AmazingData）1 分钟数据增量拉取，写入 APP 本地数据目录。"""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -22,6 +23,7 @@ from .ad_errors import (  # noqa: F401  （部分名称在此 re-export，供 li
     AdKlineEmpty,
     AdLoginError,
     AdLoginTimeout,
+    AdLockTimeout,
     AdSdkError,
     classify,
     format_failure_line,
@@ -53,6 +55,15 @@ _SDK_SOCKET_TIMEOUT = 20
 # 因此再叠一层墙钟上限。仅 live 采集路径启用（market_collector.fetch_today），
 # 历史批量补数不启用 —— 长区间拉取本就该慢，不该被硬砍。
 LIVE_FETCH_TIMEOUT = 90
+
+# H63：会话锁等待上限。合法持有者只有登录线程，其上界 _LOGIN_TIMEOUT=45s，
+# 取 60s = 45 + 15s 余量 ⇒ 正常轮次绝不会误触发；一旦超时说明登录线程卡在原生层。
+LOCK_WAIT_TIMEOUT = 60.0
+# 锁超时后 60s 内后续调用快速失败（避免每轮都白等 60s，把 30s 节拍拖成 90s）。
+LOCK_FASTFAIL_SECONDS = 60.0
+# C 项：开盘预热窗（北京 09:30–10:10）。此窗内的 kline_empty 视为「AD 尚未发布」，
+# 不计入重建额度 —— 2026-10-28 实测 AD 当日 1m 有约 30 分钟发布延迟。
+OPEN_WARMUP_END = (10, 10)
 
 # ------------------------------------------------------------------ H34 会话治理
 # 依据（28 份 live_*.log 全量统计，09-09~10-22，不是抽样）：
@@ -120,6 +131,49 @@ def _fire_exhausted(detail: dict) -> None:
         pass
 
 
+def _in_open_warmup(now=None) -> bool:
+    """是否处于开盘预热窗（北京 09:30–10:10，C 项）。
+
+    依据（2026-10-28 实测）：09:35 独立探针登录成功但当日 1m `rows=0`，10:00 的新进程
+    立刻采到 09:30 起的全部 bar ⇒ **AD 当日分钟线有约 30 分钟发布延迟**。
+    此窗内的 `kline_empty` 属"还没发布"，不该按故障烧重建额度。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        bj = (now or datetime.now()).astimezone(ZoneInfo("Asia/Shanghai"))
+    except Exception:  # noqa: BLE001 —— 时区不可用时退回本机时间（宁可保守）
+        bj = now or datetime.now()
+    return (9, 30) <= (bj.hour, bj.minute) < OPEN_WARMUP_END
+
+
+@contextlib.contextmanager
+def _locked(where: str):
+    """有界获取会话锁（H63）：超时抛 `AdLockTimeout`，**不再无限等**。
+
+    2026-10-28 实证：04:35 起进程零日志悬挂 —— 主线程卡在等 `_AD_LOCK`，
+    `_run_with_deadline` 的 90s 硬超时只包住取数函数体、**不包等锁**，所以超时根本没生效。
+    超时后 60s 内快速失败，避免把 30s 节拍拖成 90s。
+    """
+    now = time.monotonic()
+    blocked_at = float(_SESSION.get("lock_blocked_at") or 0.0)
+    if blocked_at and now - blocked_at < LOCK_FASTFAIL_SECONDS:
+        raise AdLockTimeout(
+            f"会话锁仍被占用（{where}），本轮快速失败（距上次超时 "
+            f"{now - blocked_at:.0f}s）", stage="lock")
+    if not _AD_LOCK.acquire(timeout=LOCK_WAIT_TIMEOUT):
+        _SESSION["lock_blocked_at"] = time.monotonic()
+        raise AdLockTimeout(
+            f"会话锁被占用 >{LOCK_WAIT_TIMEOUT:.0f}s（{where}）"
+            f"⇒ 疑似登录线程卡在原生层", stage="lock")
+    try:
+        yield
+    finally:
+        try:
+            _AD_LOCK.release()
+        except RuntimeError:
+            pass
+
+
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -127,7 +181,7 @@ def _today() -> str:
 def _roll_session_day() -> None:
     """换日清零重建计数（熔断计数不跨日累计，避免第二天开盘就带闸）。"""
     today = _today()
-    with _AD_LOCK:
+    with _locked("roll_day"):
         if _SESSION["day"] != today:
             _SESSION["day"] = today
             _SESSION["rebuild_count"] = 0
@@ -155,6 +209,7 @@ def reset_session_state() -> None:
             "last_rebuild_at": 0.0, "breaker_state": "closed", "breaker_opens": 0,
             "breaker_fails": 0, "opened_at": 0.0, "half_open_inflight": False,
             "login_fail_at": 0.0, "pending_login": None,
+            "lock_blocked_at": 0.0, "had_success": False,
             "login_threads_started": 0,
         })
 
@@ -162,7 +217,7 @@ def reset_session_state() -> None:
 def session_stats() -> dict:
     """供心跳/巡检聚合的可观测字段（H46 教训：缺字段 ⇒ "进程活着"被误读成"在干活"）。"""
     try:
-        with _AD_LOCK:
+        with _locked("session_stats"):
             return {
                 "breaker_state": _SESSION["breaker_state"],
                 "breaker_opens": int(_SESSION["breaker_opens"]),
@@ -185,34 +240,54 @@ def _rebuild_session(reason: str) -> bool:
     主动登录要新起线程，多一个可能挂死的原生线程（H37 正是登录在原生层 abort）；
     复用既有路径 = 零新增风险，代价最多延后一轮（30s）。
     返回 False 表示被限流拒绝（调用方应直接抛原异常，不要硬重试）。
+
+    H63（2026-10-28）：取锁改为**有界**。原实现 `with _AD_LOCK` 无上限 ——
+    登录线程卡在原生层时，主线程永远等不到锁，连日志都不打（当天 04:35 起零日志悬挂）。
+    锁超时同样**记为一次已消耗的重建**：否则 rebuild_count 永远到不了上限，
+    H60 的 exit(70) 也就永远不会触发，日终只能靠看门狗。
+
+    C 项：开盘预热窗（北京 09:30–10:10）内、当日尚未成功过的 `kline_empty` 视为
+    "AD 还没发布"，照常清缓存但**不扣额度** —— 实测当日 1m 有约 30 分钟发布延迟。
     """
     try:
         now = time.monotonic()
         detail = None
-        with _AD_LOCK:
-            if _SESSION["day"] != _today():
-                _roll_session_day()
-            if _SESSION["rebuild_count"] >= REBUILD_DAILY_CAP:
-                _SESSION["rebuild_rejected"] += 1
-                # H60：额度触顶 ⇒ 每日只回调一次（调用方据此退出进程换新会话）
-                if _EXHAUSTED_FIRED["day"] != _today():
-                    _EXHAUSTED_FIRED["day"] = _today()
-                    detail = {
-                        "day": _SESSION["day"],
-                        "reason": reason,
-                        "rebuild_count": int(_SESSION["rebuild_count"]),
-                        "rebuild_rejected": int(_SESSION["rebuild_rejected"]),
-                        "breaker_state": _SESSION["breaker_state"],
-                        "breaker_opens": int(_SESSION["breaker_opens"]),
-                        "login_threads_started": int(_SESSION["login_threads_started"]),
-                    }
-            elif now - _SESSION["last_rebuild_at"] < REBUILD_MIN_INTERVAL:
-                _SESSION["rebuild_rejected"] += 1
-            else:
-                _AD_CACHE.clear()          # ad 引用 + calendar 缓存一起失效
-                _SESSION["last_rebuild_at"] = now
-                _SESSION["rebuild_count"] += 1
-                return True
+        try:
+            with _locked("rebuild"):
+                if _SESSION["day"] != _today():
+                    _roll_session_day()
+                free_pass = (
+                    str(reason) == "kline_empty"
+                    and not _SESSION.get("had_success")
+                    and _in_open_warmup()
+                )
+                if _SESSION["rebuild_count"] >= REBUILD_DAILY_CAP:
+                    _SESSION["rebuild_rejected"] += 1
+                    # H60：额度触顶 ⇒ 每日只回调一次（调用方据此退出进程换新会话）
+                    if _EXHAUSTED_FIRED["day"] != _today():
+                        _EXHAUSTED_FIRED["day"] = _today()
+                        detail = {
+                            "day": _SESSION["day"],
+                            "reason": reason,
+                            "rebuild_count": int(_SESSION["rebuild_count"]),
+                            "rebuild_rejected": int(_SESSION["rebuild_rejected"]),
+                            "breaker_state": _SESSION["breaker_state"],
+                            "breaker_opens": int(_SESSION["breaker_opens"]),
+                            "login_threads_started": int(_SESSION["login_threads_started"]),
+                        }
+                elif now - _SESSION["last_rebuild_at"] < REBUILD_MIN_INTERVAL:
+                    _SESSION["rebuild_rejected"] += 1
+                else:
+                    _AD_CACHE.clear()          # ad 引用 + calendar 缓存一起失效
+                    _SESSION["last_rebuild_at"] = now
+                    if not free_pass:
+                        _SESSION["rebuild_count"] += 1
+                    return True
+        except AdLockTimeout:
+            # 锁被登录线程长期占用 ⇒ 计为已消耗的重建（让 H60 的额度仍能走到上限）
+            _SESSION["rebuild_count"] += 1
+            _SESSION["rebuild_rejected"] += 1
+            return False
         if detail is not None:
             _fire_exhausted(detail)
         return False
@@ -223,7 +298,7 @@ def _rebuild_session(reason: str) -> bool:
 def _breaker_before_call() -> None:
     """熔断门：open 且未到冷却 ⇒ 快速失败（不触任何 SDK）；冷却到期 ⇒ 放一个探针。"""
     now = time.monotonic()
-    with _AD_LOCK:
+    with _locked("breaker_gate"):
         state = _SESSION["breaker_state"]
         if state == "open":
             if now - _SESSION["opened_at"] < BREAKER_COOLDOWN:
@@ -244,7 +319,7 @@ def _breaker_before_call() -> None:
 
 def _breaker_on_success() -> None:
     try:
-        with _AD_LOCK:
+        with _locked("breaker_ok"):
             _SESSION["breaker_fails"] = 0
             _SESSION["half_open_inflight"] = False
             _SESSION["breaker_state"] = "closed"
@@ -259,7 +334,7 @@ def _breaker_on_failure(exc: BaseException) -> None:
         if kind not in _BREAKER_KINDS:
             return
         now = time.monotonic()
-        with _AD_LOCK:
+        with _locked("breaker_fail"):
             if _SESSION["half_open_inflight"]:
                 _SESSION["half_open_inflight"] = False
                 _SESSION["breaker_state"] = "open"
@@ -468,7 +543,7 @@ def _get_calendar(ad):
             "星耀 get_calendar() 返回 None（SDK 未就绪或会话异常）",
             stage="calendar")
     try:
-        with _AD_LOCK:
+        with _locked("calendar_cache"):
             _AD_CACHE["calendar"] = {"day": today, "obj": calendar}
     except Exception:  # noqa: BLE001 —— 缓存写失败只是退化，不得影响本次取数
         pass
@@ -523,6 +598,7 @@ def _fetch_kline_inner(code: str, begin: str, end: str,
     for col in STD_COLS:
         if col not in df.columns:
             df[col] = 0
+    _SESSION["had_success"] = True   # C 项：当日已成功过一次
     return df[STD_COLS].copy()
 
 

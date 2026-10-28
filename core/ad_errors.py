@@ -84,6 +84,17 @@ class AdFetchTimeout(AdError, TimeoutError):
     kind = "fetch_timeout"
 
 
+class AdLockTimeout(AdError, TimeoutError):
+    """会话锁等待超时（H63）：锁被卡在原生层的登录线程长期占用。
+
+    2026-10-28 实证：04:35 起进程**零日志悬挂** —— 主线程卡在等 `_AD_LOCK`，
+    `_run_with_deadline` 的 90s 硬超时根本走不到（它只包住取数函数体，不包等锁）。
+    合法持有者只有登录线程（上界 `_LOGIN_TIMEOUT=45s`），故等待上限取 60s。
+    """
+
+    kind = "lock_timeout"
+
+
 class AdCircuitOpen(AdError):
     """熔断开闸：连续失败超阈值后快速失败，**不调用任何 SDK**。
 

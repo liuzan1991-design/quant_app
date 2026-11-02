@@ -77,6 +77,11 @@ def main():
     sids = [m for m in at.multiselect if m.label == "选择策略"]
     assert sids, "未找到策略选择"
     sids[0].set_value(["intraday_t", "grid_trade"])
+    # 验证 2×2 批量 UI 时给足底仓资金。当前样本首价 1345，100 万不足 1000 股。
+    # 资金不足本身有独立保护；本用例不能把合法的保护误判为少了一行结果。
+    cash = [n for n in at.number_input if n.label == "初始资金(元)"]
+    assert cash, "未找到初始资金输入框"
+    cash[0].set_value(2_000_000.0)
     at.run()
 
     btn = [b for b in at.button if b.label == "开始批量回测"]
@@ -97,8 +102,10 @@ def main():
 
 
 @pytest.mark.slow
-def test_batch_ui_smoke():
+def test_batch_ui_smoke(monkeypatch):
     """pytest 入口：包装原 main()（AppTest UI 冒烟，分钟级，进慢档）。"""
+    from core import data_fetch
+    monkeypatch.setattr(data_fetch, "incremental_update", _offline_incremental_update)
     main()
 
 

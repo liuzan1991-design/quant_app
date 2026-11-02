@@ -2,7 +2,7 @@
 """H9 五项 P0 安全缺口的回归测试（测试先行，只复现、不改生产行为）。
 
 对应《量化研究规范_纠偏记录.md》H9 条目。
-本文件的性质说明：
+本文件的性质说明（H77 修复后 P0-2 已转为正向验收，其余仍是缺陷复现）：
 - 这些测试**断言的是"缺陷存在"**，即断言当前（有缺陷的）行为。
 - 因此它们**不是**"修复后应保持通过"的测试，而是**缺陷看门狗**：
   一旦 P0 被修复，对应用例会**失败**——这正是期望行为，提示"H9 已修复，请更新测试语义"。
@@ -68,8 +68,8 @@ def test_p0_1_rule_itself_is_alive():
     assert "行情延迟" in order.reject_reason
 
 
-def test_p0_2_risk_and_match_disagree_on_sellable_quantity():
-    """P0-2：昨仓+今买时，风控与撮合对"可卖量"口径不一致（1000 vs 900）⇒ 合法委托被静默缩量。"""
+def test_p0_2_risk_and_match_agree_on_sellable_quantity():
+    """H77：今买不再从已排除今日买入的可卖量中重复扣除。"""
     broker = PaperBroker(1_000_000, "2026-09-18", risk_manager=_loose_risk(),
                          config=PaperBrokerConfig(slippage_bps=0, max_volume_participation=1.0))
     broker.account.positions[SYMBOL] = Position(
@@ -82,12 +82,13 @@ def test_p0_2_risk_and_match_disagree_on_sellable_quantity():
     assert (pos.quantity, pos.sellable_quantity, pos.today_bought_quantity) == (1100, 1000, 100)
 
     risk_view = pos.sellable_quantity                                   # risk_manager.py:93
-    match_view = max(0, pos.sellable_quantity - pos.today_bought_quantity)  # paper_broker.py:127
-    assert risk_view == 1000 and match_view == 900, "两处口径应不一致（缺陷本身）"
+    match_view = max(0, min(pos.sellable_quantity, pos.quantity - pos.today_bought_quantity))
+    assert risk_view == match_view == 1000
 
     sell = broker.submit_order(_req("h9-p2-sell", OrderSide.SELL, 1000), _snap(), NOW)
-    assert sell.status.value == "PARTIALLY_FILLED"
-    assert sell.filled_quantity == 900, "应卖 1000 实际只成 900（被二次扣减）"
+    assert sell.status.value == "FILLED"
+    assert sell.filled_quantity == 1000, "昨日 1000 股应全部可卖，当日新买 100 股仍保留"
+    assert (pos.quantity, pos.sellable_quantity, pos.today_bought_quantity) == (100, 0, 100)
 
 
 def test_p0_3_partial_fill_continuation_bypasses_risk_recheck():

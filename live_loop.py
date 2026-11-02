@@ -135,7 +135,8 @@ def _build_engine(combo: Combination, df: pd.DataFrame):
         return MaSwingLiveEngine(combo.symbol, combo.params, strategy_id=combo.strategy_id,
                                  prepared_df=prepared, corporate_action_dates=events)
     if combo.strategy_id == "sentiment_t":
-        return SentimentTSharedLiveEngine(combo.symbol, combo.params, strategy_id=combo.strategy_id, df=df)
+        return SentimentTSharedLiveEngine(combo.symbol, combo.params, strategy_id=combo.strategy_id,
+                                         df=df, broker_driven=True)
     raise ValueError(f"未知策略：{combo.strategy_id}")
 
 

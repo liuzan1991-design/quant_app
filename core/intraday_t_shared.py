@@ -27,8 +27,11 @@ class IntradayTSharedState:
     prev_day_amplitude: float = 3.0
     current_day: Optional[date] = None
 
-    def roll_day(self, base_ready: bool) -> None:
+    def roll_day(self, base_ready: bool, preserve_t_cost: bool = False) -> None:
+        t_cost = (self.t_buy_queue, self.t_avg_cost, self.t_total_shares)
         self.__dict__.update(IntradayTSharedState(base_ready=base_ready).__dict__)
+        if preserve_t_cost:
+            self.t_buy_queue, self.t_avg_cost, self.t_total_shares = t_cost
         self.current_day = None
 
     # H68（2026-10-28）：补序列化。缺这两个方法时，live 侧 `save_engine_state` 每次
@@ -184,9 +187,8 @@ class IntradayTSharedEngine:
                 should_sell, score, details = self._evaluate_sell(indicator, ts)
                 if should_sell:
                     sellable = max(0, position - base_position)
-                    # 快速路径存在底仓兜底卖出：即使T仓不足，只要可卖持仓满足
-                    # max(0, total - base/2) 仍可卖出，不能提前跳过。
-                    if sellable <= 0:
+                    # 仅保留旧离线基准的底仓兜底；生产 BrokerTAccount 明确禁止。
+                    if sellable <= 0 and not getattr(account, "protect_base_position", False):
                         sellable = min(max(0, account.total - int(base_position / 2)), 2000)
                     if sellable > 0:
                         sell_shares = min(sellable, fixed_shares)

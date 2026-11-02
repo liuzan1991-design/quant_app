@@ -88,7 +88,8 @@ def main():
     assert rep_btn, "未找到导出按钮"
     rep_btn[0].click()
     at.run()
-    reports = sorted((APP_DIR / "reports").glob("*.html"))
+    from core import report
+    reports = sorted(report.REPORTS_DIR.glob("*.html"))
     print("报告文件:", [p.name for p in reports])
     assert reports and reports[-1].stat().st_size > 10000
     print("P1 报告导出测试通过")
@@ -126,39 +127,40 @@ def main():
     # 背景：app.py:196 原写 isinstance(d_range, list)，而 st.date_input 返回的是
     # **tuple** ⇒ 两个三元分支恒走 else ⇒ start/end 永远是默认"近一年"，
     # 用户在界面上改区间**完全无效**（H20，生产功能缺陷）。
-    # 断言锚"本次动作的后果"：记录 app.py 实际传给 load_data 的 (start, end)，
-    # 确认等于界面设定值（而不是看默认值是否合理）。
+    # 断言锚真正用于回测的数据与权益曲线，缓存不应影响验收。
     import core.data as core_data
+    import pandas as pd
     from datetime import date as _date
     _set_start, _set_end = _date(2024, 1, 1), _date(2024, 6, 30)
-    _real_load, _seen = core_data.load_data, []
+    ranges = [d for d in at.date_input if d.label == "回测区间"]
+    assert len(ranges) == 1, "必须唯一定位侧栏「回测区间」，不能误改数据看板的日期控件"
+    ranges[0].set_value((_set_start, _set_end))
+    at.run()
+    btn2 = [b for b in at.button if "开始回测" in (b.label or "")]
+    assert btn2, "未找到开始回测按钮（区间变更后）"
+    btn2[0].click()
+    at.run()
+    assert not at.exception, at.exception
 
-    def _spy_load(code, start=None, end=None):
-        _seen.append((code, start, end))
-        return _real_load(code, start, end)
-
-    core_data.load_data = _spy_load
-    try:
-        assert len(at.date_input) >= 1, "未找到「回测区间」控件"
-        at.date_input[0].set_value((_set_start, _set_end))
-        at.run()
-        assert not at.exception, at.exception
-    finally:
-        core_data.load_data = _real_load
-
-    _hits = [x for x in _seen
-             if x[1] == _set_start.isoformat() and x[2] == _set_end.isoformat()]
-    print(f"回测区间段: 设定 {_set_start}~{_set_end}，命中 {len(_hits)} 次")
-    assert _hits, (
-        f"「回测区间」控件未生效：设定 {_set_start}~{_set_end} 后，"
-        f"app.py 传给 load_data 的是 {_seen[-3:]}"
-        "—— isinstance 判断可能又被改回只判 list（H20 复发）")
+    # 检查实际数据，不用缓存内部调用次数代替行为证据。
+    actual = at.session_state["df"]
+    expected, _ = core_data.load_data(at.session_state["preset_sel"],
+                                     _set_start.isoformat(), _set_end.isoformat())
+    assert len(actual) and len(expected), "目标区间无数据，不能验收日期控件"
+    pd.testing.assert_frame_equal(actual.reset_index(drop=True), expected.reset_index(drop=True))
+    eq_time = pd.to_datetime(at.session_state["result"].equity["time"])
+    assert len(eq_time) and eq_time.min() >= pd.Timestamp(_set_start)
+    assert eq_time.max() < pd.Timestamp(_set_end) + pd.Timedelta(days=1)
+    print(f"回测区间段: 设定 {_set_start}~{_set_end}，实际 {len(actual)} 根行情与目标切片完全一致")
     print("P0 回测区间生效：通过")
 
 
 @pytest.mark.slow
-def test_app_ui():
+def test_app_ui(tmp_path, monkeypatch):
     """pytest 入口：包装原 main()（AppTest UI 冒烟，分钟级，进慢档）。"""
+    from core import param_store, report
+    monkeypatch.setattr(param_store, "SNAP_FILE", tmp_path / "param_snapshots.json")
+    monkeypatch.setattr(report, "REPORTS_DIR", tmp_path / "reports")
     main()
 
 

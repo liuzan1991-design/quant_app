@@ -141,7 +141,7 @@ class PaperBroker:
             # T+1兜底：当日买入数量不能作为可卖数量。正常情况下
             # sellable_quantity在买入时不会增加，此检查用于防御状态恢复异常。
             if position is not None:
-                sellable = max(0, sellable - position.today_bought_quantity)
+                sellable = max(0, min(sellable, position.quantity - position.today_bought_quantity))
             available = min(available, sellable)
         if available <= 0:
             return order

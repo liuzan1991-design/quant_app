@@ -4,6 +4,7 @@
 复用已通过 95% 门禁的 `IntradayTSharedEngine`，仅把大盘状态、指数涨跌、
 个股趋势模式作为逐bar上下文注入。信号生成逻辑与快速路径 `run_backtest`
 一致；情绪/趋势数据在启动前一次性预计算，回放阶段只做查找，不产生未来数据。
+生产指定 broker_driven=True，历史模拟成交不进入生产状态。
 """
 from __future__ import annotations
 
@@ -24,13 +25,14 @@ from core import sentiment_data  # noqa: E402
 from core.adjustment import prepare_signal_prices  # noqa: E402
 from core.incremental_indicators import IncrementalIndicatorCache  # noqa: E402
 from core.intraday_t_shared import IntradayTSharedEngine  # noqa: E402
+from core.intraday_t_broker import BrokerDrivenTMixin  # noqa: E402
 from core.paper_models import OrderSide  # noqa: E402
 from core.paper_replay import StrategySignal  # noqa: E402
 
 
-class SentimentTSharedLiveEngine:
+class SentimentTSharedLiveEngine(BrokerDrivenTMixin):
     def __init__(self, symbol: str, params: Dict, df: Optional[pd.DataFrame] = None,
-                 strategy_id: str = "sentiment_t"):
+                 strategy_id: str = "sentiment_t", *, broker_driven: bool = False):
         self.symbol = symbol
         self.strategy_id = strategy_id
         self.params = dict(params)
@@ -43,7 +45,8 @@ class SentimentTSharedLiveEngine:
         self.params.setdefault("cooldown_buy_base", {"low": 3, "normal": 5, "high": 7})
         self.params.setdefault("buy_back_gap_pct", 0.005)
         self.engine = IntradayTSharedEngine(self.params)
-        self.account = bg.SimAccount(1_000_000.0, self.params)
+        self.broker_driven = broker_driven
+        self.account = None if broker_driven else bg.SimAccount(1_000_000.0, self.params)
         self._status_map: Dict[pd.Timestamp, str] = {}
         self._chg_map: Dict[pd.Timestamp, float] = {}
         self._mode_map: Dict[object, str] = {}
@@ -136,8 +139,11 @@ class SentimentTSharedLiveEngine:
             self._vwap[ts] = day_amount / day_volume if day_volume else 0.0
         # 状态推进：先建独立缓存回放完整历史，推进引擎与账户状态；
         # 再单独给实时指标缓存 warmup 最后一天，避免两者互相污染。
-        replay_cache = IncrementalIndicatorCache(self.params)
-        self.engine.replay_warmup(prepared, self.account, replay_cache)
+        if self.broker_driven:
+            self._inc.warmup(prepared)
+        else:
+            replay_cache = IncrementalIndicatorCache(self.params)
+            self.engine.replay_warmup(prepared, self.account, replay_cache)
         self._prepared = True
 
     def on_bar(self, bar: pd.Series, _broker) -> Iterable[StrategySignal]:
@@ -162,7 +168,8 @@ class SentimentTSharedLiveEngine:
                 float(bar.get("amount", 0) or 0),
                 float(bar.get("volume", 0) or 0),
             )
-        trade = self.engine.on_bar(bar, self.account, indicator, vwap)
+        trade = (self._broker_trade(bar, _broker, indicator, vwap) if self.broker_driven
+                 else self.engine.on_bar(bar, self.account, indicator, vwap))
         if not trade:
             return ()
         side = OrderSide.BUY if trade["direction"] == "BUY" else OrderSide.SELL

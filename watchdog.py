@@ -134,13 +134,29 @@ def _live_run_processes() -> list:
 
 
 def _today_watermark_reached_close() -> bool:
-    """今日水位是否已到收盘最后一根 bar（用来识别正常收盘）。"""
+    """配置中全部启用组合的今日水位均收盘，才视为正常结束。"""
     try:
-        wm = LIVE_DIR / "300308.SZ" / "grid_trade" / "watermark.json"
-        if not wm.exists():
+        from core import live_config
+        cfg = live_config.load()
+        combos = live_config.to_combos(cfg) if cfg is not None else [("300308", "grid_trade")]
+        if not combos:
             return False
-        text = wm.read_text(encoding="utf-8", errors="replace")
-        return f"{datetime.now():%Y-%m-%d}T{MARKET_CLOSE_HHMM}" in text
+        day = datetime.now().date().isoformat()
+        for code, sid in combos:
+            # 与 live_match_loop._code_symbol 保持相同落盘契约。
+            exchange = "SH" if code.startswith("68") else "SZ"
+            wm = LIVE_DIR / f"{code}.{exchange}" / sid / "watermark.json"
+            if not wm.exists():
+                return False
+            data = json.loads(wm.read_text(encoding="utf-8"))
+            upto = data.get("processed_upto_by_day", {}).get(day)
+            if upto is None:
+                # 兼容 H47 之前的水位格式，但必须精确匹配今日时间。
+                times = [t for t in data.get("processed_times", []) if t.startswith(day + "T")]
+                upto = max(times, default="")
+            if not (day + "T" + MARKET_CLOSE_HHMM <= upto < day + "T24:00"):
+                return False
+        return True
     except Exception as e:
         log(f"[WARN] 水位读取失败: {e!r}")
         return False
@@ -375,6 +391,9 @@ def main() -> int:
 
     # ---- 判据：用 updated_at（循环存活）----
     if age is not None and age <= STALE_SECONDS:
+        if _today_watermark_reached_close():
+            log(f"[OK] 全部启用组合今日水位已收盘，不报采集陈旧{suffix}")
+            return 0
         # 循环还活着。但"活着"≠"在采数"—— H36 的盲区正藏在这一句之后：
         # 采集停摆时 updated_at 照刷、age 恒小，旧版会直接判健康退出。
         _report_success_staleness(hb, succ_age, suffix)

@@ -40,6 +40,7 @@ class SignalOrderAdapter:
             order_type=OrderType.LIMIT if signal.limit_price is not None else OrderType.MARKET,
             limit_price=signal.limit_price,
             strategy_id=signal.strategy_id,
+            reason=signal.reason,
         )
 
 
@@ -97,7 +98,8 @@ class OfflineReplayEngine:
             )
             self.broker.mark_to_market(snapshot)
             if day != current_day:
-                self.broker.start_new_trading_day(day)
+                if self.broker.account.trading_day != day:
+                    self.broker.start_new_trading_day(day)
                 current_day = day
             for order_id, order in list(self.broker.orders.items()):
                 if order.request.symbol == symbol and order.remaining_quantity > 0:
@@ -126,8 +128,7 @@ class OfflineReplayEngine:
                     continue
                 request = SignalOrderAdapter.to_order(signal)
                 order = self.broker.submit_order(request, snapshot, ts)
-                if order.status in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED}:
-                    self.broker.match_order(request.client_order_id, snapshot, ts)
+                # submit_order 已撮合一次；再次撮合会重复使用同一 bar 的成交量额度。
                 lifecycle_sync = getattr(signal_handler, "__self__", None)
                 sync_method = getattr(lifecycle_sync, "_sync_lifecycle_from_fills", None)
                 if callable(sync_method):

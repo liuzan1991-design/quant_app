@@ -46,6 +46,7 @@ class OrderRequest:
     order_type: OrderType = OrderType.MARKET
     limit_price: Optional[float] = None
     strategy_id: str = ""
+    reason: str = ""
 
 
 @dataclass

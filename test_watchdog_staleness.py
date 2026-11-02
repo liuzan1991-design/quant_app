@@ -25,6 +25,7 @@ import watchdog
 def sandbox(tmp_path, monkeypatch):
     hb_path = tmp_path / "heartbeat.json"
     log_path = tmp_path / "logs" / "watchdog.log"
+    monkeypatch.setattr(watchdog, "LIVE_DIR", tmp_path)
     monkeypatch.setattr(watchdog, "HEARTBEAT", hb_path)
     monkeypatch.setattr(watchdog, "WATCHDOG_LOG", log_path)
     monkeypatch.setattr(sys, "argv", ["watchdog.py", "--ignore-window"])

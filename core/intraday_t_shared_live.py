@@ -4,7 +4,8 @@
 复用 `IntradayTSharedEngine` 的信号与状态逻辑，把每根 bar 上的交易意图
 转成 `StrategySignal`，供 `OfflineReplayEngine` 交给 `PaperBroker` 撮合。
 信号生成与 `test_intraday_t_shared_consistency.py` 保持同一口径：
-策略状态用 `bg.SimAccount` 驱动，PaperBroker 只负责订单撮合与审计。
+旧离线基准默认用 `bg.SimAccount`；生产必须指定 broker_driven=True，
+只预热指标，持仓、成本与成交计数均由 PaperBroker 的实际成交驱动。
 """
 from __future__ import annotations
 
@@ -25,19 +26,22 @@ import backtest_generic as bg
 from core.adjustment import prepare_signal_prices
 from core.incremental_indicators import IncrementalIndicatorCache
 from core.intraday_t_shared import IntradayTSharedEngine
+from core.intraday_t_broker import BrokerDrivenTMixin
 from core.paper_models import OrderSide
 from core.paper_replay import StrategySignal
 
 
-class IntradayTSharedLiveEngine:
+class IntradayTSharedLiveEngine(BrokerDrivenTMixin):
     def __init__(self, symbol: str, params: Dict,
                  strategy_id: str = "intraday_t",
-                 df: Optional[pd.DataFrame] = None):
+                 df: Optional[pd.DataFrame] = None, *, broker_driven: bool = False):
         self.symbol = symbol
         self.strategy_id = strategy_id
         self.params = dict(params)
         self.engine = IntradayTSharedEngine(self.params)
-        self.account = bg.SimAccount(1_000_000.0, self.params)
+        # False 只用于旧离线基准；生产构造器必须显式使用 True。
+        self.broker_driven = broker_driven
+        self.account = None if broker_driven else bg.SimAccount(1_000_000.0, self.params)
         self.window = int(self.params.get("min_bars", 10)) + 20
         self._bar_index: Dict[pd.Timestamp, int] = {}
         self._vwap: Dict[pd.Timestamp, float] = {}
@@ -88,8 +92,12 @@ class IntradayTSharedLiveEngine:
             }
         # 状态推进：先建独立缓存回放完整历史，推进引擎与账户状态；
         # 再单独给实时指标缓存 warmup 最后一天，避免两者互相污染。
-        replay_cache = IncrementalIndicatorCache(self.params)
-        self.engine.replay_warmup(prepared, self.account, replay_cache)
+        if self.broker_driven:
+            # 预热只喂指标，不用历史模拟成交污染生产持仓/状态。
+            self._inc.warmup(prepared)
+        else:
+            replay_cache = IncrementalIndicatorCache(self.params)
+            self.engine.replay_warmup(prepared, self.account, replay_cache)
         self._prepared = True
 
     def on_bar(self, bar: pd.Series, _broker) -> Iterable[StrategySignal]:
@@ -109,7 +117,8 @@ class IntradayTSharedLiveEngine:
                 float(bar.get("amount", 0) or 0),
                 float(bar.get("volume", 0) or 0),
             )
-        trade = self.engine.on_bar(bar, self.account, indicator, vwap)
+        trade = (self._broker_trade(bar, _broker, indicator, vwap) if self.broker_driven
+                 else self.engine.on_bar(bar, self.account, indicator, vwap))
         if not trade:
             return ()
         side = OrderSide.BUY if trade["direction"] == "BUY" else OrderSide.SELL

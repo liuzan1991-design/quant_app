@@ -109,6 +109,7 @@ class PaperStateStore:
                 order_type=OrderType(request_data["order_type"]),
                 limit_price=request_data.get("limit_price"),
                 strategy_id=request_data.get("strategy_id", ""),
+                reason=request_data.get("reason", ""),
             )
             order = Order(
                 request=request,

@@ -327,31 +327,33 @@ class Observer:
             self.signals = loaded
 
     def backfill_signals_from_fills(self) -> int:
-        """从 broker.fills 重建完整信号日志，落盘 signals.jsonl，返回回填条数。
-
-        目的：signals.jsonl 可能在首次建底仓时未落盘而丢失；fills 是持久化真相源，
-        用它回填可保证信号日志与账户成交一致，信号对比不再缺块。
-        """
+        """只追加缺失订单的恢复记录，绝不覆盖原始信号或拿成交时间冒充信号时间。"""
         if self.signal_path is None or self.broker is None:
             return 0
+        self.load_signals()
+        present = {s.get("client_order_id") for s in self.signals if s.get("client_order_id")}
         rows = []
-        for f in self.broker.fills:
+        for order_id, order in self.broker.orders.items():
+            if order_id in present:
+                continue
+            request = order.request
             rows.append({
-                "signal_time": f.filled_at.isoformat(),
-                "strategy_id": self.strategy_id,
-                "symbol": f.symbol,
-                "side": f.side.value if hasattr(f.side, "value") else str(f.side),
-                "quantity": int(f.quantity),
-                "reason": "(由fills回填)",
-                "client_order_id": f.client_order_id,
-                "order_status": "FILLED",
-                "filled_quantity": int(f.quantity),
+                "signal_time": request.created_at.isoformat(),
+                "strategy_id": request.strategy_id or self.strategy_id,
+                "symbol": request.symbol,
+                "side": request.side.value,
+                "quantity": int(request.quantity),
+                "reason": request.reason or "(由订单恢复，原始信号缺失)",
+                "client_order_id": order_id,
+                "order_status": order.status.value,
+                "filled_quantity": int(order.filled_quantity),
+                "record_source": "order_recovery",
             })
         if rows:
-            with self.signal_path.open("w", encoding="utf-8") as fh:
+            with self.signal_path.open("a", encoding="utf-8") as fh:
                 for item in rows:
                     fh.write(json.dumps(item, ensure_ascii=False) + "\n")
-            self.signals = rows
+            self.signals.extend(rows)
         return len(rows)
 
     def save_watermark(self) -> None:
@@ -377,12 +379,12 @@ def _engine_for(obs: Observer, df: pd.DataFrame):
     if obs.strategy_id == "intraday_t":
         # H65：与 grid 同构（都吃 df 做 prepare），复权在引擎内部走 prepare_signal_prices
         return IntradayTSharedLiveEngine(obs.symbol, obs.params,
-                                         strategy_id=obs.strategy_id, df=df)
+                                         strategy_id=obs.strategy_id, df=df, broker_driven=True)
     if obs.strategy_id == "sentiment_t":
         # H71：签名是 (symbol, params, df, strategy_id) —— 位置顺序与 intraday_t 不同，
         # 必须全部走关键字，否则会把 df 当 strategy_id 传进去。
         return SentimentTSharedLiveEngine(obs.symbol, obs.params,
-                                          df=df, strategy_id=obs.strategy_id)
+                                          df=df, strategy_id=obs.strategy_id, broker_driven=True)
     prepared, events, _adj = prepare_signal_prices(df, obs.code)
     return MaSwingLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id,
                              prepared_df=prepared, corporate_action_dates=events)
@@ -644,43 +646,53 @@ def _base_signals(obs: Observer) -> pd.DataFrame:
 def _compare_signals(obs: Observer) -> dict:
     """信号对比：引擎一致性 与 执行层损耗，两个数分开。"""
     live = []
-    # 优先从真实成交(fills)重建 live 信号，避免 signals.jsonl 丢失导致"成交有、信号无"。
-    # fills 持久化可靠，含 side/quantity/filled_at；引擎一致性只比 time+direction+shares。
-    if obs.broker is not None and obs.broker.fills:
-        for f in obs.broker.fills:
-            live.append({
-                "time": pd.Timestamp(f.filled_at),
-                "direction": f.side.value if hasattr(f.side, "value") else str(f.side),
-                "shares": int(f.quantity),
-                "filled": int(f.quantity),
-            })
-    else:
-        for s in obs.signals:
-            live.append({
-                "time": pd.Timestamp(s["signal_time"]),
-                "direction": s["side"],
-                "shares": int(s["quantity"]),
-                "filled": int(s.get("filled_quantity") or 0),
-            })
+    # 信号意图与成交分开：有成交时也保留拒单；延迟/部分成交不改写信号时间或股数。
+    orders = obs.broker.orders if obs.broker is not None else {}
+    present = set()
+    for s in obs.signals:
+        order_id = s.get("client_order_id")
+        order = orders.get(order_id)
+        if order_id and order_id in present:
+            continue
+        if order_id:
+            present.add(order_id)
+        request = order.request if order else None
+        live.append({
+            "time": pd.Timestamp(request.created_at if request else s["signal_time"]),
+            "direction": request.side.value if request else s["side"],
+            "shares": int(request.quantity if request else s["quantity"]),
+            "filled": int(order.filled_quantity if order else s.get("filled_quantity") or 0),
+        })
+    for order_id, order in orders.items():
+        if order_id not in present:
+            live.append({"time": pd.Timestamp(order.request.created_at),
+                         "direction": order.request.side.value,
+                         "shares": int(order.request.quantity),
+                         "filled": int(order.filled_quantity)})
     live_df = pd.DataFrame(live)
     base_df = _base_signals(obs)
 
     engine_consistency = None
     execution_loss = None
     if len(base_df) and len(live_df):
-        merged = base_df.merge(live_df, on=["time", "direction"], how="outer",
+        keys = ["time", "direction", "shares"]
+        base_df = base_df.copy()
+        for frame in (base_df, live_df):
+            frame["seq"] = frame.groupby(keys).cumcount()
+        merged = base_df.merge(live_df, on=keys + ["seq"], how="outer",
                                suffixes=("_base", "_live"), indicator=True)
         matched = int((merged["_merge"] == "both").sum())
         engine_consistency = matched / max(len(base_df), len(live_df))
-        live_filled = live_df[live_df["filled"] > 0] if "filled" in live_df else live_df
-        base_only = merged[merged["_merge"] == "left_only"]
-        live_unfilled = merged[(merged["_merge"] == "right_only")]
-        execution_loss = (len(base_only) + len(live_unfilled)) / max(len(base_df), 1)
+    if len(live_df):
+        execution_loss = float((live_df["shares"] - live_df["filled"]).clip(lower=0).sum()
+                               / max(live_df["shares"].sum(), 1))
     return {
         "engine_consistency": None if engine_consistency is None else round(engine_consistency, 6),
         "execution_loss": None if execution_loss is None else round(execution_loss, 6),
         "base_signals": len(base_df),
         "live_signals": len(live_df),
+        "comparison_basis": "signal_time+side+requested_shares",
+        "execution_loss_basis": "unfilled_requested_shares",
     }
 
 

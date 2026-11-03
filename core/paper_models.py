@@ -57,6 +57,10 @@ class Order:
     average_fill_price: float = 0.0
     reject_reason: str = ""
     updated_at: Optional[datetime] = None
+    reserved_price: float = 0.0
+    execution_wait_bars: int = 0
+    risk_exit_recorded: bool = False
+    realized_pnl: float = 0.0
 
     @property
     def remaining_quantity(self) -> int:

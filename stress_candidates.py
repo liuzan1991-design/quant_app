@@ -61,13 +61,13 @@ def _params(code, sid):
 def _engine(code, sid, params, df):
     symbol = f"{code}.SH" if code.startswith("68") else f"{code}.SZ"
     if sid == "grid_trade":
-        return symbol, GridSharedLiveEngine(symbol, params, df=df)
+        return symbol, GridSharedLiveEngine(symbol, params, df=df, broker_driven=True)
     if sid == "ma_swing":
         prepared, events, _ = prepare_signal_prices(df, code)
         return symbol, MaSwingLiveEngine(symbol, params, prepared_df=prepared,
                                          corporate_action_dates=events)
     if sid == "sentiment_t":
-        return symbol, SentimentTSharedLiveEngine(symbol, params, df=df)
+        return symbol, SentimentTSharedLiveEngine(symbol, params, df=df, broker_driven=True)
     raise ValueError(sid)
 
 
@@ -94,7 +94,7 @@ def _metrics(engine, init_cash):
     peak = eq["equity"].cummax()
     dd = (eq["equity"] - peak) / peak
     mdd = float(dd.min())
-    filled = sum(1 for s in engine.signal_log if (s.get("filled_quantity") or 0) > 0)
+    filled = sum(1 for o in engine.broker.orders.values() if o.filled_quantity > 0)
     dropped = sum(1 for s in engine.signal_log if s.get("order_status") == "DROPPED")
     rejected = sum(1 for s in engine.signal_log if s.get("order_status") in {"REJECTED", "UNKNOWN"})
     return total_return, mdd, filled, dropped, rejected

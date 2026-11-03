@@ -2,8 +2,9 @@
 """本地模拟撮合器：订单幂等、状态机、T+1持仓与成交量约束。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from math import isfinite
 from typing import Dict, List, Optional
 from traceback import format_exc as _format_exc
 from uuid import uuid4
@@ -61,6 +62,40 @@ class PaperBroker:
         self.orders: Dict[str, Order] = {}
         self.fills: List[Fill] = []
         self.audit_log: List[dict] = []
+        self.volume_budget: dict = {}
+        self.replay_upto: dict = {}
+        self.replay_market_context: dict = {}
+        self.corporate_action_events: List[dict] = []
+
+    def pending_orders(self, exclude_id: str = ""):
+        return (o for oid, o in self.orders.items() if oid != exclude_id
+                and o.status not in TERMINAL_ORDER_STATUSES and o.remaining_quantity > 0)
+
+    def _risk_decision(self, request, market, now, exclude_id=""):
+        symbol_value = total_value = frozen_cash = 0.0
+        frozen_sell = 0
+        for other in self.pending_orders(exclude_id):
+            r = other.request
+            if r.side == OrderSide.BUY:
+                pos = self.account.positions.get(r.symbol)
+                price = max(other.reserved_price, float(r.limit_price or 0),
+                            market.last_price if r.symbol == market.symbol else
+                            (pos.market_price if pos else 0.0))
+                value = price * other.remaining_quantity
+                total_value += value
+                if r.symbol == request.symbol:
+                    symbol_value += value
+                frozen_cash += value + self._calculate_fee(r.side, price, other.remaining_quantity)
+            elif r.symbol == request.symbol:
+                frozen_sell += other.remaining_quantity
+        if request.side == OrderSide.BUY:
+            price = market.last_price * (1 + self.config.slippage_bps / 10000.0)
+            frozen_cash += ((price - market.last_price) * request.quantity
+                            + self._calculate_fee(request.side, price, request.quantity))
+        return self.risk_manager.evaluate(
+            request, self.account, market, now, pending_symbol_value=symbol_value,
+            pending_total_value=total_value, pending_cash=frozen_cash,
+            pending_sell_quantity=frozen_sell)
 
     def _transition(self, order: Order, status: OrderStatus, now: datetime,
                     reason: str = "") -> None:
@@ -83,7 +118,8 @@ class PaperBroker:
         })
 
     def submit_order(self, request: OrderRequest, market: MarketSnapshot,
-                     now: datetime) -> Order:
+                     now: datetime, *, execute_immediately: bool = True,
+                     execution_wait_bars: int = 0, quote_now: Optional[datetime] = None) -> Order:
         existing = self.orders.get(request.client_order_id)
         if existing is not None:
             self.audit_log.append({
@@ -93,9 +129,12 @@ class PaperBroker:
             })
             return existing
 
-        order = Order(request=request, updated_at=now)
+        slip = self.config.slippage_bps / 10000.0
+        order = Order(request=request, updated_at=now,
+                      reserved_price=max(market.last_price, float(request.limit_price or 0)) * (1 + slip),
+                      execution_wait_bars=max(0, int(execution_wait_bars)))
         self.orders[request.client_order_id] = order
-        decision = self.risk_manager.evaluate(request, self.account, market, now)
+        decision = self._risk_decision(request, market, quote_now or now, request.client_order_id)
         if not decision.passed:
             # H9 观测增强（纯新增，不改任何交易行为）：风控拒绝此前是静默的，
             # 无法区分「策略无信号」与「信号被风控拒」。结构化拒绝原因写入审计日志，
@@ -114,15 +153,27 @@ class PaperBroker:
             return order
         self._transition(order, OrderStatus.PENDING_SUBMIT, now)
         self._transition(order, OrderStatus.SUBMITTED, now)
-        self.match_order(request.client_order_id, market, now)
+        if execute_immediately:
+            self.match_order(request.client_order_id, market, now, quote_now=quote_now)
         return order
 
     def match_order(self, client_order_id: str, market: MarketSnapshot,
-                    now: datetime) -> Order:
+                    now: datetime, *, quote_now: Optional[datetime] = None,
+                    other_volume_used: int = 0) -> Order:
         order = self.orders[client_order_id]
         if order.status not in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED}:
             return order
         request = order.request
+        remaining = replace(request, quantity=order.remaining_quantity)
+        decision = self._risk_decision(remaining, market, quote_now or now, client_order_id)
+        if not decision.passed:
+            self.audit_log.append({"time": now, "event": "RISK_RECHECK_BLOCKED",
+                                   "client_order_id": client_order_id,
+                                   "violations": [v.code for v in decision.violations]})
+            temporary = {"stale_quote", "suspended", "limit_up_buy", "limit_down_sell"}
+            if any(v.code not in temporary for v in decision.violations):
+                self._transition(order, OrderStatus.CANCELLED, now, decision.reason)
+            return order
         if request.order_type == OrderType.LIMIT:
             if request.limit_price is None:
                 self._transition(order, OrderStatus.UNKNOWN, now, "限价单缺少价格")
@@ -132,9 +183,14 @@ class PaperBroker:
             if not executable:
                 return order
 
-        available = order.remaining_quantity
-        if market.volume > 0:
-            available = min(available, int(market.volume * self.config.max_volume_participation // 100 * 100))
+        budget_key = market.timestamp.isoformat()
+        usage = self.volume_budget.get(market.symbol, {})
+        used = int(usage.get("used", 0)) if usage.get("time") == budget_key else 0
+        # 零量/未知量不成交；同一bar所有订单共享参与率额度，重复撮合也不能复用。
+        capacity = max(0, int((market.volume or 0) * self.config.max_volume_participation))
+        room = max(0, capacity - used - other_volume_used)
+        lot = self.risk_manager.config.board_lot
+        available = min(order.remaining_quantity, room // lot * lot)
         if request.side == OrderSide.SELL:
             position = self.account.positions.get(request.symbol)
             sellable = position.sellable_quantity if position else 0
@@ -150,18 +206,19 @@ class PaperBroker:
         price = market.last_price * (1 + slip if request.side == OrderSide.BUY else 1 - slip)
         fee = self._calculate_fee(request.side, price, available)
         if request.side == OrderSide.BUY and price * available + fee > self.account.cash:
-            affordable = int((self.account.cash / (price * (1 + self.config.commission_rate
-                                                             + self.config.transfer_fee_rate))) // 100 * 100)
-            available = min(available, affordable)
-            if available <= 0:
-                self._transition(order, OrderStatus.UNKNOWN, now, "撮合时可用资金不足")
-                return order
-            fee = self._calculate_fee(request.side, price, available)
+            self._transition(order, OrderStatus.CANCELLED, now, "撮合时可用资金不足（含费用）")
+            return order
 
         fill = Fill(fill_id=uuid4().hex, client_order_id=client_order_id,
                     symbol=request.symbol, side=request.side, quantity=available,
                     price=price, fee=fee, filled_at=now)
+        pos = self.account.positions.get(request.symbol)
+        realized = ((price - pos.average_cost) * available - fee
+                    if request.side == OrderSide.SELL and pos else 0.0)
         self._apply_fill(fill)
+        self.mark_to_market(market)
+        order.realized_pnl += realized
+        self.volume_budget[market.symbol] = {"time": budget_key, "used": used + available}
         old_qty = order.filled_quantity
         order.filled_quantity += available
         order.average_fill_price = ((order.average_fill_price * old_qty + price * available)
@@ -178,11 +235,18 @@ class PaperBroker:
         })
         status = OrderStatus.FILLED if order.remaining_quantity == 0 else OrderStatus.PARTIALLY_FILLED
         self._transition(order, status, now)
+        if request.side == OrderSide.SELL and not order.risk_exit_recorded:
+            if "止损" in request.reason:
+                self.risk_manager.record_stop_loss(self.account, request.symbol, now.date())
+                order.risk_exit_recorded = True
+            elif status == OrderStatus.FILLED and order.realized_pnl > 0:
+                self.risk_manager.record_profitable_exit(self.account, request.symbol)
+                order.risk_exit_recorded = True
         return order
 
-    def cancel_order(self, client_order_id: str, now: datetime) -> Order:
+    def cancel_order(self, client_order_id: str, now: datetime, reason: str = "") -> Order:
         order = self.orders[client_order_id]
-        self._transition(order, OrderStatus.CANCELLED, now)
+        self._transition(order, OrderStatus.CANCELLED, now, reason)
         return order
 
     def start_new_trading_day(self, trading_day: str) -> None:
@@ -219,7 +283,7 @@ class PaperBroker:
         if cash_div > 0:
             self.account.cash += cash_div
         position.sellable_quantity = max(position.sellable_quantity, new_qty)
-        self.audit_log.append({
+        event = {
             "time": datetime.now(),
             "event": "CORPORATE_ACTION",
             "symbol": symbol,
@@ -232,7 +296,9 @@ class PaperBroker:
             "qty_after": new_qty,
             "cost_before": (total_cost / qty0) if qty0 else 0.0,
             "cost_after": new_cost,
-        })
+        }
+        self.audit_log.append(event)
+        self.corporate_action_events.append(event)
         return True
 
     def _apply_due_corporate_actions(self, trading_day: str) -> None:
@@ -269,7 +335,7 @@ class PaperBroker:
 
     def mark_to_market(self, market: MarketSnapshot) -> None:
         position = self.account.positions.get(market.symbol)
-        if position:
+        if position and isfinite(market.last_price) and market.last_price > 0:
             position.market_price = market.last_price
 
     def _calculate_fee(self, side: OrderSide, price: float, quantity: int) -> float:

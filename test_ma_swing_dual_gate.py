@@ -41,7 +41,7 @@ def run(code):
                              max_volume_participation=1))
     live = MaSwingLiveEngine(symbol, params, prepared_df=prepared,
                              corporate_action_dates=events)
-    replay = OfflineReplayEngine(broker)
+    replay = OfflineReplayEngine(broker, execution_mode="legacy_reference")
     replay.run(df, symbol, live.on_bar)
 
     fast_signals = fast.trades[["time", "direction", "shares", "reason"]].copy()

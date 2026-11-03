@@ -84,11 +84,8 @@ class SentimentTStrategy(IntradayTStrategy):
             except Exception as e:  # noqa: BLE001
                 print(f"[情绪做T] 趋势模式计算失败：{e}")
 
-        p["stop_loss_pct"] = {
-            "low": p.pop("stop_loss_low"),
-            "normal": p.pop("stop_loss_normal"),
-            "high": p.pop("stop_loss_high"),
-        }
+        from core.strategy_params import normalize_t_params
+        p = normalize_t_params(p)
         acc, trades, eq = bg.run_backtest(
             prepared, init_cash, p,
             index_status_map=status_map if status_map else None,

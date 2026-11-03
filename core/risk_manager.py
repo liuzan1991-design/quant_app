@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from math import isfinite
 from typing import Callable, Optional
 
 from core.paper_models import (
@@ -46,7 +47,9 @@ class RiskManager:
         return current
 
     def evaluate(self, request: OrderRequest, account: AccountState,
-                 market: MarketSnapshot, now: datetime) -> RiskDecision:
+                 market: MarketSnapshot, now: datetime, *, pending_symbol_value: float = 0.0,
+                 pending_total_value: float = 0.0, pending_cash: float = 0.0,
+                 pending_sell_quantity: int = 0) -> RiskDecision:
         violations = []
         cfg = self.config
         equity = account.equity()
@@ -61,7 +64,7 @@ class RiskManager:
             violations.append(RiskViolation("invalid_board_lot", f"买卖数量必须为{cfg.board_lot}股整数倍",
                                             value=request.quantity, limit=cfg.board_lot,
                                             symbol=request.symbol))
-        if market.last_price <= 0:
+        if not isfinite(market.last_price) or market.last_price <= 0:
             violations.append(RiskViolation("invalid_price", "行情价格无效",
                                             value=market.last_price, symbol=request.symbol))
         delay = max(0.0, (now - market.timestamp).total_seconds())
@@ -73,33 +76,35 @@ class RiskManager:
             violations.append(RiskViolation("suspended", "标的处于停牌状态",
                                             symbol=request.symbol))
 
-        if account.daily_realized_pnl <= -account.initial_cash * cfg.max_daily_loss_pct:
+        if request.side == OrderSide.BUY and account.daily_realized_pnl <= -account.initial_cash * cfg.max_daily_loss_pct:
             violations.append(RiskViolation("daily_loss_limit", "账户单日亏损达到停机线",
                                             value=account.daily_realized_pnl,
                                             limit=-account.initial_cash * cfg.max_daily_loss_pct))
         symbol_pnl = account.realized_pnl_by_symbol.get(request.symbol, 0.0)
-        if symbol_pnl <= -account.initial_cash * cfg.max_symbol_cumulative_loss_pct:
+        if request.side == OrderSide.BUY and symbol_pnl <= -account.initial_cash * cfg.max_symbol_cumulative_loss_pct:
             violations.append(RiskViolation("symbol_loss_limit", "单股累计亏损达到暂停线",
                                             value=symbol_pnl,
                                             limit=-account.initial_cash * cfg.max_symbol_cumulative_loss_pct,
                                             symbol=request.symbol))
         pause_until = account.symbol_pause_until.get(request.symbol)
-        if pause_until and date.fromisoformat(account.trading_day) <= date.fromisoformat(pause_until):
+        if request.side == OrderSide.BUY and pause_until and date.fromisoformat(account.trading_day) <= date.fromisoformat(pause_until):
             violations.append(RiskViolation("symbol_paused", f"连续止损后暂停至{pause_until}",
                                             symbol=request.symbol))
 
         position = account.positions.get(request.symbol)
         if request.side == OrderSide.SELL:
-            sellable = position.sellable_quantity if position else 0
+            sellable = max(0, min(position.sellable_quantity,
+                                 position.quantity - position.today_bought_quantity)
+                           - pending_sell_quantity) if position else 0
             if request.quantity > sellable:
                 violations.append(RiskViolation("t_plus_one_or_position", "可卖持仓不足，可能受T+1限制",
                                                 value=request.quantity, limit=sellable,
                                                 symbol=request.symbol))
         elif request.side == OrderSide.BUY and equity > 0 and market.last_price > 0:
             order_value = request.quantity * market.last_price
-            projected_symbol = account.position_value(request.symbol) + order_value
+            projected_symbol = account.position_value(request.symbol) + pending_symbol_value + order_value
             current_total = sum(item.market_value for item in account.positions.values())
-            projected_total = current_total + order_value
+            projected_total = current_total + pending_total_value + order_value
             if order_value > equity * cfg.max_order_value_pct:
                 violations.append(RiskViolation("order_value_limit", "单笔委托金额超过账户比例限制",
                                                 value=order_value / equity,
@@ -114,9 +119,9 @@ class RiskManager:
                 violations.append(RiskViolation("account_position_limit", "全账户仓位超过限制",
                                                 value=projected_total / equity,
                                                 limit=cfg.max_account_position_pct))
-            if order_value > account.cash:
+            if order_value > account.cash - pending_cash:
                 violations.append(RiskViolation("insufficient_cash", "可用资金不足",
-                                                value=order_value, limit=account.cash,
+                                                value=order_value, limit=account.cash - pending_cash,
                                                 symbol=request.symbol))
             if market.limit_up is not None and market.last_price >= market.limit_up:
                 violations.append(RiskViolation("limit_up_buy", "涨停状态禁止按最新价模拟买入",

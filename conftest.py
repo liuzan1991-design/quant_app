@@ -52,10 +52,12 @@ def _isolate_alerts(tmp_path, monkeypatch):
     与 H19（测试触发真实登录）同族：**副作用的落点没被纳入测试边界**。
     """
     from core import alerts
+    import watchdog
     root = tmp_path / "_alerts"
     monkeypatch.setattr(alerts, "LIVE_DIR", root)
     monkeypatch.setattr(alerts, "LOG_DIR", root / "logs")
     monkeypatch.setattr(alerts, "ACTIVE_FILE", root / "ALERT_ACTIVE.json")
     monkeypatch.setattr(alerts, "JSONL_FILE", root / "logs" / "alerts.jsonl")
     monkeypatch.setattr(alerts, "DESKTOP_FILE", root / "Desktop" / "量化系统告警.txt")
+    monkeypatch.setattr(watchdog, "WATCHDOG_LOG", root / "logs" / "watchdog.log")
     yield

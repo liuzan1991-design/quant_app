@@ -36,6 +36,9 @@ class SentimentTSharedLiveEngine(BrokerDrivenTMixin):
         self.symbol = symbol
         self.strategy_id = strategy_id
         self.params = dict(params)
+        if broker_driven:
+            from core.strategy_params import normalize_t_params
+            self.params = normalize_t_params(self.params)
         self.params.setdefault("min_bars", 10)
         self.params.setdefault("macd_fast", 5)
         self.params.setdefault("macd_slow", 10)

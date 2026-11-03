@@ -80,7 +80,7 @@ def build_html_report(result: BacktestResult, df: pd.DataFrame, code: str,
 
     attr_rows = "".join(
         f"<tr><td>{k}</td><td style='text-align:right'>{v:+,.2f} 元</td></tr>"
-        for k, v in attr.items())
+        for k, v in attr.items() if k not in {"对账通过", "合计(≈)"})
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     title = f"{stock}（{code}）日内做T回测报告"

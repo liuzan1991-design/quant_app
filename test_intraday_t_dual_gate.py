@@ -58,7 +58,7 @@ def run(code):
                              slippage_bps=params["slippage_bps"],
                              max_volume_participation=1))
     live = IntradayTSharedLiveEngine(symbol, engine_params, df=df)
-    replay = OfflineReplayEngine(broker)
+    replay = OfflineReplayEngine(broker, execution_mode="legacy_reference")
     replay.run(df, symbol, live.on_bar)
 
     fast_signals = fast.trades[["time", "direction", "shares", "reason"]].copy()

@@ -19,30 +19,35 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 LOG_DIR = APP_DIR / "live_outputs" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 _LOGGER = logging.getLogger("live_run")
 _LOGGER.setLevel(logging.INFO)
-if not _LOGGER.handlers:
-    _fh = logging.FileHandler(
-        LOG_DIR / f"live_{datetime.now():%Y%m%d}.log", encoding="utf-8")
-    _fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s"))
-    _LOGGER.addHandler(_fh)
+_CONSOLE_LOG = None
 for _p in (str(APP_DIR), str(APP_DIR / "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# 控制台输出重定向：计划任务下 stdout/stderr 无处可去，未捕获 traceback 会静默丢失
-# （2026-09-09 12:43 进程无声死亡，就是崩溃现场没留痕）。这里全部落到文件。
-_CONSOLE_LOG = open(LOG_DIR / f"console_{datetime.now():%Y%m%d}.log",
-                    "a", buffering=1, encoding="utf-8")
-sys.stdout = _CONSOLE_LOG
-sys.stderr = _CONSOLE_LOG
-try:
-    import faulthandler
-    faulthandler.enable(_CONSOLE_LOG)  # 段错误等硬崩溃也留 Python 层栈
-except Exception:
-    pass
+
+def _configure_logging():
+    """仅在运行入口配置文件日志，模块导入可用于隔离测试。"""
+    global _CONSOLE_LOG
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(LOG_DIR / f"live_{datetime.now():%Y%m%d}.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    _LOGGER.addHandler(handler)
+    # 计划任务没有控制台，保留启动阶段和硬崩溃的现场。
+    _CONSOLE_LOG = open(LOG_DIR / f"console_{datetime.now():%Y%m%d}.log",
+                        "a", buffering=1, encoding="utf-8")
+    sys.stdout = _CONSOLE_LOG
+    sys.stderr = _CONSOLE_LOG
+    try:
+        import faulthandler
+        faulthandler.enable(_CONSOLE_LOG)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    _configure_logging()
 
 import live_match_loop as match  # noqa: E402
 from core.close_timing import is_today_close_bar  # noqa: E402
@@ -252,7 +257,8 @@ def main() -> None:
 
         # 撮合新 bar：单轮异常只记日志不退出，下一轮从持久化状态继续。
         try:
-            summary = match._run_once(observers, match.OUTPUT_DIR)
+            summary = match._run_once(observers, match.OUTPUT_DIR,
+                                      quote_now=match.live_quote_time())
             for obs in observers:
                 equity = obs.broker.account.equity()
                 obs.day_high_equity = max(obs.day_high_equity, equity)

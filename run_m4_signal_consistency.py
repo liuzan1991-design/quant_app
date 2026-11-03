@@ -141,7 +141,7 @@ def run_one(code: str, signal_gate: float, fill_gate: float) -> dict:
         prepared_df=prepared,
         corporate_action_dates=corporate_action_dates,
     )
-    replay = OfflineReplayEngine(broker)
+    replay = OfflineReplayEngine(broker, execution_mode="legacy_reference")
     replay.run(df, symbol, engine.on_bar)
     live = normalize_live_signals(replay.signal_log)
 

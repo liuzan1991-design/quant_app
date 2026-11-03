@@ -38,6 +38,9 @@ class IntradayTSharedLiveEngine(BrokerDrivenTMixin):
         self.symbol = symbol
         self.strategy_id = strategy_id
         self.params = dict(params)
+        if broker_driven:
+            from core.strategy_params import normalize_t_params
+            self.params = normalize_t_params(self.params)
         self.engine = IntradayTSharedEngine(self.params)
         # False 只用于旧离线基准；生产构造器必须显式使用 True。
         self.broker_driven = broker_driven

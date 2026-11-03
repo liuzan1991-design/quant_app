@@ -114,8 +114,10 @@ def test_loss_pause_and_limit_states():
     )
     broker.account.realized_pnl_by_symbol["600000.SH"] = -5000
     order = broker.submit_order(request("symbol-stop", OrderSide.SELL, 100), market(), NOW)
-    assert order.status == OrderStatus.REJECTED
-    assert "累计亏损" in order.reject_reason
+    assert order.status == OrderStatus.FILLED  # 亏损后仍允许合法减仓。
+    blocked = broker.submit_order(request("symbol-stop-buy", OrderSide.BUY, 100), market(), NOW)
+    assert blocked.status == OrderStatus.REJECTED
+    assert "累计亏损" in blocked.reject_reason
 
     broker2 = PaperBroker(100000, "2026-08-31")
     up = broker2.submit_order(request("up", OrderSide.BUY, 100),

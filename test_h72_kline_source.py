@@ -10,6 +10,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import runpy
+import shutil
+import sys
 
 import pytest
 
@@ -78,3 +82,15 @@ def test_apply_survives_broken_config(cfg_path, monkeypatch) -> None:
     assert R._apply_kline_source() == "ad"
     import os
     assert "QUANT_KLINE_SOURCE" not in os.environ
+
+
+def test_import_live_run_leaves_logs_and_streams_alone(tmp_path):
+    entry = tmp_path / "live_run.py"
+    shutil.copyfile(Path(R.__file__), entry)
+    stdout, stderr = sys.stdout, sys.stderr
+    try:
+        runpy.run_path(str(entry), run_name="live_run_import_probe")
+        assert sys.stdout is stdout and sys.stderr is stderr
+        assert not (tmp_path / "live_outputs").exists()
+    finally:
+        sys.stdout, sys.stderr = stdout, stderr

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime
 
 from core.paper_models import OrderSide, OrderStatus
 
@@ -12,12 +14,15 @@ class BrokerTAccount:
 
     protect_base_position = True
 
-    def __init__(self, broker, symbol, base_position):
+    def __init__(self, broker, symbol, base_position, *, base_target=None, eligible_t=None):
         self.broker = broker
         self.symbol = symbol
         self.base_position = base_position
+        self.base_target = base_position if base_target is None else base_target
+        self._eligible_t = eligible_t
         self.last_fill_price = 0.0
         self.last_fee = 0.0
+        self.trading_enabled = True
 
     @property
     def position(self):
@@ -40,19 +45,80 @@ class BrokerTAccount:
         # 换日由 broker 负责，策略不能自行解锁当日买入。
         pass
 
+    @property
+    def sellable_t(self):
+        if self._eligible_t is None:
+            # 网格沿用现有库存口径。
+            return min(self.closeable, max(0, self.total - self.base_position))
+        return min(self.closeable, self._eligible_t)
+
     def buy(self, price, shares):
         lot = self.broker.risk_manager.config.board_lot
         self.last_fill_price = price
-        return shares > 0 and shares % lot == 0 and self.cash >= price * shares
+        return self.trading_enabled and shares > 0 and shares % lot == 0 and self.cash >= price * shares
 
     def sell(self, price, shares):
         lot = self.broker.risk_manager.config.board_lot
-        allowed = min(shares, self.closeable, max(0, self.total - self.base_position))
+        allowed = min(shares, self.sellable_t)
         self.last_fill_price = price
-        return max(0, int(allowed) // lot * lot)
+        return max(0, int(allowed) // lot * lot) if self.trading_enabled else 0
 
     def equity(self, price):
         return self.broker.account.equity()
+
+
+@dataclass
+class InventoryLot:
+    cost: float
+    quantity: int
+    protected: bool
+    bought_on: str
+
+
+def _order_reason(broker, fill):
+    order = broker.orders.get(fill.client_order_id)
+    return (order.request.reason or "") if order else ""
+
+
+def filled_inventory(broker, symbol, base):
+    """成交和除权事件按生效顺序重放，返回分开的底仓/T仓及调整后底仓目标。"""
+    fills = [fill for fill in broker.fills if fill.symbol == symbol]
+    actions = [event for event in broker.corporate_action_events if event["symbol"] == symbol]
+    events = [(fill.filled_at, 1, fill) for fill in fills]
+    events += [(datetime.fromisoformat(action["ex_date"]), 0, action) for action in actions]
+    lots = []
+    for _, kind, event in sorted(events, key=lambda row: row[:2]):
+        if kind == 0 and lots:
+            ratio = 1 + float(event["bonus_ratio"])
+            dividend = float(event["dividend_per_share"])
+            base = round(base * ratio)
+            original = adjusted = 0
+            for lot in lots:
+                old_qty = lot.quantity
+                original += old_qty
+                # 按累计股数取整，确保所有lot股数之和与账户送转一致。
+                qty = round(original * ratio) - adjusted
+                adjusted += qty
+                lot.cost = (lot.cost - dividend) * old_qty / qty
+                lot.quantity = qty
+        elif kind == 1 and event.side == OrderSide.BUY:
+            # H78：资金目标只决定建仓意图的尺寸。用实际订单意图区分
+            # 底仓和T仓；旧快照缺意图时保守保护，不能凭股数猜为T仓。
+            is_t = _order_reason(broker, event).startswith("加权买入")
+            cost = event.price + event.fee / event.quantity
+            lots.append(InventoryLot(cost, event.quantity, not is_t,
+                                     event.filled_at.date().isoformat()))
+        elif kind == 1:
+            remaining = event.quantity
+            day = event.filled_at.date().isoformat()
+            for protected in (False, True):
+                for lot in lots:
+                    if lot.protected == protected and lot.bought_on < day and remaining:
+                        take = min(lot.quantity, remaining)
+                        lot.quantity -= take
+                        remaining -= take
+            lots = [lot for lot in lots if lot.quantity]
+    return fills, lots, base
 
 
 class BrokerDrivenTMixin:
@@ -61,45 +127,28 @@ class BrokerDrivenTMixin:
     def _sync_lifecycle_from_fills(self, broker):
         if not self.broker_driven:
             return
-        self.account = BrokerTAccount(broker, self.symbol, int(self.params.get("base_position", 1000)))
-        p = self.account.position
-        key = (id(broker), len(broker.fills), broker.account.trading_day,
-               self.account.total, p.average_cost if p else 0.0)
+        p = broker.account.positions.get(self.symbol)
+        key = (id(broker), len(broker.fills), len(broker.corporate_action_events),
+               broker.account.trading_day, p.quantity if p else 0, p.average_cost if p else 0.0)
         if getattr(self, "_fill_state_key", None) == key:
             return
+        fills, lots, target = filled_inventory(broker, self.symbol, int(self.params.get("base_position", 1000)))
+        total = p.quantity if p else 0
+        # 成交历史与账户不闭合时，来源不明的持仓不进入自动卖出。
+        t_inventory = ([lot for lot in lots if not lot.protected]
+                       if sum(lot.quantity for lot in lots) == total else [])
+        t_lots = [(lot.cost, lot.quantity) for lot in t_inventory]
+        actual_t = sum(qty for _, qty in t_lots)
+        eligible_t = sum(lot.quantity for lot in t_inventory
+                         if lot.bought_on < broker.account.trading_day)
+        self.account = BrokerTAccount(broker, self.symbol, total - actual_t,
+                                      base_target=target, eligible_t=eligible_t)
         self._fill_state_key = key
         state = self.engine.state
-        fills = [f for f in broker.fills if f.symbol == self.symbol]
-        base = self.account.base_position
-        lots = []  # [含费单位成本, 股数, 是否底仓]
-        for f in fills:
-            if f.side == OrderSide.BUY:
-                base_held = sum(q for _, q, is_base in lots if is_base)
-                base_qty = min(f.quantity, max(0, base - base_held))
-                unit_cost = f.price + f.fee / f.quantity
-                if base_qty:
-                    lots.append([unit_cost, base_qty, True])
-                if f.quantity > base_qty:
-                    lots.append([unit_cost, f.quantity - base_qty, False])
-            else:
-                remaining = f.quantity
-                # 做T卖出先扣 T 仓；旧记录可能卖到底仓，也必须按实际成交扣除。
-                for is_base in (False, True):
-                    for lot in lots:
-                        if lot[2] == is_base and remaining:
-                            take = min(lot[1], remaining)
-                            lot[1] -= take
-                            remaining -= take
-                lots = [lot for lot in lots if lot[1]]
-        t_lots = [(price, qty) for price, qty, is_base in lots if not is_base]
-        actual_t = max(0, self.account.total - base)
-        if sum(q for _, q in t_lots) != actual_t:
-            # 外部导入/公司行为可能改变股数；绝不沿用大于实际持仓的旧 T 台账。
-            t_lots = [(p.average_cost, actual_t)] if actual_t and p else []
         state.t_buy_queue = t_lots
         state.t_total_shares = actual_t
         state.t_avg_cost = sum(price * q for price, q in t_lots) / actual_t if actual_t else 0.0
-        state.base_ready = base <= 0 or self.account.total > 0 or any(f.side == OrderSide.BUY for f in fills)
+        state.base_ready = target <= 0 or total > 0 or any(f.side == OrderSide.BUY for f in fills)
 
         today = [f for f in fills if f.filled_at.date().isoformat() == broker.account.trading_day]
         buys = [f for f in today if f.side == OrderSide.BUY]
@@ -110,8 +159,7 @@ class BrokerDrivenTMixin:
         state.last_sell_time = max((f.filled_at for f in sells), default=None)
 
         def reason(fill):
-            order = broker.orders.get(fill.client_order_id)
-            return getattr(order.request, "reason", "") if order else ""
+            return _order_reason(broker, fill)
 
         state.daily_stop_loss_count = len({f.client_order_id for f in sells
                                           if reason(f).startswith("T仓位止损")})

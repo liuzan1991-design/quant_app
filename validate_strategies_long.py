@@ -14,7 +14,7 @@ OUT_DIR = Path(r"D:\Codex输出")
 sys.path.insert(0, str(APP_DIR))
 
 from core.data import load_data, stock_name  # noqa: E402
-from core.metrics import stock_return  # noqa: E402
+from core.metrics import stock_return, benchmark_comparison  # noqa: E402
 from strategies import STRATEGIES, get_strategy  # noqa: E402
 
 
@@ -84,6 +84,7 @@ def run_validation() -> pd.DataFrame:
                             params["trade_shares"] = max(100, int(base_shares * 0.1 // 100 * 100))
                         params["max_position"] = max(base_shares * 2, base_shares + 100)
                     result = strategy.run(df, init_cash, params, {"code": code})
+                    comparison = benchmark_comparison(result, df)
                     rows.append({
                         "股票代码": code, "股票名称": stock_name(code), "股票类型": category,
                         "阶段": period_name, "开始": pd.Timestamp(df["time"].iloc[0]).date(),
@@ -92,6 +93,8 @@ def run_validation() -> pd.DataFrame:
                         "策略收益%": round(result.total_return * 100, 2),
                         "策略最大回撤%": round(result.max_drawdown * 100, 2),
                         "相对股票涨跌%": round(result.total_return * 100 - feat["股票涨跌%"], 2),
+                        "相对基准收益%": round(comparison["增量收益%"], 2),
+                        "基准收益%": round(comparison["基准收益%"], 2),
                         "交易笔数": len(result.trades), "手续费": round(result.total_fees, 2),
                         "数据源": str(source or ""), "错误": "",
                     })
@@ -109,7 +112,7 @@ def build_scorecard(detail: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (code, name, sid, strategy), g in yearly.groupby(["股票代码", "股票名称", "策略ID", "策略"]):
         positive = float((g["策略收益%"] > 0).mean() * 100)
-        beat = float((g["相对股票涨跌%"] > 0).mean() * 100)
+        beat = float((g["相对基准收益%"] > 0).mean() * 100)
         avg_ret = float(g["策略收益%"].mean())
         avg_dd = float(g["策略最大回撤%"].mean())
         worst_dd = float(g["策略最大回撤%"].min())
@@ -126,7 +129,7 @@ def build_scorecard(detail: pd.DataFrame) -> pd.DataFrame:
         rows.append({
             "股票代码": code, "股票名称": name, "策略ID": sid, "策略": strategy,
             "有效阶段数": len(g), "平均收益%": round(avg_ret, 2),
-            "盈利阶段占比%": round(positive, 1), "跑赢股票占比%": round(beat, 1),
+            "盈利阶段占比%": round(positive, 1), "跑赢基准占比%": round(beat, 1),
             "平均最大回撤%": round(avg_dd, 2), "最差最大回撤%": round(worst_dd, 2),
             "适配评分": round(float(score), 1), "结论": grade,
         })

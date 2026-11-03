@@ -57,11 +57,8 @@ class IntradayTStrategy(BaseStrategy):
             context: dict = None) -> BacktestResult:
         p = dict(params)
         # 界面用三档独立输入，引擎需要分档字典
-        p["stop_loss_pct"] = {
-            "low": p.pop("stop_loss_low"),
-            "normal": p.pop("stop_loss_normal"),
-            "high": p.pop("stop_loss_high"),
-        }
+        from core.strategy_params import normalize_t_params
+        p = normalize_t_params(p)
         raw_code = str((context or {}).get("code") or df.attrs.get("code", ""))
         prepared, corporate_dates, adjustment = prepare_signal_prices(df, raw_code)
         prepared.attrs["adjustment"] = adjustment
@@ -117,7 +114,7 @@ class IntradayTStrategy(BaseStrategy):
                 "回测未产生任何权益记录（equity_curve 为空）。"
                 "常见原因：① 初始资金不足以建立底仓；② 区间内无有效交易日；"
                 "③ 区间内每根 bar 都被前置条件跳过。")
-        peak = eq2["equity"].cummax()
+        peak = eq2["equity"].cummax().clip(lower=init_cash)
         dd = ((eq2["equity"] - peak) / peak)
         mdd = float(dd.min())
         calmar = annual / abs(mdd) if mdd < 0 else float("nan")

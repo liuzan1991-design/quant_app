@@ -81,6 +81,72 @@ def test_no_ghost_sell_from_base_or_empty_account(engine, cleared):
     assert engine.engine.state.t_total_shares == 0
 
 
+@pytest.mark.parametrize("minute,price,reason", [
+    ("09:40", 260, "加权卖出"),
+    ("09:40", 249, "T仓位止损"),
+    ("14:45", 259, "尾盘止盈"),
+    ("14:55", 255, "尾盘强制平仓"),
+])
+def test_h78_first_weighted_buy_stays_t_after_restore(engine, tmp_path, minute, price, reason):
+    b = broker()
+    b.start_new_trading_day("2026-11-03")
+    seed(b, price=255.3276, reason="加权买入[九转低8低9(x10)] 评分=12")
+    store = PaperStateStore(tmp_path)
+    store.save(b)
+    b = store.load()
+
+    # 即使配置了100股底仓目标，首笔加权买入的身份仍是T仓。
+    same_day = feed(engine, b, [bar("2026-11-03 14:55", price=249)])
+    assert same_day.signal_log == []
+    assert engine.engine.state.t_total_shares == 100
+    assert engine.engine.state.t_avg_cost == pytest.approx(255.3276)
+    assert engine.account.base_position == 0
+    assert engine.account.base_target == 100
+    assert engine.account.sellable_t == 0
+
+    ts = pd.Timestamp(f"2026-11-04 {minute}")
+    eligible = feed(engine, b, [bar(str(ts), price=price)])
+    assert eligible.signal_log[0]["reason"].startswith(reason)
+    assert eligible.signal_log[0]["quantity"] == 100
+    assert eligible.signal_log[0]["filled_quantity"] == 0
+    feed(engine, b, [bar(str(ts + pd.Timedelta(minutes=1)), price=price)])
+    assert b.fills[-1].side == OrderSide.SELL
+    assert b.fills[-1].quantity == 100
+    assert engine.engine.state.t_total_shares == 0
+
+
+def test_h78_today_t_does_not_sell_yesterdays_protected_base(engine):
+    b = broker()
+    seed(b)
+    b.start_new_trading_day("2026-11-02")
+    seed(b, price=120, reason="加权买入[试算] 评分=10")
+    loss = feed(engine, b, [bar("2026-11-02 10:05", price=95)])
+    assert loss.signal_log == []
+    assert engine.account.closeable == 100
+    assert engine.account.sellable_t == 0
+    assert engine.account.base_position == 100
+    assert engine.engine.state.t_total_shares == 100
+
+
+def test_h78_unknown_buy_intent_is_protected(engine):
+    b = broker()
+    seed(b, reason="")
+    later = feed(engine, b, [bar("2026-11-02 14:55")])
+    assert later.signal_log == []
+    assert engine.account.base_position == 100
+    assert engine.engine.state.t_total_shares == 0
+
+
+def test_h78_fresh_account_builds_and_protects_explicit_base(engine):
+    b = broker()
+    signal = feed(engine, b, [bar(price=100)])
+    assert signal.signal_log[0]["reason"] == "建底仓"
+    assert signal.signal_log[0]["quantity"] == 100
+    feed(engine, b, [bar("2026-11-02 09:41", price=100)])
+    assert engine.account.total == engine.account.base_position == 100
+    assert engine.engine.state.t_total_shares == 0
+
+
 @pytest.mark.parametrize("gate_reject", [True, False])
 def test_rejected_buy_never_changes_strategy_cost_or_counters(engine, gate_reject):
     b = broker()
@@ -104,11 +170,13 @@ def test_partial_sell_counts_once_and_preserves_actual_remaining_cost(engine):
     engine.engine.params["fixed_shares"] = 200
     first = feed(engine, b, [bar(volume=1000)])
     assert first.signal_log[0]["quantity"] == 200
-    assert first.signal_log[0]["filled_quantity"] == 100
+    assert first.signal_log[0]["filled_quantity"] == 0
+    assert engine.account.total == 300
+    feed(engine, b, [bar("2026-11-02 09:41", volume=1000)])
     assert engine.account.total == 200
     assert engine.engine.state.t_total_shares == 100
     assert engine.engine.state.t_avg_cost == 110
-    second = feed(engine, b, [bar("2026-11-02 09:41", volume=1000)])
+    second = feed(engine, b, [bar("2026-11-02 09:42", volume=1000)])
     assert second.signal_log == []
     assert engine.account.total == 100
     assert engine.engine.state.t_total_shares == 0
@@ -135,12 +203,13 @@ def test_stop_loss_survives_day_roll_and_never_sells_base(engine):
     b = broker()
     seed(b)
     seed(b, 200, 110, reason="加权买入[test] 评分=10")
-    feed(engine, b, [bar(price=110)])
+    feed(engine, b, [bar(price=110), bar("2026-11-02 09:41", price=110)])
     # 先前强制卖评分会卖出 100；余下 100 T 股应跨日保留成本。
     assert engine.engine.state.t_total_shares == 100
     replay = feed(engine, b, [bar("2026-11-03 09:40", price=90)])
     assert replay.signal_log[0]["quantity"] == 100
     assert replay.signal_log[0]["reason"].startswith("T仓位止损")
+    feed(engine, b, [bar("2026-11-03 09:41", price=90)])
     assert engine.account.total == 100
     assert engine.engine.state.daily_stop_loss_count == 1
 
@@ -150,7 +219,8 @@ def test_restart_with_partial_order_uses_snapshot_and_real_fills(engine, tmp_pat
     seed(b)
     seed(b, 200, 110, reason="加权买入[test] 评分=10")
     engine.params["fixed_shares"] = engine.engine.params["fixed_shares"] = 200
-    feed(engine, b, [bar(volume=1000)])
+    feed(engine, b, [bar(volume=1000), bar("2026-11-02 09:41", volume=1000)])
+    assert next(reversed(b.orders.values())).filled_quantity == 100
     store = PaperStateStore(tmp_path)
     store.save(b)
     saved_state = engine.engine.state.to_dict()
@@ -158,7 +228,7 @@ def test_restart_with_partial_order_uses_snapshot_and_real_fills(engine, tmp_pat
     new = type(engine)(SYMBOL, engine.params, broker_driven=True)
     new._prepared = True
     new.engine.state = IntradayTSharedState.from_dict(saved_state)
-    replay = feed(new, restored, [bar("2026-11-02 09:41", volume=1000)])
+    replay = feed(new, restored, [bar("2026-11-02 09:42", volume=1000)])
     assert replay.signal_log == []
     assert new.account.total == 100
     assert new.engine.state.t_total_shares == 0
@@ -323,8 +393,10 @@ def test_zero_base_setting_skips_zero_quantity_order_and_respects_t_plus_one(eng
     first = feed(engine, b, [bar(price=90)])
     assert first.signal_log[0]["quantity"] == 100
     assert first.signal_log[0]["reason"].startswith("加权买入")
-    assert engine.engine.state.t_total_shares == 100
+    assert engine.engine.state.t_total_shares == 0
     assert feed(engine, b, [bar("2026-11-02 09:41")]).signal_log == []
+    assert engine.engine.state.t_total_shares == 100
     next_day = feed(engine, b, [bar("2026-11-03 09:40")])
     assert next_day.signal_log[0]["side"] == "SELL"
+    feed(engine, b, [bar("2026-11-03 09:41")])
     assert engine.account.total == 0

@@ -63,6 +63,10 @@ class PaperStateStore:
             "account": asdict(broker.account),
             "orders": [asdict(item) for item in broker.orders.values()],
             "fills": [asdict(item) for item in broker.fills],
+            "volume_budget": broker.volume_budget,
+            "replay_upto": broker.replay_upto,
+            "replay_market_context": broker.replay_market_context,
+            "corporate_action_events": broker.corporate_action_events,
         }
         temp = self.snapshot_path.with_suffix(".tmp")
         temp.write_text(json.dumps(payload, ensure_ascii=False,
@@ -119,6 +123,10 @@ class PaperStateStore:
                 reject_reason=item.get("reject_reason", ""),
                 updated_at=(datetime.fromisoformat(item["updated_at"])
                             if item.get("updated_at") else None),
+                reserved_price=float(item.get("reserved_price", item.get("average_fill_price", 0))),
+                execution_wait_bars=int(item.get("execution_wait_bars", 0)),
+                risk_exit_recorded=bool(item.get("risk_exit_recorded", False)),
+                realized_pnl=float(item.get("realized_pnl", 0)),
             )
             broker.orders[request.client_order_id] = order
         broker.fills = [
@@ -131,4 +139,23 @@ class PaperStateStore:
             for item in payload.get("fills", [])
         ]
         broker._persisted_audit_count = 0
+        broker.volume_budget = dict(payload.get("volume_budget", {}))
+        broker.replay_upto = dict(payload.get("replay_upto", {}))
+        broker.replay_market_context = dict(payload.get("replay_market_context", {}))
+        broker.corporate_action_events = list(payload.get("corporate_action_events", []))
+        if "corporate_action_events" not in payload and broker.account.applied_corporate_actions and self.audit_path.exists():
+            # 旧快照只有末次除权日期，明细在审计日志；只恢复已进入该快照的事件。
+            recovered = {}
+            with self.audit_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("event") != "CORPORATE_ACTION":
+                        continue
+                    symbol, ex_date = event.get("symbol"), event.get("ex_date", "")
+                    if ex_date and ex_date <= broker.account.applied_corporate_actions.get(symbol, ""):
+                        recovered[(symbol, ex_date)] = event
+            broker.corporate_action_events = list(recovered.values())
         return broker

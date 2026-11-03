@@ -107,15 +107,16 @@ class IntradayTSharedEngine:
         # 快速路径建底仓使用首日第一根bar收盘价；后续信号同样使用当前bar收盘价。
         price = float(bar["close"])
         hhmm = ts.hour * 100 + ts.minute
-        base_position = int(p.get("base_position", 1000))
+        base_position = int(getattr(account, "base_position", p.get("base_position", 1000)))
         fixed_shares = int(p.get("fixed_shares", 100))
 
         if not self.state.base_ready:
-            ok = account.buy(price, base_position)
+            base_target = int(getattr(account, "base_target", base_position))
+            ok = account.buy(price, base_target)
             if ok:
                 self.state.base_ready = True
                 return {
-                    "direction": "BUY", "shares": base_position, "reason": "建底仓",
+                    "direction": "BUY", "shares": base_target, "reason": "建底仓",
                     "price": account.last_fill_price, "fee": account.last_fee,
                 }
             return None
@@ -139,9 +140,10 @@ class IntradayTSharedEngine:
         cooldown_sell = int(sell_map.get(vol_level, 2))
         cooldown_buy = int(buy_map.get(vol_level, 5))
         position = getattr(account, "closeable", getattr(account, "total", 0))
+        sellable_t = getattr(account, "sellable_t", max(0, position - base_position))
 
         if hhmm >= 1445 and bool(p.get("enable_afternoon_close", True)) and self._day_mode != "hold":
-            t_shares = max(0, position - base_position)
+            t_shares = sellable_t
             if t_shares > 0:
                 t_pnl = ((price - self.state.t_avg_cost) / self.state.t_avg_cost * 100
                          if self.state.t_avg_cost > 0 else 0.0)
@@ -186,7 +188,7 @@ class IntradayTSharedEngine:
                     and self._day_mode != "hold"):
                 should_sell, score, details = self._evaluate_sell(indicator, ts)
                 if should_sell:
-                    sellable = max(0, position - base_position)
+                    sellable = sellable_t
                     # 仅保留旧离线基准的底仓兜底；生产 BrokerTAccount 明确禁止。
                     if sellable <= 0 and not getattr(account, "protect_base_position", False):
                         sellable = min(max(0, account.total - int(base_position / 2)), 2000)

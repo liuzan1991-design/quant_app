@@ -6,7 +6,7 @@ import pandas as pd
 
 from core import data_fetch
 from core.data import load_data, stock_name
-from core.metrics import stock_return
+from core.metrics import stock_return, benchmark_comparison
 from strategies import STRATEGIES, get_strategy
 
 
@@ -45,6 +45,7 @@ def run_batch(stocks: list, strategies: list, init_cash: float,
                 _p(done / max(total, 1),
                    f"回测 {done + 1}/{total}：{stock_name(code)} {code} × {s.name}…")
                 r = s.run(df, init_cash, s.default_params(), {"code": code})
+                comparison = benchmark_comparison(r, df)
                 rows.append({
                     "板块": sector or "",
                     "股票": f"{stock_name(code)} {code}",
@@ -53,7 +54,9 @@ def run_batch(stocks: list, strategies: list, init_cash: float,
                     "总收益%": round(r.total_return * 100, 2),
                     "年化%": round(r.annual_return * 100, 2),
                     "最大回撤%": round(r.max_drawdown * 100, 2),
-                    "超额收益%": round(r.total_return * 100 - sret, 2),
+                    "基准收益%": round(comparison["基准收益%"], 2),
+                    "超额收益%": round(comparison["增量收益%"], 2),
+                    "全仓机会成本差%": round(comparison["全仓机会成本差%"], 2),
                     "交易笔数": len(r.trades),
                     "T胜率%": round(r.t_win_rate, 1) if r.t_sell_count else 0,
                     "手续费": round(r.total_fees, 0),
@@ -75,8 +78,7 @@ def summarize_batch(result_df: pd.DataFrame) -> str:
     if not len(result_df):
         return "批量回测无数据"
     if "超额收益%" not in result_df.columns:
-        result_df = result_df.copy()
-        result_df["超额收益%"] = result_df["总收益%"] - result_df["股票涨跌%"]
+        return "缺少匹配基准收益，无法生成增量收益评价；请重新回测。"
     lines = []
     n_stock = result_df["股票"].nunique()
     n_strat = result_df["策略"].nunique()
@@ -90,7 +92,7 @@ def summarize_batch(result_df: pd.DataFrame) -> str:
     lines.append(f"最佳收益组合：{best['股票']} × {best['策略']}  {best['总收益%']:+.2f}%")
     lines.append(f"最差收益组合：{worst['股票']} × {worst['策略']}  {worst['总收益%']:+.2f}%")
     lines.append(f"最大超额组合：{best_exc['股票']} × {best_exc['策略']}  "
-                 f"跑赢股票 {best_exc['超额收益%']:+.2f}%")
+                 f"相对匹配基准 {best_exc['超额收益%']:+.2f} 个百分点")
     lines.append("")
 
     lines.append("【分股票诊断】")
@@ -103,13 +105,11 @@ def summarize_batch(result_df: pd.DataFrame) -> str:
         line = (f"· {stock}：股票自身 {sret:+.2f}% ｜ 最佳策略「{best_s['策略']}」"
                 f" {best_s['总收益%']:+.2f}%（超额{best_s['超额收益%']:+.2f}%）")
         if max_exc > 1:
-            line += "，策略跑赢持股，做T/网格有正价值"
-        elif sret > 20 and max_exc < -5:
-            line += "，**大牛股，策略全部跑输持股，此股应持股不动而非做T**"
+            line += "，本区间有策略跑赢匹配基准"
         elif max_exc < -1:
-            line += "，策略整体跑输持股，需谨慎"
+            line += "，本区间策略均跑输匹配基准"
         else:
-            line += "，策略与持股基本相当"
+            line += "，相对匹配基准的增量有限"
         if len(g) > 1 and worst_s["总收益%"] < best_s["总收益%"] - 3:
             line += f"；最差策略「{worst_s['策略']}」{worst_s['总收益%']:+.2f}%（差{best_s['总收益%']-worst_s['总收益%']:.1f}pct）"
         lines.append(line)

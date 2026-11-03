@@ -93,7 +93,9 @@ def run_strategy(sid, df, code):
             params["trade_shares"] = max(100, int(base * 0.1) // 100 * 100)
         params["max_position"] = max(base * 2, base + 100)
     r = s.run(df, init, params, {"code": code})
-    return {"ret": r.total_return * 100, "mdd": r.max_drawdown * 100, "trades": len(r.trades)}
+    from core.metrics import benchmark_comparison
+    return {"ret": r.total_return * 100, "mdd": r.max_drawdown * 100, "trades": len(r.trades),
+            "relative": benchmark_comparison(r, df)["增量收益%"]}
 
 
 def run_period(code, sid, start, end):
@@ -106,7 +108,7 @@ def run_period(code, sid, start, end):
         if res is None:
             return None
         res["stock_ret"] = stock_ret
-        res["relative"] = res["ret"] - stock_ret
+        res["full_stock_opportunity_cost"] = res["ret"] - stock_ret
         res["regime"] = regime(stock_ret)
         return res
     except Exception:

@@ -11,7 +11,8 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from itertools import groupby
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -161,11 +162,15 @@ def _params_for(cfg, code: str, sid: str, first_price: float) -> dict:
         if ov:
             params.update(ov)
             _LOGGER.info("[H57] %s×%s 应用配置覆盖: %s", code, sid, ov)
+    if sid in ("intraday_t", "sentiment_t"):
+        from core.strategy_params import normalize_t_params
+        params = normalize_t_params(params)
     return params
 
 
 def _code_symbol(code: str) -> str:
-    return f"{code}.SH" if code.startswith("68") else f"{code}.SZ"
+    suffix = "SH" if code.startswith(("60", "68")) else "BJ" if code.startswith(("43", "83", "87", "88", "92")) else "SZ"
+    return f"{code}.{suffix}"
 
 
 def _risk(cfg=None) -> RiskManager:
@@ -375,7 +380,7 @@ class Observer:
 def _engine_for(obs: Observer, df: pd.DataFrame):
     obs.params.setdefault("warmup_end", str(_trade_start_date(getattr(obs, "cfg", None)).date()))
     if obs.strategy_id == "grid_trade":
-        return GridSharedLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id, df=df)
+        return GridSharedLiveEngine(obs.symbol, obs.params, strategy_id=obs.strategy_id, df=df, broker_driven=True)
     if obs.strategy_id == "intraday_t":
         # H65：与 grid 同构（都吃 df 做 prepare），复权在引擎内部走 prepare_signal_prices
         return IntradayTSharedLiveEngine(obs.symbol, obs.params,
@@ -459,6 +464,10 @@ def _build_observers() -> List[Observer]:
         existing_broker = obs.store.load()
         if existing_broker is not None:
             obs.broker = existing_broker
+            # 风控以当前配置生效；账户收益基准沿用实际账本的期初资金。
+            if cfg is not None:
+                obs.broker.risk_manager = _risk(cfg)
+            obs.initial_cash = obs.broker.account.initial_cash
             obs.load_watermark()
             obs.load_signals()
             # 引擎重建后先恢复引擎状态，再恢复账户状态。
@@ -511,7 +520,8 @@ def _with_price_limits(full_df: pd.DataFrame, new_df: pd.DataFrame,
 
 
 def _process_new_bars(obs: Observer, df: pd.DataFrame,
-                      ledger: "cross_risk.CrossSymbolLedger | None" = None) -> dict:
+                      ledger: "cross_risk.CrossSymbolLedger | None" = None,
+                      ) -> dict:
     if df.empty:
         return {"new_bars": 0}
     # 只处理未处理过的 bar。H47：按「当日最高时刻」判定 —— 与全量集合语义等价，
@@ -537,15 +547,19 @@ def _process_new_bars(obs: Observer, df: pd.DataFrame,
     for _, row in new_df.iterrows():
         obs._mark_processed(pd.Timestamp(row["time"]))
     obs.save_watermark()
-    # 累积信号并落盘，供收盘后做信号对比。
-    if obs.signal_path is not None and replay.signal_log:
-        with obs.signal_path.open("a", encoding="utf-8") as fh:
-            for item in replay.signal_log:
-                item = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
-                        for k, v in item.items()}
-                fh.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
-        obs.signals.extend(replay.signal_log)
+    _append_replay_signals(obs, replay.signal_log)
     return {"new_bars": len(new_df), "signals": len(replay.signal_log)}
+
+
+def _append_replay_signals(obs: Observer, signals) -> None:
+    if not signals:
+        return
+    if obs.signal_path is not None:
+        with obs.signal_path.open("a", encoding="utf-8") as fh:
+            for item in signals:
+                record = {k: v.isoformat() if hasattr(v, "isoformat") else v for k, v in item.items()}
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    obs.signals.extend(signals)
 
 
 def _obs_key(obs: Observer) -> str:
@@ -559,18 +573,7 @@ def _gate_for(obs: Observer, ledger: "cross_risk.CrossSymbolLedger | None"):
     """
     if ledger is None:
         return None
-    key = _obs_key(obs)
-
-    def _gate(signal, price, own_shares) -> bool:
-        ok = ledger.check(signal.symbol, int(signal.quantity), float(price), key,
-                          own_shares, strategy_id=obs.strategy_id,
-                          at=str(getattr(signal, "signal_time", "")))
-        if not ok:
-            _LOGGER.warning("[H73] %s 买入 %s 股被跨策略闸门拒绝（合计超单标上限）",
-                            key, signal.quantity)
-        return ok
-
-    return _gate
+    return cross_risk.PortfolioGate(ledger, _obs_key(obs), obs.broker, obs.strategy_id)
 
 
 def _build_cross_ledger(observers: List[Observer]):
@@ -586,27 +589,79 @@ def _build_cross_ledger(observers: List[Observer]):
     base = float(getattr(cfg, "initial_cash", None) or 0)
     if base <= 0:
         return None
-    ledger = cross_risk.CrossSymbolLedger(cap, base)
+    risk = _risk(cfg).config
+    ledger = cross_risk.CrossSymbolLedger(cap, base,
+        max_account_position_pct=risk.max_account_position_pct,
+        max_daily_loss_pct=risk.max_daily_loss_pct)
     for obs in observers:
+        ledger.bind(_obs_key(obs), obs.broker)
         pos = obs.broker.account.positions.get(obs.symbol) if obs.broker is not None else None
         ledger.update(_obs_key(obs), obs.symbol,
                       int(getattr(pos, "quantity", 0) or 0) if pos is not None else 0)
     return ledger
 
 
-def _run_once(observers: List[Observer], out) -> Dict[str, dict]:
+def live_quote_time() -> datetime:
+    """行情时间是无时区的交易所本地时间；不依赖主机的时区设置。"""
+    return datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+
+def _run_once(observers: List[Observer], out, *, quote_now=None) -> Dict[str, dict]:
     summary = {}
-    # H73：整轮开始前给所有观察者建一次台账（未配置 ⇒ None ⇒ 不装闸）
     ledger = _build_cross_ledger(observers)
-    for obs in observers:
-        df = _load_live(obs.code)
-        result = _process_new_bars(obs, df, ledger=ledger)
-        if ledger is not None and obs.broker is not None:
-            pos = obs.broker.account.positions.get(obs.symbol)
-            ledger.update(_obs_key(obs), obs.symbol,
-                          int(getattr(pos, "quantity", 0) or 0) if pos is not None else 0)
-        summary[f"{obs.code}×{obs.strategy_id}"] = {
-            "新bar": result.get("new_bars", 0),
+    loaded = {}
+    events = []
+    replays = []
+    for rank, obs in enumerate(observers):
+        # 数据使用分钟起点标签；新鲜度从该分钟完成时刻开始计算。
+        risk_clock = quote_now - timedelta(minutes=1) if quote_now is not None else None
+        replay = OfflineReplayEngine(obs.broker, gate=_gate_for(obs, ledger), quote_now=risk_clock)
+        replays.append(replay)
+        if obs.code not in loaded:
+            loaded[obs.code] = _load_live(obs.code)
+        df = loaded[obs.code]
+        if df.empty:
+            continue
+        times = pd.to_datetime(df["time"])
+        # 不用补录旧bar倒拨账户。快照水位和旧版独立水位都识别。
+        persisted = obs.broker.replay_upto.get(obs.symbol)
+        latest = max(obs.day_upto.values(), default=None)
+        if persisted:
+            latest = max(latest, pd.Timestamp(persisted)) if latest else pd.Timestamp(persisted)
+        eligible = pd.Series(True, index=df.index) if latest is None else times > latest
+        if quote_now is not None:
+            completed = times + pd.Timedelta(minutes=1)
+            # QMT/AD 对齐口径把14:57的成交并入14:56，须等两分钟都结束。
+            merged = (times.dt.hour == 14) & (times.dt.minute == 56)
+            completed = completed + pd.to_timedelta(merged.astype(int), unit="min")
+            eligible &= completed <= quote_now
+        pending = df[eligible]
+        pending = _with_price_limits(df, pending, obs.symbol)
+        if not pending.empty:
+            for _, row in replay.normalize_bars(pending).iterrows():
+                events.append((row["time"], rank, row))
+    # 同分钟先统一处理开盘撮合，再统一更新收盘价并生成新订单。
+    for _, group in groupby(sorted(events, key=lambda item: (item[0], item[1])),
+                            key=lambda item: item[0]):
+        active = []
+        for ts, rank, row in group:
+            obs, replay = observers[rank], replays[rank]
+            started = replay.begin_bar(row, obs.symbol)
+            if started is not None:
+                active.append((obs, replay, *started))
+        for _, replay, _, opening in active:
+            replay.match_pending(opening)
+        closings = [replay.mark_close(bar, obs.symbol) for obs, replay, bar, _ in active]
+        for (obs, replay, bar, opening), closing in zip(active, closings):
+            replay.finish_bar(bar, opening, closing, obs.engine.on_bar)
+            obs._mark_processed(pd.Timestamp(bar["time"]))
+    for obs, replay in zip(observers, replays):
+        if replay.processed_bars:
+            obs.store.save(obs.broker)
+            obs.save_watermark()
+            _append_replay_signals(obs, replay.signal_log)
+        summary[_obs_key(obs)] = {
+            "新bar": replay.processed_bars,
             "累计订单": len(obs.broker.orders),
             "累计成交": len(obs.broker.fills),
             "账户权益": round(obs.broker.account.equity(), 2),
@@ -832,7 +887,7 @@ def main() -> None:
     out = OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
     while True:
-        summary = _run_once(observers, out)
+        summary = _run_once(observers, out, quote_now=live_quote_time())
         for obs in observers:
             equity = obs.broker.account.equity()
             obs.day_high_equity = max(obs.day_high_equity, equity)

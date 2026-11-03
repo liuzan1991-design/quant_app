@@ -24,7 +24,7 @@ def _chart_download(fig, name: str, key: str) -> None:
         st.caption(f"PNG 导出暂不可用：{e}")
 
 
-def _metric_row(result, stock_ret: float) -> None:
+def _metric_row(result, stock_ret: float, incremental: float | None = None) -> None:
     def cls(v: float) -> str:
         return "up" if v > 0 else ("down" if v < 0 else "flat")
 
@@ -35,7 +35,8 @@ def _metric_row(result, stock_ret: float) -> None:
         ("最大回撤", f"{result.max_drawdown*100:.2f}%", "down"),
         ("卡玛比率", f"{result.calmar:.2f}" if np.isfinite(result.calmar) else "n/a", "flat"),
         ("股票涨跌幅", f"{stock_ret:+.2f}%", cls(stock_ret)),
-        ("策略超额", f"{excess:+.2f}%", cls(excess)),
+        ("相对基准增量", f"{incremental:+.2f}%" if incremental is not None else "n/a", cls(incremental or 0)),
+        ("全仓机会成本差", f"{excess:+.2f}%", cls(excess)),
         ("交易次数", f"{result.buy_count+result.sell_count}", "flat"),
         ("T胜率", f"{result.t_win_rate:.1f}%" if result.t_sell_count else "n/a", "flat"),
         ("平均资金占用", f"{result.avg_exposure*100:.1f}%", "flat"),
@@ -55,9 +56,10 @@ def render_overview(result, df: pd.DataFrame, code: str = "", start: str = "",
     daily = metrics.daily_t_summary(result)
     attr = metrics.attribution(result, df, daily)
     pf = metrics.profit_factor(result)
+    comparison = metrics.benchmark_comparison(result, df)
 
     # ① 指标卡行
-    _metric_row(result, stock_ret)
+    _metric_row(result, stock_ret, comparison["增量收益%"])
     st.divider()
 
     # ② 权益曲线（对齐线框图：主图 + 图例）
@@ -80,6 +82,8 @@ def render_overview(result, df: pd.DataFrame, code: str = "", start: str = "",
         eq["日期"] = pd.to_datetime(eq["time"]).dt.date
         last = eq.groupby("日期")["equity"].last().reset_index()
         last["当日收益"] = last["equity"].pct_change()
+        if len(last):
+            last.loc[last.index[0], "当日收益"] = last["equity"].iloc[0] / result.init_cash - 1
         st.dataframe(last.tail(20).sort_values("日期", ascending=False),
                      hide_index=True, width="stretch")
 
@@ -88,22 +92,26 @@ def render_overview(result, df: pd.DataFrame, code: str = "", start: str = "",
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.markdown('<div class="sub-title">收益归因（总收益 ≈ 底仓收益 + T净收益 − 费用）</div>',
+        st.markdown('<div class="sub-title">收益归因（含未平仓浮盈亏，费用只扣一次）</div>',
                     unsafe_allow_html=True)
         attr_df = pd.DataFrame([
             {"项目": "底仓收益", "金额(元)": round(attr["底仓收益"], 2)},
             {"项目": "累计T净收益", "金额(元)": round(attr["累计T净收益"], 2)},
+            {"项目": "未实现T盈亏", "金额(元)": round(attr["未实现T盈亏"], 2)},
             {"项目": "其他费用", "金额(元)": round(attr["其他费用"], 2)},
             {"项目": "合计(≈)", "金额(元)": round(attr["合计(≈)"], 2)},
             {"项目": "实际净值变化", "金额(元)": round(attr["实际净值变化"], 2)},
+            {"项目": "未解释差额", "金额(元)": round(attr["未解释差额"], 2)},
         ])
         st.dataframe(attr_df, hide_index=True, width="stretch")
+        if not attr["对账通过"]:
+            st.warning("归因未闭合：请核查公司行为、资金流或缺失交易，不将差额计为策略收益。")
         st.caption(f"累计手续费 {result.total_fees:,.2f} 元 | 盈亏比 {pf:.2f}" if np.isfinite(pf) else
                    f"累计手续费 {result.total_fees:,.2f} 元 | 盈亏比 n/a")
     with c2:
-        st.markdown('<div class="sub-title">策略 vs 持股不动</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub-title">策略与匹配基准</div>', unsafe_allow_html=True)
         st.caption(f"策略期末 {result.final_equity:,.0f} 元 | "
-                   f"超额收益 {attr['实际净值变化'] - attr['底仓收益']:+,.0f} 元")
+                   f"相对基准增量 {result.init_cash * comparison['增量收益%'] / 100:+,.0f} 元")
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -265,7 +273,7 @@ def render_batch(result_df) -> None:
         st.info("在左侧【批量回测（多股×多策略）】面板选择股票和策略，"
                 "点击【开始批量回测】。不在预置池的代码可手动输入（逗号分隔），会自动拉数据。")
         return
-    st.caption("股票涨跌幅 = 区间内价格涨幅；超额收益 = 策略收益 − 股票涨跌幅")
+    st.caption("超额收益 = 策略收益 − 同底仓（波段用配置仓位）加现金基准；全仓机会成本差另列。基准按同费率建仓，现金不计息，未提供的公司行为不计入。")
     st.markdown('<div class="sub-title">📝 批量分析总结</div>', unsafe_allow_html=True)
     summary = summarize_batch(result_df)
     st.code(summary, language=None)

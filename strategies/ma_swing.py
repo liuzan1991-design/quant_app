@@ -186,7 +186,7 @@ class MaSwingStrategy(BaseStrategy):
         total_return = final_equity / init_cash - 1
         days = int(df["date"].nunique())
         annual = (1 + total_return) ** (252 / max(days, 1)) - 1 if total_return > -1 else -1.0
-        peak = eq["equity"].cummax()
+        peak = eq["equity"].cummax().clip(lower=init_cash)
         mdd = float(((eq["equity"] - peak) / peak).min())
         calmar = annual / abs(mdd) if mdd < 0 else float("nan")
         buys = trades_df[trades_df["direction"] == "BUY"]

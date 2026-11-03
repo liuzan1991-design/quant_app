@@ -251,7 +251,7 @@ class GridTradeStrategy(BaseStrategy):
         days = int(pd.to_datetime(df["time"]).dt.date.nunique())
         annual = (1 + total_return) ** (252 / max(days, 1)) - 1
         eq2 = eq.copy()
-        peak = eq2["equity"].cummax()
+        peak = eq2["equity"].cummax().clip(lower=init_cash)
         dd = (eq2["equity"] - peak) / peak
         mdd = float(dd.min())
         calmar = annual / abs(mdd) if mdd < 0 else float("nan")

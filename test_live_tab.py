@@ -19,7 +19,6 @@ import pytest
 from ui import live_tab
 
 APP = Path(__file__).resolve().parent
-LIVE_ROOT = APP / "live_outputs"
 SRC = APP / "ui" / "live_tab.py"
 
 
@@ -57,12 +56,15 @@ def test_collect_status_survives_corrupt_json(tmp_path: Path) -> None:
     assert got["units"][0]["summary"] == {}
 
 
-def test_collect_status_reads_real_live_outputs() -> None:
-    """真实目录：能读到心跳与至少一个观察单元（只读，不改）。"""
-    got = live_tab.collect_status(LIVE_ROOT)
-    assert got["heartbeat"] is not None, "live_outputs/heartbeat.json 应可读"
-    assert "last_success_at" in got["heartbeat"]
-    assert got["units"], "应至少有一个 标的/策略 单元"
+def test_collect_status_reads_heartbeat_and_unit(tmp_path: Path) -> None:
+    """用与生产相同的目录结构，支持在没有运行实例的副本里回归。"""
+    heartbeat = {"last_success_at": "2026-11-03T13:26:00", "status": "running"}
+    (tmp_path / "heartbeat.json").write_text(json.dumps(heartbeat), encoding="utf-8")
+    _mk_unit(tmp_path, sym="301717.SZ", sid="intraday_t", summary={"equity": 300000})
+    got = live_tab.collect_status(tmp_path)
+    assert got["heartbeat"] == heartbeat
+    assert [(unit["symbol"], unit["strategy"]) for unit in got["units"]] == [
+        ("301717.SZ", "intraday_t")]
 
 
 def test_collect_status_skips_logs_and_underscore_dirs(tmp_path: Path) -> None:

@@ -57,12 +57,19 @@ def norm_ppf(p: float) -> float:
 
 
 # ── 基础绩效 ──
-def daily_returns(equity: pd.Series, times: pd.Series | None = None) -> pd.Series:
+def daily_returns(equity: pd.Series, times: pd.Series | None = None,
+                  initial_cash: float | None = None) -> pd.Series:
     """从（分钟级）权益曲线取**日末**权益，再算日收益。"""
     s = pd.Series(equity.values, index=pd.DatetimeIndex(times)) if times is not None \
         else pd.Series(equity.values, index=pd.DatetimeIndex(equity.index))
-    daily = s.groupby(s.index.normalize()).last()
-    return daily.pct_change().dropna()
+    daily = s.sort_index().groupby(s.index.normalize()).last()
+    ret = daily.pct_change()
+    if initial_cash is not None:
+        if initial_cash <= 0:
+            raise ValueError("期初资金必须大于0")
+        if len(ret):
+            ret.iloc[0] = daily.iloc[0] / initial_cash - 1
+    return ret.dropna()
 
 
 def annualized_return(returns: pd.Series, periods: int = TRADING_DAYS_PER_YEAR) -> float:
@@ -207,19 +214,21 @@ def bh_fdr(pvalues: list[float] | np.ndarray, alpha: float = 0.05) -> dict:
 
 
 def summarize(equity: pd.Series, times: pd.Series | None = None,
-              rf: float = 0.0) -> dict:
+              rf: float = 0.0, *, initial_cash: float | None = None) -> dict:
     """一次算全：日收益 → 年化/波动/Sharpe/Sortino/MDD/Calmar。"""
-    ret = daily_returns(equity, times)
+    ret = daily_returns(equity, times, initial_cash)
     eq_daily = pd.Series(equity.values, index=pd.DatetimeIndex(times)) if times is not None \
         else pd.Series(equity.values, index=pd.DatetimeIndex(equity.index))
-    eq_daily = eq_daily.groupby(eq_daily.index.normalize()).last()
+    eq_daily = eq_daily.sort_index().groupby(eq_daily.index.normalize()).last()
+    starting = initial_cash if initial_cash is not None else (float(eq_daily.iloc[0]) if len(eq_daily) else 0)
+    dd_equity = pd.Series([initial_cash, *eq_daily.to_list()]) if initial_cash is not None else eq_daily
     return {
         "days": int(len(ret)),
         "annual_return": annualized_return(ret),
         "annual_vol": annualized_vol(ret),
         "sharpe": sharpe(ret, rf),
         "sortino": sortino(ret, rf),
-        "max_drawdown": max_drawdown(eq_daily),
-        "calmar": calmar(eq_daily, ret),
-        "total_return": float(eq_daily.iloc[-1] / eq_daily.iloc[0] - 1) if len(eq_daily) > 1 else 0.0,
+        "max_drawdown": max_drawdown(dd_equity),
+        "calmar": calmar(dd_equity, ret),
+        "total_return": float(eq_daily.iloc[-1] / starting - 1) if len(eq_daily) and starting > 0 else 0.0,
     }

@@ -11,15 +11,36 @@ from strategies.base import BacktestResult
 
 
 def buy_and_hold_equity(result: BacktestResult, df: pd.DataFrame) -> pd.Series:
-    """持股不动基准：期初以建仓价买入底仓股数，持有至期末；剩余现金不动、无费用。"""
-    if result.base_price is None or result.base_shares <= 0:
+    """同初始底仓+现金基准；波段使用其配置仓位。现金不计息，不含未提供的公司行为。
+
+    用真实价格，按同费率计入建仓费用。全仓价格涨跌另列为机会成本比较。
+    """
+    if result.equity.empty or df.empty:
         return pd.Series(dtype=float)
-    base_cost = result.base_price * result.base_shares
-    idle_cash = result.init_cash - base_cost
-    if idle_cash < 0:
-        idle_cash = 0.0
-    closes = df.set_index("time")["close"]
-    return (idle_cash + result.base_shares * closes).reindex(result.equity["time"]).ffill()
+    times = pd.DatetimeIndex(pd.to_datetime(result.equity["time"]))
+    closes = df.assign(time=pd.to_datetime(df["time"])).set_index("time")["close"]
+    closes = closes[~closes.index.duplicated(keep="last")].sort_index()
+    aligned = closes.reindex(times, method="ffill")
+    price = float(result.base_price or aligned.iloc[0])
+    shares = int(result.base_shares)
+    if shares <= 0 and "position_pct" in result.params:
+        shares = int(result.init_cash * float(result.params["position_pct"]) / 100 / price) // 100 * 100
+    if shares <= 0:
+        return pd.Series(result.init_cash, index=times, dtype=float)
+    p = result.params
+    entry = price if result.base_price else price * (1 + float(p.get("slippage_bps", 0)) / 10000)
+    value = entry * shares
+    fee = max(float(p.get("min_commission", 0)), value * float(p.get("commission_rate", 0)))
+    fee += value * float(p.get("transfer_fee_rate", 0))
+    return (result.init_cash - value - fee + shares * aligned).rename("同底仓基准")
+
+
+def benchmark_comparison(result: BacktestResult, df: pd.DataFrame) -> dict:
+    bh = buy_and_hold_equity(result, df)
+    baseline = float(bh.iloc[-1] / result.init_cash - 1) * 100 if len(bh) else 0.0
+    return {"基准收益%": baseline,
+            "增量收益%": result.total_return * 100 - baseline,
+            "全仓机会成本差%": result.total_return * 100 - stock_return(df)}
 
 
 def daily_t_summary(result: BacktestResult) -> pd.DataFrame:
@@ -55,20 +76,54 @@ def t_pnl_series(result: BacktestResult) -> pd.Series:
 
 
 def attribution(result: BacktestResult, df: pd.DataFrame, daily: pd.DataFrame) -> dict:
-    """收益归因：总收益 ≈ 底仓收益 + 累计T净收益 − 其他费用。"""
-    base_pnl = 0.0
-    if result.base_price is not None:
-        base_pnl = (df["close"].iloc[-1] - result.base_price) * result.base_shares
-    total_t_net = float(daily["T净收益"].sum()) if len(daily) else 0.0
-    other_fees = float(result.total_fees) - (float(daily["手续费"].sum()) if len(daily) else 0.0)
+    """用实际交易重建底仓/T仓的已实现和未实现盈亏，费用只扣一次。
+
+    无法由交易记录解释的公司行为/资金流/不完整历史单列差额，不把差额冒充T浮盈。
+    """
+    price = float(result.equity["close"].iloc[-1] if "close" in result.equity else df["close"].iloc[-1])
+    trades = result.trades.sort_values("time", kind="stable") if len(result.trades) else result.trades
+    lots = []  # [成交单价, 股数, 是否底仓]，手续费最后统一扣除
+    has_base_fill = bool(len(trades) and ((trades["direction"] == "BUY") &
+                         trades["reason"].astype(str).str.contains("底仓")).any())
+    if result.base_price is not None and result.base_shares > 0 and not has_base_fill:
+        lots.append([float(result.base_price), int(result.base_shares), True])
+    base_realized = t_realized = t_fees = 0.0
+    for _, trade in trades.iterrows():
+        qty, px = int(trade["shares"]), float(trade["price"])
+        fee = float(trade["fee"]) if pd.notna(trade.get("fee")) else 0.0
+        if trade["direction"] == "BUY":
+            base_held = sum(q for _, q, base in lots if base)
+            base_qty = min(qty, max(0, result.base_shares - base_held)) if "底仓" in str(trade.get("reason", "")) else 0
+            if base_qty:
+                lots.append([px, base_qty, True])
+            if qty > base_qty:
+                lots.append([px, qty - base_qty, False])
+                t_fees += fee * (qty - base_qty) / qty
+        elif trade["direction"] == "SELL":
+            remaining = qty
+            for is_base in (False, True):
+                for lot in lots:
+                    if lot[2] == is_base and remaining:
+                        take = min(lot[1], remaining)
+                        pnl = (px - lot[0]) * take
+                        if is_base:
+                            base_realized += pnl
+                        else:
+                            t_realized += pnl
+                            t_fees += fee * take / qty
+                        lot[1] -= take
+                        remaining -= take
+            lots = [lot for lot in lots if lot[1]]
+    base_pnl = base_realized + sum((price - px) * qty for px, qty, base in lots if base)
+    unrealized_t = sum((price - px) * qty for px, qty, base in lots if not base)
+    t_net = t_realized - t_fees
+    other_fees = float(result.total_fees) - t_fees
+    total = base_pnl + t_net + unrealized_t - other_fees
     net_pnl = float(result.final_equity - result.init_cash)
-    return {
-        "底仓收益": base_pnl,
-        "累计T净收益": total_t_net,
-        "其他费用": -other_fees,
-        "合计(≈)": base_pnl + total_t_net - other_fees,
-        "实际净值变化": net_pnl,
-    }
+    residual = net_pnl - total
+    return {"底仓收益": base_pnl, "累计T净收益": t_net, "未实现T盈亏": unrealized_t,
+            "其他费用": -other_fees, "合计": total, "合计(≈)": total,
+            "实际净值变化": net_pnl, "未解释差额": residual, "对账通过": abs(residual) < .01}
 
 
 def profit_factor(result: BacktestResult) -> float:
@@ -82,10 +137,12 @@ def profit_factor(result: BacktestResult) -> float:
 
 def monthly_returns(result: BacktestResult) -> pd.DataFrame:
     """按月收益矩阵（年 × 月），用于热力图。"""
-    eq = result.equity.copy()
+    eq = result.equity.sort_values("time").copy()
     eq["ym"] = pd.to_datetime(eq["time"]).dt.to_period("M")
     last = eq.groupby("ym")["equity"].last()
-    ret = last.pct_change().fillna(0.0) * 100
+    ret = last.pct_change() * 100
+    if len(ret):
+        ret.iloc[0] = (last.iloc[0] / result.init_cash - 1) * 100
     df = pd.DataFrame({"ym": ret.index.astype(str), "ret": ret.values})
     df["year"] = df["ym"].str[:4]
     df["month"] = df["ym"].str[5:7].astype(int)
@@ -133,8 +190,8 @@ def build_summary_text(result: BacktestResult, df: pd.DataFrame, stock: str,
     cap = capital_efficiency(result)
     adj = detect_suspect_adj_dates(df)
 
-    verdict = "做T创造正超额收益，策略优于持股不动" if excess > 0.05 \
-        else ("做T收益与持股不动基本相当" if excess > -0.05 else "做T拖累收益，当前参数不如持股不动")
+    verdict = "本区间策略收益高于匹配基准" if excess > 0.05 \
+        else ("本区间策略收益与匹配基准接近" if excess > -0.05 else "本区间策略收益低于匹配基准")
     pf_str = f"{pf:.2f}" if pf != float("inf") else "∞"
     fee_per_trade = result.total_fees / len(result.trades) if len(result.trades) else 0.0
     mtd_avg_fee = f"{fee_per_trade:.2f} 元"
@@ -163,10 +220,11 @@ def build_summary_text(result: BacktestResult, df: pd.DataFrame, stock: str,
         "",
         "【收益归因】",
         f"底仓收益 {attr['底仓收益']:+,.2f} 元 ｜ 累计T净收益 {attr['累计T净收益']:+,.2f} 元",
+        f"未实现T盈亏 {attr['未实现T盈亏']:+,.2f} 元 ｜ 未解释差额 {attr['未解释差额']:+,.2f} 元",
         f"累计手续费 {result.total_fees:,.2f} 元 ｜ 实际净值变化 {attr['实际净值变化']:+,.2f} 元",
         "",
         "【基准对比】",
-        f"持股不动收益 {bh_ret:+.2f}% ｜ 策略超额 {excess:+.2f} 个百分点",
+        f"匹配基准收益 {bh_ret:+.2f}% ｜ 策略增量 {excess:+.2f} 个百分点",
         f"结论：{verdict}",
         "",
         "【T交易质量】",
@@ -228,13 +286,13 @@ def advanced_stats(result: BacktestResult, df: pd.DataFrame) -> dict:
                 sig[name] += 1
     top_signals = sig.most_common(5)
 
-    # 月度表现（排除首月，因 pct_change 起点为 0）
+    # 月度表现，含真实首月及零收益月份。
     mtx = monthly_returns(result)
     flat = []
     for y in mtx.index:
         for mth in mtx.columns:
             v = mtx.loc[y, mth]
-            if pd.notna(v) and abs(v) > 1e-9:
+            if pd.notna(v):
                 flat.append((f"{y}-{mth:02d}", float(v)))
     best_m = max(flat, key=lambda x: x[1]) if flat else None
     worst_m = min(flat, key=lambda x: x[1]) if flat else None
@@ -242,7 +300,7 @@ def advanced_stats(result: BacktestResult, df: pd.DataFrame) -> dict:
 
     # 回撤详情
     eq = result.equity.reset_index(drop=True)
-    peak = eq["equity"].cummax()
+    peak = eq["equity"].cummax().clip(lower=result.init_cash)
     dd = (eq["equity"] - peak) / peak
     trough_i = int(dd.idxmin())
     start_i = 0

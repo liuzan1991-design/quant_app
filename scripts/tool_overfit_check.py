@@ -60,8 +60,8 @@ def run_one(sid: str, df: pd.DataFrame, params: dict) -> dict:
     strat = get_strategy(sid)
     r = strat.run(df.copy(), 1_000_000.0, params, {"code": "300308"})
     eq = pd.Series(r.equity["equity"].to_numpy(), index=pd.DatetimeIndex(r.equity["time"]))
-    m = pf.summarize(eq)
-    ret = pf.daily_returns(eq)
+    m = pf.summarize(eq, initial_cash=r.init_cash)
+    ret = pf.daily_returns(eq, initial_cash=r.init_cash)
     sr = float(ret.mean() / ret.std(ddof=1)) if len(ret) > 1 and ret.std(ddof=1) > 0 else 0.0
     skew = float(ret.skew()) if len(ret) > 2 else 0.0
     kurt = float(ret.kurtosis() + 3.0) if len(ret) > 3 else 3.0

@@ -82,7 +82,7 @@ def equity_chart(result: BacktestResult, df: pd.DataFrame) -> go.Figure:
 
 def drawdown_chart(result: BacktestResult) -> go.Figure:
     eq = result.equity
-    peak = eq["equity"].cummax()
+    peak = eq["equity"].cummax().clip(lower=result.init_cash)
     dd = (eq["equity"] - peak) / peak * 100
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=eq["time"], y=dd, fill="tozeroy", name="回撤(%)",

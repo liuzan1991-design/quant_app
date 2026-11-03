@@ -1,16 +1,7 @@
 # -*- coding: utf-8 -*-
-"""H9 五项 P0 安全缺口的回归测试（测试先行，只复现、不改生产行为）。
-
-对应《量化研究规范_纠偏记录.md》H9 条目。
-本文件的性质说明（H77 修复后 P0-2 已转为正向验收，其余仍是缺陷复现）：
-- 这些测试**断言的是"缺陷存在"**，即断言当前（有缺陷的）行为。
-- 因此它们**不是**"修复后应保持通过"的测试，而是**缺陷看门狗**：
-  一旦 P0 被修复，对应用例会**失败**——这正是期望行为，提示"H9 已修复，请更新测试语义"。
-- 观察期内**只运行、只记录**，不因此修改生产代码。
-"""
+"""H9 风控验收：行情时钟、T+1、续成风控、止损计数和配置上限。"""
 from __future__ import annotations
 
-import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -46,14 +37,14 @@ def _loose_risk() -> RiskManager:
                                   max_symbol_cumulative_loss_pct=1.0))
 
 
-def test_p0_1_live_contract_makes_quote_delay_always_zero():
-    """P0-1：live 契约下 now == market.timestamp ⇒ 延迟恒为 0，120 秒阈值永不触发。"""
+def test_p0_1_offline_replay_uses_logical_clock():
+    """离线回放可以用历史逻辑时钟，实时时钟的验收见 execution_risk_accounting。"""
     ts = NOW
     broker = PaperBroker(1_000_000, "2026-09-18")
     snapshot = _snap(ts=ts)
-    # 复刻 paper_replay.py:102 的调用契约：ts 同时充当 now 与 snapshot.timestamp
+    # 离线调用以历史时点作为 now，不拿当前日期拦截整段历史行情。
     delay = max(0.0, (ts - snapshot.timestamp).total_seconds())
-    assert delay == 0.0, "live 契约下延迟应为 0（此断言即缺陷本身）"
+    assert delay == 0.0
 
     order = broker.submit_order(_req("h9-p1-fresh", OrderSide.BUY, 100), snapshot, ts)
     assert order.status.value == "FILLED", "延迟 0 时不应被 stale_quote 拦下"
@@ -91,8 +82,8 @@ def test_p0_2_risk_and_match_agree_on_sellable_quantity():
     assert (pos.quantity, pos.sellable_quantity, pos.today_bought_quantity) == (100, 0, 100)
 
 
-def test_p0_3_partial_fill_continuation_bypasses_risk_recheck():
-    """P0-3：部分成交后跨 bar 续成不重新过风控 ⇒ 单日亏损停机线可被绕过。"""
+def test_p0_3_partial_fill_continuation_rechecks_risk():
+    """亏损熔断后撤销旧买单余量，持仓仍可合法减仓。"""
     broker = PaperBroker(1_000_000, "2026-09-18",
                          risk_manager=RiskManager(RiskConfig(max_symbol_position_pct=1.0,
                                                             max_account_position_pct=1.0,
@@ -107,35 +98,37 @@ def test_p0_3_partial_fill_continuation_bypasses_risk_recheck():
 
     # 注意：first 与返回的 order 是同一对象，必须先取 filled_quantity 快照再比较
     continued = broker.match_order("h9-p3", _snap(volume=10_000_000), NOW + timedelta(minutes=1))
-    assert continued.filled_quantity > filled_before, \
-        "停机线已触发仍继续成交 ⇒ 续成绕过风控（缺陷本身）"
+    assert continued.filled_quantity == filled_before
+    assert continued.status.value == "CANCELLED"
+    assert not list(broker.pending_orders())
+    next_day = NOW + timedelta(days=3)
+    broker.start_new_trading_day(next_day.date().isoformat())
+    broker.account.daily_realized_pnl = -500_000.0
+    reducing = broker.submit_order(_req("h9-reduce", OrderSide.SELL, 100),
+                                   _snap(ts=next_day), next_day)
+    assert reducing.status.value == "FILLED"
 
 
-def test_p0_4_stop_loss_streak_has_no_production_caller():
-    """P0-4：生产代码无 record_stop_loss 调用点 ⇒ 连续止损熔断永不触发。
+def test_p0_4_actual_stop_loss_partial_fills_count_once():
+    from dataclasses import replace
 
-    扫描范围：项目内 .py，排除 ① 测试文件 ② 缓存/备份目录 ③ 以 `_` 开头的临时探针脚本
-    （本次核查新建的 `_h9_verify_p0.py` 就属此类——它自身会引用这两个函数名，
-    若不排除会让本用例自我误报，首版即踩此坑）。
-    """
-    callers = []
-    for path in APP_DIR.rglob("*.py"):
-        name = path.name
-        if name.startswith("test_") or name.startswith("_"):
-            continue
-        if "__pycache__" in str(path) or "_h8_backup" in str(path):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            continue
-        for match in re.finditer(r"\brecord_stop_loss\b|\brecord_profitable_exit\b", text):
-            line_start = text.rfind("\n", 0, match.start()) + 1
-            line = text[line_start:text.find("\n", match.start())]
-            if re.match(r"\s*def\s", line):
-                continue  # 排除定义行
-            callers.append(f"{path.relative_to(APP_DIR)}:{text[:match.start()].count(chr(10)) + 1}")
-    assert callers == [], f"生产代码应无调用点（缺陷本身），实际发现：{callers}"
+    risk = _loose_risk()
+    risk.config = replace(risk.config, stop_loss_streak_limit=1)
+    broker = PaperBroker(1_000_000, "2026-09-18", risk_manager=risk,
+                         config=PaperBrokerConfig(slippage_bps=0))
+    broker.account.positions[SYMBOL] = Position(
+        symbol=SYMBOL, quantity=200, sellable_quantity=200,
+        average_cost=110.0, market_price=100.0)
+    req = replace(_req("stop", OrderSide.SELL, 200), reason="T仓位止损")
+    order = broker.submit_order(req, _snap(volume=1000), NOW)
+    assert order.status.value == "PARTIALLY_FILLED"
+    assert broker.account.consecutive_stop_losses[SYMBOL] == 1
+    later = NOW + timedelta(minutes=1)
+    broker.match_order("stop", _snap(volume=1000, ts=later), later)
+    assert order.status.value == "FILLED"
+    assert broker.account.consecutive_stop_losses[SYMBOL] == 1
+    buy = broker.submit_order(_req("reentry", OrderSide.BUY, 100), _snap(ts=later), later)
+    assert "暂停至" in buy.reject_reason
 
 
 def test_p0_4_gate_works_when_manually_invoked():
@@ -195,11 +188,11 @@ def test_p0_5_ma_swing_first_signal_blocked_above_threshold():
 
 if __name__ == "__main__":
     tests = [
-        test_p0_1_live_contract_makes_quote_delay_always_zero,
+        test_p0_1_offline_replay_uses_logical_clock,
         test_p0_1_rule_itself_is_alive,
-        test_p0_2_risk_and_match_disagree_on_sellable_quantity,
-        test_p0_3_partial_fill_continuation_bypasses_risk_recheck,
-        test_p0_4_stop_loss_streak_has_no_production_caller,
+        test_p0_2_risk_and_match_agree_on_sellable_quantity,
+        test_p0_3_partial_fill_continuation_rechecks_risk,
+        test_p0_4_actual_stop_loss_partial_fills_count_once,
         test_p0_4_gate_works_when_manually_invoked,
         test_p0_5_position_gate_blocks_grid_add_on,
         test_p0_5_ma_swing_first_signal_blocked_above_threshold,
@@ -207,4 +200,4 @@ if __name__ == "__main__":
     for test in tests:
         test()
         print(f"PASS {test.__name__}")
-    print(f"\nH9 缺陷看门狗：{len(tests)} 项全部复现（说明 5 项 P0 仍存在）")
+    print(f"\nH9 风控验收：{len(tests)} 项通过")

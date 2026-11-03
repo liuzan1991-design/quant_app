@@ -80,6 +80,8 @@ class LiveConfig:
     # 四策略跑同一只票相当于 4 倍资金 —— 纸面能跑，实盘同一账户会叠加，接实盘前必须开）。
     # 启用后：同一标的在**所有策略合计**的持仓市值不得超过 cross_symbol_cap × initial_cash。
     cross_symbol_cap: Optional[float] = None
+    # 只对明确配置的标的限制买入。其他启用策略继续观察和管理已有仓位。
+    entry_owner_by_code: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -92,6 +94,7 @@ class LiveConfig:
             "paper_start_date": self.paper_start_date,
             "kline_source": self.kline_source,
             "cross_symbol_cap": self.cross_symbol_cap,
+            "entry_owner_by_code": dict(self.entry_owner_by_code),
         }
 
 
@@ -107,7 +110,7 @@ def validate(cfg: LiveConfig) -> list[str]:
     """返回错误列表（空 = 通过）。**不抛异常**，便于 UI 直接展示。"""
     from strategies import STRATEGIES
 
-    errs: list[str] = []
+    errs = _entry_owner_errors(cfg)
 
     if not (0 < float(cfg.risk_pct) <= 1):
         errs.append(f"risk_pct 必须在 (0, 1] 内，当前 {cfg.risk_pct}")
@@ -178,6 +181,17 @@ def validate(cfg: LiveConfig) -> list[str]:
     return errs
 
 
+def _entry_owner_errors(cfg: LiveConfig) -> list[str]:
+    owners = cfg.entry_owner_by_code
+    if not isinstance(owners, dict):
+        return ["entry_owner_by_code 必须为证券代码到策略ID的映射"]
+    enabled = {(p.code, p.strategy_id) for p in cfg.positions if p.enabled}
+    return [f"entry_owner_by_code[{code!r}] 必须指向该标的已启用的策略"
+            for code, owner in owners.items()
+            if not isinstance(code, str) or not CODE_RE.fullmatch(code)
+            or not isinstance(owner, str) or (code, owner) not in enabled]
+
+
 # ── 读写 ─────────────────────────────────────────────────────────────────────
 
 def from_dict(d: dict) -> LiveConfig:
@@ -187,7 +201,7 @@ def from_dict(d: dict) -> LiveConfig:
                         param_overrides=dict(p.get("param_overrides") or {}),
                         note=str(p.get("note", "")))
            for p in (d.get("positions") or [])]
-    return LiveConfig(version=int(d.get("version", SCHEMA_VERSION)),
+    cfg = LiveConfig(version=int(d.get("version", SCHEMA_VERSION)),
                       updated_at=str(d.get("updated_at", "")),
                       initial_cash=d.get("initial_cash"),
                       risk_pct=float(d.get("risk_pct", 0.10)),
@@ -197,7 +211,12 @@ def from_dict(d: dict) -> LiveConfig:
                                         if d.get("paper_start_date") else None),
                       kline_source=str(d.get("kline_source") or "qmt").strip().lower(),
                       cross_symbol_cap=(float(d["cross_symbol_cap"])
-                                        if d.get("cross_symbol_cap") is not None else None))
+                                        if d.get("cross_symbol_cap") is not None else None),
+                      entry_owner_by_code=d.get("entry_owner_by_code", {}))
+    errors = _entry_owner_errors(cfg)
+    if errors:
+        raise ValueError("；".join(errors))
+    return cfg
 
 
 def load(path: Path | None = None) -> LiveConfig | None:

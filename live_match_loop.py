@@ -126,6 +126,7 @@ def _record_applied_config(cfg, combos) -> None:
             "initial_cash": (cfg.initial_cash if cfg is not None else None),
             "risk_pct": (cfg.risk_pct if cfg is not None else None),
             "risk": (dict(cfg.risk) if cfg is not None else {}),
+            "entry_owner_by_code": dict(getattr(cfg, "entry_owner_by_code", {})),
         }
         LIVE_DIR.mkdir(parents=True, exist_ok=True)
         (LIVE_DIR / "config_applied.json").write_text(
@@ -567,13 +568,12 @@ def _obs_key(obs: Observer) -> str:
 
 
 def _gate_for(obs: Observer, ledger: "cross_risk.CrossSymbolLedger | None"):
-    """H73：把「跨策略台账」包装成回放引擎要的 `gate(signal, price, own_shares) -> bool`。
-
-    ledger 为 None（未配置 cross_symbol_cap）⇒ 返回 None ⇒ 回放不装闸，行为不变。
-    """
-    if ledger is None:
-        return None
-    return cross_risk.PortfolioGate(ledger, _obs_key(obs), obs.broker, obs.strategy_id)
+    """开仓资格与跨策略额度分别执行，卖出继续走实际账户风控。"""
+    portfolio = (cross_risk.PortfolioGate(ledger, _obs_key(obs), obs.broker, obs.strategy_id)
+                 if ledger is not None else None)
+    owners = getattr(getattr(obs, "cfg", None), "entry_owner_by_code", {})
+    owner = owners.get(obs.code) if owners else None
+    return cross_risk.EntryObservationGate(owner, portfolio) if owner and owner != obs.strategy_id else portfolio
 
 
 def _build_cross_ledger(observers: List[Observer]):
@@ -641,10 +641,17 @@ def _run_once(observers: List[Observer], out, *, quote_now=None) -> Dict[str, di
             for _, row in replay.normalize_bars(pending).iterrows():
                 events.append((row["time"], rank, row))
     # 同分钟先统一处理开盘撮合，再统一更新收盘价并生成新订单。
-    for _, group in groupby(sorted(events, key=lambda item: (item[0], item[1])),
+    cancelled_buys = [0] * len(observers)
+    for ts, group in groupby(sorted(events, key=lambda item: (item[0], item[1])),
                             key=lambda item: item[0]):
+        batch = list(group)
+        active_symbols = {observers[rank].symbol for _, rank, _ in batch}
+        # 先释放观察策略旧买单，再复核执行策略，避免策略顺序影响冻结额度。
+        for rank, (obs, replay) in enumerate(zip(observers, replays)):
+            if obs.symbol in active_symbols:
+                cancelled_buys[rank] += replay.cancel_observation_buys(obs.symbol, ts.to_pydatetime())
         active = []
-        for ts, rank, row in group:
+        for _, rank, row in batch:
             obs, replay = observers[rank], replays[rank]
             started = replay.begin_bar(row, obs.symbol)
             if started is not None:
@@ -655,9 +662,10 @@ def _run_once(observers: List[Observer], out, *, quote_now=None) -> Dict[str, di
         for (obs, replay, bar, opening), closing in zip(active, closings):
             replay.finish_bar(bar, opening, closing, obs.engine.on_bar)
             obs._mark_processed(pd.Timestamp(bar["time"]))
-    for obs, replay in zip(observers, replays):
-        if replay.processed_bars:
+    for rank, (obs, replay) in enumerate(zip(observers, replays)):
+        if replay.processed_bars or cancelled_buys[rank]:
             obs.store.save(obs.broker)
+        if replay.processed_bars:
             obs.save_watermark()
             _append_replay_signals(obs, replay.signal_log)
         summary[_obs_key(obs)] = {
@@ -665,6 +673,8 @@ def _run_once(observers: List[Observer], out, *, quote_now=None) -> Dict[str, di
             "累计订单": len(obs.broker.orders),
             "累计成交": len(obs.broker.fills),
             "账户权益": round(obs.broker.account.equity(), 2),
+            "仅观察买入信号": sum(s["order_status"] == "OBSERVE_ONLY" for s in replay.signal_log),
+            "观察模式撤销旧买单": cancelled_buys[rank],
         }
     if ledger is not None and ledger.rejects:
         summary["跨策略闸门拒绝"] = {"笔数": len(ledger.rejects),
@@ -717,13 +727,14 @@ def _compare_signals(obs: Observer) -> dict:
             "direction": request.side.value if request else s["side"],
             "shares": int(request.quantity if request else s["quantity"]),
             "filled": int(order.filled_quantity if order else s.get("filled_quantity") or 0),
+            "observe_only": s.get("order_status") == "OBSERVE_ONLY",
         })
     for order_id, order in orders.items():
         if order_id not in present:
             live.append({"time": pd.Timestamp(order.request.created_at),
                          "direction": order.request.side.value,
                          "shares": int(order.request.quantity),
-                         "filled": int(order.filled_quantity)})
+                         "filled": int(order.filled_quantity), "observe_only": False})
     live_df = pd.DataFrame(live)
     base_df = _base_signals(obs)
 
@@ -738,14 +749,16 @@ def _compare_signals(obs: Observer) -> dict:
                                suffixes=("_base", "_live"), indicator=True)
         matched = int((merged["_merge"] == "both").sum())
         engine_consistency = matched / max(len(base_df), len(live_df))
-    if len(live_df):
-        execution_loss = float((live_df["shares"] - live_df["filled"]).clip(lower=0).sum()
-                               / max(live_df["shares"].sum(), 1))
+    executable = live_df.loc[~live_df["observe_only"]] if len(live_df) else live_df
+    if len(executable):
+        execution_loss = float((executable["shares"] - executable["filled"]).clip(lower=0).sum()
+                               / max(executable["shares"].sum(), 1))
     return {
         "engine_consistency": None if engine_consistency is None else round(engine_consistency, 6),
         "execution_loss": None if execution_loss is None else round(execution_loss, 6),
         "base_signals": len(base_df),
         "live_signals": len(live_df),
+        "observed_buy_signals": len(live_df) - len(executable),
         "comparison_basis": "signal_time+side+requested_shares",
         "execution_loss_basis": "unfilled_requested_shares",
     }

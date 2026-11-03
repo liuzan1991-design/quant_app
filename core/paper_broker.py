@@ -38,8 +38,8 @@ class PaperBrokerConfig:
 
 
 _ALLOWED_TRANSITIONS = {
-    OrderStatus.SIGNAL: {OrderStatus.PENDING_SUBMIT, OrderStatus.REJECTED},
-    OrderStatus.PENDING_SUBMIT: {OrderStatus.SUBMITTED, OrderStatus.REJECTED},
+    OrderStatus.SIGNAL: {OrderStatus.PENDING_SUBMIT, OrderStatus.REJECTED, OrderStatus.CANCELLED},
+    OrderStatus.PENDING_SUBMIT: {OrderStatus.SUBMITTED, OrderStatus.REJECTED, OrderStatus.CANCELLED},
     OrderStatus.SUBMITTED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED,
                             OrderStatus.CANCELLED, OrderStatus.UNKNOWN},
     OrderStatus.PARTIALLY_FILLED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED,

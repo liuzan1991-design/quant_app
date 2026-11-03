@@ -124,11 +124,27 @@ class OfflineReplayEngine:
         self.broker.mark_to_market(snapshot)
         return bar, snapshot
 
+    def cancel_observation_buys(self, symbol, ts):
+        """切换为观察时，撤销旧买单的未成交部分，释放冻结额度。"""
+        if not getattr(self.gate, "observe_only", False):
+            return 0
+        count = 0
+        for order in list(self.broker.pending_orders()):
+            request = order.request
+            if (request.symbol == symbol and request.side == OrderSide.BUY
+                    and (order.updated_at or request.created_at) <= ts):
+                self.broker.cancel_order(request.client_order_id, ts, self.gate.last_rejection)
+                count += 1
+        return count
+
     def match_pending(self, snapshot):
         ts, symbol = snapshot.timestamp, snapshot.symbol
+        self.cancel_observation_buys(symbol, ts)
         for order_id, order in list(self.broker.orders.items()):
             if (order.request.symbol != symbol or order.status not in
                     {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED}):
+                continue
+            if getattr(self.gate, "observe_only", False) and order.request.side == OrderSide.BUY:
                 continue
             if self.execution_mode == "next_bar" and ts <= order.request.created_at:
                 continue
@@ -164,8 +180,11 @@ class OfflineReplayEngine:
             if (signal.side == OrderSide.BUY and self.gate is not None and not
                     self.gate(signal, decision.last_price, self._own_shares(symbol))):
                 reason = getattr(self.gate, "last_rejection", "跨策略单标上限")
-                self._record_signal(signal, reason=f"{signal.reason}|{reason}拒绝",
-                                    status=OrderStatus.REJECTED.value)
+                if getattr(self.gate, "observe_only", False):
+                    self._record_signal(signal, reason=f"{signal.reason}|{reason}", status="OBSERVE_ONLY")
+                else:
+                    self._record_signal(signal, reason=f"{signal.reason}|{reason}拒绝",
+                                        status=OrderStatus.REJECTED.value)
                 continue
             order = self.broker.submit_order(
                 SignalOrderAdapter.to_order(signal), decision, ts,

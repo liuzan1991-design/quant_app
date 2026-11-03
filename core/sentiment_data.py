@@ -188,6 +188,20 @@ def compute_sector_status(daily_df: pd.DataFrame) -> str:
     return "flat"
 
 
+def sector_status_by_close(daily_df: pd.DataFrame) -> dict:
+    """每个行业日线收盘独立给出状态；调用方只可使用早于交易日的状态。"""
+    if daily_df.empty:
+        return {}
+    daily = daily_df.assign(day=pd.to_datetime(daily_df["time"]).dt.date)
+    close = (daily.sort_values("time").drop_duplicates("day", keep="last")
+             .set_index("day")["close"].astype(float))
+    up = close.rolling(5).mean() > close.rolling(20).mean()
+    change = close.pct_change(fill_method=None) * 100
+    strong = (up & (change > .1)) | (change > .5)
+    weak = (~up & (change < -.1)) | (change < -.5)
+    return dict(zip(close.index, np.select([strong, weak], ["strong", "weak"], default="flat")))
+
+
 def compute_trend_mode(df: pd.DataFrame, ma_fast: int = 5, ma_slow: int = 10,
                        ma_trend: int = 20) -> Dict:
     """个股日线趋势模式：hold=多头排列（持股防卖飞）、defense=空头排列（禁买）、

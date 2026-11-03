@@ -170,3 +170,19 @@ class PortfolioGate:
     def check_order(self, order, price):
         return self._check(order.request.symbol, order.remaining_quantity, price,
                            order.request.created_at, order.request.client_order_id)
+
+
+class EntryObservationGate:
+    """该观察单元只记录买入意图。卖单仍共用原有分钟成交量预算。"""
+
+    observe_only = True
+
+    def __init__(self, owner, portfolio=None):
+        self.last_rejection = f"仅观察买入(开仓策略={owner})"
+        self.portfolio = portfolio
+
+    def __call__(self, signal, price, own_shares):
+        return False
+
+    def other_volume_used(self, symbol, ts):
+        return self.portfolio.other_volume_used(symbol, ts) if self.portfolio else 0

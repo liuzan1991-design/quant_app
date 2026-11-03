@@ -2,13 +2,13 @@
 """大盘情绪做T严格增量引擎。
 
 复用已通过 95% 门禁的 `IntradayTSharedEngine`，仅把大盘状态、指数涨跌、
-个股趋势模式作为逐bar上下文注入。信号生成逻辑与快速路径 `run_backtest`
-一致；情绪/趋势数据在启动前一次性预计算，回放阶段只做查找，不产生未来数据。
-生产指定 broker_driven=True，历史模拟成交不进入生产状态。
+个股趋势模式作为逐bar上下文注入。生产模式按已完成的日线日期取上下文；
+历史参考模式保留旧逻辑，用于与快速路径核对。
 """
 from __future__ import annotations
 
 import sys
+from bisect import bisect_left, insort
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -53,6 +53,10 @@ class SentimentTSharedLiveEngine(BrokerDrivenTMixin):
         self._status_map: Dict[pd.Timestamp, str] = {}
         self._chg_map: Dict[pd.Timestamp, float] = {}
         self._mode_map: Dict[object, str] = {}
+        self._sector_closes: dict = {}
+        self._sector_days: list = []
+        self._stock_closes: dict = {}
+        self._session_days: list = []
         self._indicator: Dict[pd.Timestamp, dict] = {}
         self._vwap: Dict[pd.Timestamp, float] = {}
         self._prepared = False
@@ -61,13 +65,91 @@ class SentimentTSharedLiveEngine(BrokerDrivenTMixin):
         if df is not None:
             self.prepare(df)
 
+    @staticmethod
+    def _is_session_close(ts):
+        # 项目分钟线通常用14:59标记最后一分钟，兼容15:00的结束时刻标签。
+        return (ts.hour, ts.minute) in {(14, 59), (15, 0)}
+
+    def _update_trend_at_closes(self):
+        if self._stock_closes and self.params.get("trend_mode", True):
+            daily = pd.DataFrame({"time": pd.to_datetime(list(self._stock_closes)),
+                                  "signal_close": list(self._stock_closes.values())})
+            self._mode_map = sentiment_data.compute_trend_mode(
+                daily, ma_trend=int(self.params.get("trend_ma", 20)))
+
+    def _prepare_causal_context(self, prepared, start, end):
+        self._session_days = sorted(set(prepared["time"].dt.date))
+        if not self.params.get("enable_sentiment_filter", True):
+            return
+        index_code = self.params.get("index_code", "399006.SZ")
+        try:
+            index = sentiment_data.load_index_min(index_code, start, end)
+            index = index.sort_values("time").drop_duplicates("time", keep="last")
+            self._status_map, self._chg_map = sentiment_data.compute_market_status(index)
+        except Exception:
+            pass
+
+        if self.params.get("use_sector", True) and self._code:
+            try:
+                industry = sentiment_data.get_stock_industry_index(self._code)
+                if industry:
+                    warmup = (pd.Timestamp(start) - pd.Timedelta(days=60)).date().isoformat()
+                    daily = sentiment_data.load_industry_daily(industry, warmup, end)
+                    self._sector_closes = sentiment_data.sector_status_by_close(daily)
+                    self._sector_days = sorted(self._sector_closes)
+            except Exception:
+                pass
+        if self.params.get("trend_mode", True):
+            closing = prepared.loc[prepared["time"].map(self._is_session_close)]
+            self._stock_closes = dict(zip(closing["time"].dt.date, closing["signal_close"]))
+            self._update_trend_at_closes()
+
+    def _set_causal_context(self, ts):
+        day = ts.date()
+        i = bisect_left(self._session_days, day)
+        prior_session = self._session_days[i - 1] if i else None
+        if i == len(self._session_days) or self._session_days[i] != day:
+            insort(self._session_days, day)
+        mode = self._mode_map.get(prior_session, "range")
+        status = self._status_map.get(ts, "flat")
+        sector_i = bisect_left(self._sector_days, day)
+        if ts in self._status_map and sector_i:
+            previous_sector_day = self._sector_days[sector_i - 1]
+            # 缓存缺上一交易日时回到原指数状态，避免旧行业方向跨日反复生效。
+            if prior_session is not None and previous_sector_day >= prior_session:
+                sector = self._sector_closes[previous_sector_day]
+                if sector == "weak" and status != "crash":
+                    status = "weak"
+                elif sector == "strong" and status in ("flat", "strong"):
+                    status = "strong"
+        if ts in self._status_map and mode == "defense" and status != "crash":
+            status = "weak"
+        self.engine.set_context(status, self._chg_map.get(ts, 0.0), mode)
+
+    def _ingest_session_close(self, ts, bar):
+        if (self.params.get("enable_sentiment_filter", True)
+                and self.params.get("trend_mode", True)
+                and self._is_session_close(ts) and ts not in self._indicator):
+            self._stock_closes[ts.date()] = float(bar.get("signal_close", bar["close"]))
+            self._update_trend_at_closes()
+
     def prepare(self, df: pd.DataFrame) -> None:
         if self._prepared:
             return
         p = self.params
         prepared, _events, _adj = prepare_signal_prices(df, self._code)
+        prepared = prepared.sort_values("time", kind="stable").reset_index(drop=True)
         start = pd.Timestamp(prepared["time"].iloc[0]).strftime("%Y-%m-%d")
         end = pd.Timestamp(prepared["time"].iloc[-1]).strftime("%Y-%m-%d")
+        if self.broker_driven:
+            self._prepare_causal_context(prepared, start, end)
+        else:
+            self._prepare_reference_context(prepared, start, end)
+
+        self._prepare_indicators(prepared)
+
+    def _prepare_reference_context(self, prepared, start, end):
+        p = self.params
         index_code = p.get("index_code", "399006.SZ")
         try:
             idx = sentiment_data.load_index_min(index_code, start, end)
@@ -108,6 +190,8 @@ class SentimentTSharedLiveEngine(BrokerDrivenTMixin):
         self._chg_map = chg_map
         self._mode_map = mode_map
 
+    def _prepare_indicators(self, prepared):
+        p = self.params
         closes_all = prepared["signal_close"].to_numpy(float)
         highs_all = prepared["signal_high"].to_numpy(float)
         lows_all = prepared["signal_low"].to_numpy(float)
@@ -153,11 +237,13 @@ class SentimentTSharedLiveEngine(BrokerDrivenTMixin):
         ts = pd.Timestamp(bar["time"])
         if not self._prepared:
             raise RuntimeError("SentimentTSharedLiveEngine.prepare(df) 未调用")
-        day = ts.date()
-        self.engine.set_context(
-            index_status=self._status_map.get(ts, "flat"),
-            index_change_pct=self._chg_map.get(ts, 0.0),
-            day_mode=self._mode_map.get(day, "range"))
+        if self.broker_driven:
+            self._set_causal_context(ts)
+        else:
+            self.engine.set_context(
+                index_status=self._status_map.get(ts, "flat"),
+                index_change_pct=self._chg_map.get(ts, 0.0),
+                day_mode=self._mode_map.get(ts.date(), "range"))
         if ts in self._indicator:
             indicator = self._indicator[ts]
             vwap = self._vwap[ts]
@@ -173,6 +259,8 @@ class SentimentTSharedLiveEngine(BrokerDrivenTMixin):
             )
         trade = (self._broker_trade(bar, _broker, indicator, vwap) if self.broker_driven
                  else self.engine.on_bar(bar, self.account, indicator, vwap))
+        if self.broker_driven:
+            self._ingest_session_close(ts, bar)
         if not trade:
             return ()
         side = OrderSide.BUY if trade["direction"] == "BUY" else OrderSide.SELL

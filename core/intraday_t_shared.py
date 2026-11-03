@@ -89,6 +89,8 @@ class IntradayTSharedEngine:
         self._day_mode = "range"
 
     def set_context(self, index_status="flat", index_change_pct=0.0, day_mode="range"):
+        if not self.params.get("enable_sentiment_filter", True):
+            index_status, index_change_pct, day_mode = "flat", 0.0, "range"
         self._bar_index_status = index_status
         self._bar_index_change_pct = float(index_change_pct)
         self._day_mode = day_mode
@@ -268,7 +270,7 @@ class IntradayTSharedEngine:
         confirm = 2 if vol_level == "high" else 1
         should, score, details = bg.evaluate_sell(
             indicator["closes"], indicator["volumes"], macd, confirm,
-            indicator["sig_high"], vol_level, indicator["rsi"],
+            indicator["sig_high"] and p.get("enable_nine_turn", True), vol_level, indicator["rsi"],
             float(self._bar_index_change_pct),
             self._bar_index_status, p)
         return should, score, bg.signal_summary(details)
@@ -281,7 +283,8 @@ class IntradayTSharedEngine:
         confirm = 2 if vol_level == "high" else 1
         should, score, details = bg.evaluate_buy(
             indicator["closes"], indicator["volumes"], macd, confirm,
-            indicator["sig_low"], indicator["rsi"], self.state.sell_lowest_price,
+            indicator["sig_low"] and p.get("enable_nine_turn", True), indicator["rsi"],
+            self.state.sell_lowest_price if p.get("enable_sell_buyback", True) else 0.0,
             price, p)
         return should, score, bg.signal_summary(details), details
 

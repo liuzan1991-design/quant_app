@@ -27,6 +27,18 @@ import time
 
 # Leave empty to auto-detect. Fill only if auto-detect finds nothing.
 MANUAL_ACCOUNT = ''
+try:
+    import os as _os
+    for _p in (r'C:\Users\27329\qmt_account_id.txt',
+               r'C:\Users\27329\qmt_account.txt'):
+        if _os.path.exists(_p):
+            _f = open(_p)
+            MANUAL_ACCOUNT = _f.read().strip()
+            _f.close()
+            if MANUAL_ACCOUNT:
+                break
+except Exception:
+    pass
 
 CODE = '301717.SZ'
 # A symbol with a known ex-dividend / split history, used to detect
@@ -232,17 +244,35 @@ def _acct_section(ContextInfo):
     if not ids:
         _w('SKIP: no account id candidate. Re-run in LIVE mode to get this section.')
         return
+
+    setacc = getattr(ContextInfo, 'set_account', None)
+    _w('ContextInfo.set_account available: %s' % ('YES' if callable(setacc) else 'NO'))
+
     for tag, aid in ids:
-        for dtype in ('ACCOUNT', 'POSITION'):
+        _w('--- try id %s (len=%d) ---' % (_mask(aid), len(aid)))
+        if callable(setacc):
             try:
-                rows = get_trade_detail_data(aid, 'stock', dtype)
-                n = 0 if rows is None else len(rows)
-                _w('%-10s %-9s id=%-16s rows=%d' % (tag, dtype, aid, n))
-                if rows:
-                    _dump_fields(dtype, rows[0])
+                setacc(aid)
+                _w('set_account -> ok')
             except Exception as e:
-                _w('%-10s %-9s id=%-16s FAIL %s: %s'
-                   % (tag, dtype, aid, type(e).__name__, e))
+                _w('set_account -> FAIL %s: %s' % (type(e).__name__, e))
+        seen = {}
+        for atype in ('stock', 'STOCK', 'credit', 'future'):
+            for dtype in ('ACCOUNT', 'POSITION', 'ORDER', 'DEAL'):
+                if atype != 'stock' and dtype != 'ACCOUNT':
+                    continue
+                try:
+                    rows = get_trade_detail_data(aid, atype, dtype)
+                    n = 0 if rows is None else len(rows)
+                except Exception as e:
+                    _w('  %-7s %-9s FAIL %s: %s'
+                       % (atype, dtype, type(e).__name__, e))
+                    continue
+                _w('  %-7s %-9s rows=%d' % (atype, dtype, n))
+                if n and dtype not in seen:
+                    seen[dtype] = True
+                    _dump_fields(dtype, rows[0])
+        _w('  local now=%s' % time.strftime('%Y-%m-%d %H:%M:%S'))
 
 
 def _dump_fields(dtype, obj):
@@ -254,4 +284,6 @@ def _dump_fields(dtype, obj):
         except Exception:
             continue
         if isinstance(v, (int, float, str)):
-            _w('    %s.%s = %s' % (dtype, attr, v))
+            low = attr.lower()
+            shown = _mask(v) if ('accountid' in low or 'accountkey' in low) else v
+            _w('    %s.%s = %s' % (dtype, attr, shown))

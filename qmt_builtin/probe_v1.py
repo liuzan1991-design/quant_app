@@ -11,7 +11,7 @@
 import sys
 import os
 
-ACCOUNT_ID = '66035016052'      # <-- REPLACE with your full fund account
+ACCOUNT_ID = ''      # <-- REPLACE with your full fund account
 CODE = '301717.SZ'
 
 

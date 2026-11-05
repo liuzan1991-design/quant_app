@@ -30,3 +30,5 @@ _tmp*.py
 # 系统
 .DS_Store
 Thumbs.db
+# 告警配置含 SMTP 授权码，绝不入库
+data/alert_config.json

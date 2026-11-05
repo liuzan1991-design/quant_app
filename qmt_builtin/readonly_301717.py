@@ -36,7 +36,8 @@ ORDER_FNS = (
     'cancel', 'do_order',
 )
 
-_STATE = {'bars': 0, 'guard': [], 'acct': '', 'last_ts': '', 'dup': 0}
+_STATE = {'bars': 0, 'guard': [], 'acct': '', 'last_ts': '', 'dup': 0,
+          'tail_date': ''}
 
 
 # ---------------- output (print only) ----------------
@@ -232,10 +233,48 @@ def init(ContextInfo):
        'pos_vol,pos_sellable,avail,signal,ticks')
 
 
+def tail_prev_day(C):
+    """Backfill the last two bars of the previous trading day.
+
+    WHY: after the close no new tick arrives, so handlebar stops firing and
+    the final bar can never be promoted to "completed" (2026-11-05 lost
+    AD 14:58 and 14:59). The only usable moment is the next session, when
+    those bars are already final. Runs once per trading day, memory flag
+    only, nothing written to disk.
+    """
+    for k in (1, 2, 3, 4, 5):
+        d = time.strftime('%Y%m%d', time.localtime(time.time() - 86400 * k))
+        df = get_bars(C, d, d)
+        if df is None or len(df) < 2:
+            continue
+        for i in (-2, -1):
+            try:
+                row = df.iloc[i]
+                idx = df.index[i]
+                _w('TAIL,%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.0f'
+                   % (str(idx), to_beijing(idx, '%Y-%m-%d'), to_beijing(idx),
+                      float(row['open']), float(row['high']), float(row['low']),
+                      float(row['close']), float(row['volume'])))
+            except Exception:
+                pass
+        _w('# tail backfill done for %s (%d bars)' % (d, len(df)))
+        return
+    _w('# tail backfill: no prev-day data found within 5 days')
+
+
 def handlebar(ContextInfo):
     _STATE['bars'] += 1
 
     today = time.strftime('%Y%m%d')
+
+    # once per trading day: backfill previous session's tail bars
+    if _STATE['tail_date'] != today:
+        _STATE['tail_date'] = today
+        try:
+            tail_prev_day(ContextInfo)
+        except Exception as e:
+            _w('# tail backfill FAIL %s: %s' % (type(e).__name__, e))
+
     df = get_bars(ContextInfo, today, today)
     if df is None:
         df = get_bars(ContextInfo, '', '')

@@ -32,12 +32,13 @@ def log_path(date: str) -> Path:
     return QMT_LOG_DIR / ("XtClient_FormulaOutput_%s.log" % date)
 
 
-def extract(logfile: Path) -> tuple[list[str], list[str]]:
-    """返回 (元信息行, 数据行)。"""
+def extract(logfile: Path) -> tuple[list[str], list[str], list[str]]:
+    """返回 (元信息行, 数据行, 尾盘补录行)。"""
     meta: list[str] = []
     rows: list[str] = []
+    tails: list[str] = []
     if not logfile.exists():
-        return meta, rows
+        return meta, rows, tails
     for raw in logfile.read_text(encoding="utf-8", errors="replace").splitlines():
         payload = None
         if "output = " in raw:
@@ -51,7 +52,9 @@ def extract(logfile: Path) -> tuple[list[str], list[str]]:
         payload = payload.rstrip()
         if not payload:
             continue
-        if payload[0].isdigit():
+        if payload.startswith("TAIL,"):
+            tails.append(payload)
+        elif payload[0].isdigit():
             rows.append(payload)
         else:
             meta.append(payload)
@@ -65,7 +68,7 @@ def extract(logfile: Path) -> tuple[list[str], list[str]]:
             order.append(key)
         last[key] = r
     uniq: list[str] = [last[k] for k in order]
-    return meta, uniq
+    return meta, uniq, tails
 
 
 def main() -> int:
@@ -79,7 +82,7 @@ def main() -> int:
         print("日志不存在: %s" % lp)
         return 2
 
-    meta, rows = extract(lp)
+    meta, rows, tails = extract(lp)
     if not rows:
         print("日志里没有 [RO] 数据行: %s" % lp)
         for m in meta[:10]:
@@ -101,10 +104,23 @@ def main() -> int:
             w.writerow(r.split(","))
             n += 1
 
+    tail_out = None
+    if tails:
+        tail_out = OUT_DIR / ("ro_tail_%s.csv" % args.date)
+        with tail_out.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["bar_ts", "bj_date", "bj_time", "open", "high",
+                        "low", "close", "vol"])
+            for r in tails:
+                w.writerow(r.split(",")[1:])
+
     print("日志: %s" % lp)
     print("元信息 %d 条，数据行 %d 条 -> %s" % (len(meta), n, out))
     print("首根: %s" % rows[1].split(",")[2:4])
     print("末根: %s" % rows[-1].split(",")[2:4])
+    if tail_out is not None:
+        print("尾盘补录 %d 根 -> %s" % (len(tails), tail_out))
+        print("  尾部: %s" % [t.split(",")[1:4] for t in tails])
     return 0
 
 

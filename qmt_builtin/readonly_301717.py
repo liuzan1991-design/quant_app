@@ -21,7 +21,9 @@
 
 import time
 
-CODE = '301717.SZ'
+CODE = '300319.SZ'   # 300319 = Majie Technology (ChiNext, listed 2012-05-23)
+                     # switching instrument = change this one line only;
+                     # the deployed file name stays RO_301717.py
 ACCOUNT_ID_HARD = ''
 
 # order-sending globals that must never be callable in this file
@@ -230,7 +232,7 @@ def init(ContextInfo):
 
     _w('# hb=RO  parse these lines externally, last line age = liveness')
     _w('bar,bar_ts,bj_date,bj_time,open,high,low,close,vol,day_cum,'
-       'pos_vol,pos_sellable,avail,signal,ticks')
+       'pos_vol,pos_sellable,avail,signal,ticks,code')
 
 
 def tail_prev_day(C):
@@ -315,8 +317,8 @@ def handlebar(ContextInfo):
     a = acct_snapshot()
     sig = shadow_signal(df.iloc[:-1])
 
-    _w('%d,%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.0f,%.0f,%d,%d,%.2f,%s,%d'
+    _w('%d,%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.0f,%.0f,%d,%d,%.2f,%s,%d,%s'
        % (_STATE['bars'], str(idx), to_beijing(idx, '%Y-%m-%d'),
           to_beijing(idx), o, h, lo, px, bvol, cum,
           p.get('vol', 0), p.get('sellable', 0),
-          a.get('m_dAvailable') or 0.0, sig, ticks))
+          a.get('m_dAvailable') or 0.0, sig, ticks, CODE))

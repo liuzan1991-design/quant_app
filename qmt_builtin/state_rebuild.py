@@ -61,6 +61,13 @@ def _quantity(value, name):
     return int(number)
 
 
+def _owner(order):
+    owner = order.get("owner")
+    _require(isinstance(owner, str) and bool(owner.strip()) and owner == owner.strip()
+             and owner.strip().lower() not in ("unknown", "unassigned", "none"), "order_owner_unverified")
+    return owner
+
+
 def _timestamp(value):
     result = datetime.fromisoformat(value)
     _require(result.tzinfo is not None, "timezone_required")
@@ -97,7 +104,11 @@ def _anchor(anchor, symbol, strategy_id, at):
     _require(abs(cash + sum(lot["quantity"] * lot["cost"] for lot in lots)
                  - INITIAL_EQUITY - realized) <= 0.01, "anchor_cash_cost_mismatch")
     external = _quantity(anchor["external_quantity"], "external_quantity")
-    return cutoff, cash, realized, lots, external
+    if external and cutoff.date() == at.date():
+        _require("external_bought_today" in anchor, "external_today_quantity_unverified")
+    external_today = _quantity(anchor.get("external_bought_today", 0), "external_bought_today")
+    _require(external_today <= external, "external_today_quantity_invalid")
+    return cutoff, cash, realized, lots, external, external_today
 
 
 def _coverage(coverage, cutoff, at):
@@ -110,7 +121,8 @@ def _coverage(coverage, cutoff, at):
              "coverage_interval_mismatch")
 
 
-def _replay(deals, order_map, anchor, cutoff, at, symbol, strategy_id, cash, realized, lots):
+def _replay(deals, order_map, anchor, cutoff, at, symbol, strategy_id, cash, realized, lots,
+            external, external_today):
     today_realized = 0.0
     fills_by_order = {}
     selected = []
@@ -123,17 +135,31 @@ def _replay(deals, order_map, anchor, cutoff, at, symbol, strategy_id, cash, rea
         _require(filled_at <= at, "future_deal")
         order = order_map.get(deal["order_id"])
         _require(order is not None, "orphan_deal")
-        _require(order["symbol"] == symbol and order["owner"] == strategy_id, "foreign_target_deal")
+        _require(order["symbol"] == symbol, "deal_order_symbol_mismatch")
+        _owner(order)
         _require(deal["side"] == order["side"], "deal_order_side_mismatch")
+        _require(deal["side"] in ("BUY", "SELL"), "unknown_side")
         quantity = _quantity(deal["quantity"], "deal_quantity")
         price = _money(deal["price"], "deal_price", 0)
-        fee = _money(deal["fee"], "deal_fee", 0)
+        fee = _money(deal["fee"], "deal_fee", 0) if order["owner"] == strategy_id else None
         _require(quantity > 0 and price > 0, "empty_deal")
         selected.append((filled_at, deal["trade_id"], deal, order, quantity, price, fee))
 
+    external_day = cutoff.date().isoformat()
     for filled_at, _, deal, order, quantity, price, fee in sorted(selected, key=lambda item: item[:2]):
         day = filled_at.date().isoformat()
+        if day != external_day:
+            external_today = 0
+            external_day = day
         fills_by_order[deal["order_id"]] = fills_by_order.get(deal["order_id"], 0) + quantity
+        if order["owner"] != strategy_id:
+            if deal["side"] == "BUY":
+                external += quantity
+                external_today += quantity
+            else:
+                _require(quantity <= external - external_today, "external_sale_exceeds_sellable_external")
+                external -= quantity
+            continue
         if deal["side"] == "BUY":
             reason = order["reason"]
             _require(isinstance(reason, str), "unclassified_buy")
@@ -157,12 +183,16 @@ def _replay(deals, order_map, anchor, cutoff, at, symbol, strategy_id, cash, rea
             if day == at.date().isoformat():
                 today_realized += profit
         _require(cash >= -0.01, "negative_strategy_cash")
-    return cash, realized, today_realized, lots, fills_by_order
+    if external_day != at.date().isoformat():
+        external_today = 0
+    return cash, realized, today_realized, lots, fills_by_order, external, external_today
 
 
-def _pending(order_map, fills_by_order, anchor, cutoff, at, symbol, strategy_id):
+def _pending(order_map, fills_by_order, anchor, cutoff, at, symbol, strategy_id, external, external_today):
     cash = sell_quantity = exposure = 0
     active = []
+    external_active = []
+    external_sell = 0
     previous_fills = anchor.get("order_fills", {})
     for order_id, order in sorted(order_map.items()):
         if order["symbol"] != symbol:
@@ -174,10 +204,9 @@ def _pending(order_map, fills_by_order, anchor, cutoff, at, symbol, strategy_id)
         quantity = _quantity(order["quantity"], "order_quantity")
         filled = _quantity(order["filled_quantity"], "filled_quantity")
         _require(quantity > 0 and filled <= quantity, "invalid_order_quantity")
-        if order["owner"] != strategy_id:
-            _require(status in FINAL_STATUSES, "foreign_active_target_order")
-            _require(not (inserted_at > cutoff and filled), "foreign_target_order_activity")
+        if inserted_at <= cutoff and order_id not in fills_by_order and status in FINAL_STATUSES:
             continue
+        _owner(order)
         _require(order["side"] in ("BUY", "SELL"), "unknown_side")
         if inserted_at > cutoff or order_id in fills_by_order or status in ACTIVE_STATUSES:
             if inserted_at <= cutoff:
@@ -190,6 +219,11 @@ def _pending(order_map, fills_by_order, anchor, cutoff, at, symbol, strategy_id)
             continue
         remaining = quantity - filled
         _require(remaining > 0, "active_order_without_remaining")
+        if order["owner"] != strategy_id:
+            external_active.append(order_id)
+            if order["side"] == "SELL":
+                external_sell += remaining
+            continue
         active.append(order_id)
         if order["side"] == "BUY":
             price = _money(order["limit_price"], "pending_price", 0)
@@ -199,12 +233,14 @@ def _pending(order_map, fills_by_order, anchor, cutoff, at, symbol, strategy_id)
             cash += remaining * price + fee
         else:
             sell_quantity += remaining
-    return cash, sell_quantity, exposure, active
+    _require(external_sell <= external - external_today, "external_pending_sale_exceeds_external")
+    return cash, sell_quantity, exposure, active, external_active
 
 
-def _risk(risk, equity, symbol, strategy_id, at):
-    _require(isinstance(risk, dict) and risk.get("verified") is True
-             and risk.get("history_complete") is True, "risk_history_unverified")
+def _risk(risk, equity, symbol, strategy_id, at, anchor, cutoff, orders):
+    _require(isinstance(risk, dict) and risk.get("verified") is True, "risk_history_unverified")
+    seed = risk.get("risk_seed", "risk_history_verified")
+    _require(seed in ("origin_initialized", "risk_history_verified"), "unknown_risk_seed")
     _require(risk["symbol"] == symbol and risk["strategy_id"] == strategy_id, "risk_scope_mismatch")
     _require(_timestamp(risk["as_of"]) == at and risk["trading_day"] == at.date().isoformat(),
              "risk_checkpoint_stale")
@@ -214,7 +250,20 @@ def _risk(risk, equity, symbol, strategy_id, at):
     _require(opening > 0 and peak >= max(equity, opening), "risk_peak_invalid")
     _require(type(risk["daily_loss_latched"]) is bool and type(risk["drawdown_latched"]) is bool,
              "risk_latch_missing")
+    if seed == "origin_initialized":
+        _require(risk.get("origin_verified") is True, "origin_not_verified")
+        _require(_timestamp(risk["strategy_start"]) == at and cutoff == at, "origin_seed_not_at_start")
+        _require(not anchor["lots"] and abs(anchor["cash"] - INITIAL_EQUITY) <= 0.01
+                 and anchor["realized_pnl"] == 0, "origin_not_zero_strategy_inventory")
+        _require(not any(order.get("owner") == strategy_id for order in orders.values()),
+                 "origin_has_strategy_orders")
+        _require(equity == opening == peak == INITIAL_EQUITY, "origin_equity_invalid")
+        _require(not risk["daily_loss_latched"] and not risk["drawdown_latched"], "origin_latch_conflict")
+    else:
+        _require(risk.get("history_complete") is True, "risk_history_unverified")
     return {
+        "risk_seed": seed,
+        "risk_history_complete": True,
         "day_pnl": equity - opening,
         "drawdown": peak - equity,
         "daily_halt": risk["daily_loss_latched"] or opening - equity >= DAILY_LOSS_LIMIT,
@@ -240,7 +289,7 @@ def rebuild_state(account, positions, orders, deals, *, as_of, anchor=None,
                  and symbol[6:] in (".SZ", ".SH", ".BJ"), "invalid_symbol")
         _require(isinstance(strategy_id, str) and bool(strategy_id.strip()), "strategy_id_missing")
         at = _timestamp(as_of)
-        cutoff, cash, realized, lots, external = _anchor(anchor, symbol, strategy_id, at)
+        cutoff, cash, realized, lots, external, external_today = _anchor(anchor, symbol, strategy_id, at)
         _coverage(coverage, cutoff, at)
         mark = _money(mark_price, "mark_price", 0)
         _require(mark > 0, "mark_price_missing")
@@ -251,20 +300,21 @@ def rebuild_state(account, positions, orders, deals, *, as_of, anchor=None,
         sellable = _quantity(position["sellable_quantity"], "position_sellable")
         _require(sellable <= total, "position_sellable_invalid")
         order_map = _unique(orders, "order_id")
-        cash, realized, today_realized, lots, fills = _replay(
-            deals, order_map, anchor, cutoff, at, symbol, strategy_id, cash, realized, lots)
+        cash, realized, today_realized, lots, fills, external, external_today = _replay(
+            deals, order_map, anchor, cutoff, at, symbol, strategy_id, cash, realized, lots,
+            external, external_today)
         own = sum(lot["quantity"] for lot in lots)
         _require(own + external == total, "position_reconciliation_failed")
         today_bought = sum(lot["quantity"] for lot in lots if lot["bought_on"] == at.date().isoformat())
-        _require(sellable <= total - today_bought, "position_t_plus_one_invalid")
-        reserved_cash, reserved_sell, pending_value, active = _pending(
-            order_map, fills, anchor, cutoff, at, symbol, strategy_id)
+        _require(sellable <= total - today_bought - external_today, "position_t_plus_one_invalid")
+        reserved_cash, reserved_sell, pending_value, active, external_active = _pending(
+            order_map, fills, anchor, cutoff, at, symbol, strategy_id, external, external_today)
         t_lots = [lot for lot in lots if lot["kind"] == "T"]
         t_quantity = sum(lot["quantity"] for lot in t_lots)
         eligible = sum(lot["quantity"] for lot in t_lots if lot["bought_on"] < at.date().isoformat())
         _require(reserved_sell <= eligible, "pending_sale_exceeds_sellable_t")
         equity = cash + own * mark
-        risk_state = _risk(risk, equity, symbol, strategy_id, at)
+        risk_state = _risk(risk, equity, symbol, strategy_id, at, anchor, cutoff, order_map)
         cost = sum(lot["quantity"] * lot["cost"] for lot in lots)
         state.update(t_total_shares=t_quantity, base_shares=own-t_quantity,
                      t_buy_queue=[(lot["cost"], lot["quantity"]) for lot in t_lots],
@@ -273,6 +323,8 @@ def rebuild_state(account, positions, orders, deals, *, as_of, anchor=None,
                      strategy_equity=equity, total_pnl=equity-INITIAL_EQUITY,
                      realized_pnl=realized, today_realized_pnl=today_realized,
                      unrealized_pnl=own*mark-cost, reserved_buy_cash=reserved_cash,
+                     external_quantity=external, external_bought_today=external_today,
+                     external_pending_order_ids=external_active, symbol_cap_scope="strategy_owned",
                      reserved_sell_quantity=reserved_sell, pending_exposure=pending_value,
                      sellable_t=min(sellable, max(0, eligible-reserved_sell)),
                      available_strategy_cash=max(0.0, min(cash-reserved_cash, available)),

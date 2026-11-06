@@ -209,12 +209,17 @@ def test_same_day_position_does_not_override_t_plus_one(snapshot):
     assert_halted(rebuild_state(**snapshot))
 
 
-def test_manual_round_trip_is_detected_even_when_position_quantity_matches(snapshot):
+def test_verified_manual_round_trip_does_not_enter_strategy_pnl(snapshot):
+    snapshot["anchor"]["external_quantity"] = 100
+    snapshot["positions"][0].update(quantity=300, sellable_quantity=200)
     snapshot["orders"] = [order("manual_buy", owner="manual"), order("manual_sell", "SELL", owner="manual")]
     snapshot["deals"] = [deal("buy", "manual_buy"), deal("sell", "manual_sell", side="SELL")]
     result = rebuild_state(**snapshot)
-    assert_halted(result)
-    assert result["blockers"] == ["foreign_target_deal"]
+    assert result["mode"] == "ready"
+    assert result["external_quantity"] == 100
+    assert result["external_bought_today"] == 100
+    assert result["t_total_shares"] == 100
+    assert result["total_pnl"] == result["realized_pnl"] == 0
 
 
 def test_foreign_filled_order_after_anchor_cannot_hide_in_incomplete_deals(snapshot):

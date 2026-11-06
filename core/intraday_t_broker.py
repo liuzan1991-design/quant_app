@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from core.paper_models import OrderSide, OrderStatus
+from qmt_builtin.state_rebuild import sell_allocations
 
 
 class BrokerTAccount:
@@ -109,14 +110,12 @@ def filled_inventory(broker, symbol, base):
             lots.append(InventoryLot(cost, event.quantity, not is_t,
                                      event.filled_at.date().isoformat()))
         elif kind == 1:
-            remaining = event.quantity
             day = event.filled_at.date().isoformat()
-            for protected in (False, True):
-                for lot in lots:
-                    if lot.protected == protected and lot.bought_on < day and remaining:
-                        take = min(lot.quantity, remaining)
-                        lot.quantity -= take
-                        remaining -= take
+            allocations, _remaining = sell_allocations(
+                [(lot.quantity, lot.protected, lot.bought_on) for lot in lots],
+                event.quantity, day)
+            for lot, take in zip(lots, allocations):
+                lot.quantity -= take
             lots = [lot for lot in lots if lot.quantity]
     return fills, lots, base
 

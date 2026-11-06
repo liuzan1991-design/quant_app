@@ -121,7 +121,8 @@ def acct_snapshot():
     a = rows[0]
     out = {}
     for k in ('m_dAvailable', 'm_dBalance', 'm_dStockValue',
-              'm_dPositionProfit', 'm_strStatus'):
+              'm_dPositionProfit', 'm_strStatus',
+              'm_dRepurchaseValue', 'm_dFrozenCash', 'm_dMortgage'):
         try:
             out[k] = getattr(a, k)
         except Exception:
@@ -224,6 +225,11 @@ def init(ContextInfo):
            % (a.get('m_dAvailable') or 0, a.get('m_dBalance') or 0,
               a.get('m_dStockValue') or 0, a.get('m_dPositionProfit') or 0,
               a.get('m_strStatus')))
+        # reverse repo parks idle cash; avail alone understates usable funds.
+        # repurchase=non-zero means the cash is in repo and comes back later.
+        _w('# acct repo=%.2f frozen_cash=%.2f mortgage=%.2f'
+           % (a.get('m_dRepurchaseValue') or 0, a.get('m_dFrozenCash') or 0,
+              a.get('m_dMortgage') or 0))
     else:
         _w('# acct EMPTY (account id / login)')
 

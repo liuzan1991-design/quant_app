@@ -21,10 +21,9 @@
 #   <QMT>\python\SNAP_300319.py has the real account id injected.
 #
 # EXTERNAL PARSE
-#   Every line starts with "[SNAP] ". Line kinds:
-#     BEGIN / Q (per query timing) / D (one data row) / END / VERDICT
-#   Field pairs are "name=value", separated by single spaces,
-#   values have "," replaced by "~" so a comma split stays safe.
+#   V2 records: sequence, kind, hex-encoded ASCII Python literal.
+#   END seals the preceding record count/checksum. This detects damage,
+#   NOT source authenticity. Legacy records are never upgraded in place.
 # ============================================================
 
 import time
@@ -33,6 +32,18 @@ CODE = '300319.SZ'
 ACCOUNT_ID_HARD = ''
 
 TABLES = ('ACCOUNT', 'POSITION', 'ORDER', 'DEAL')
+REQUIRED = {
+    'ACCOUNT': ('m_strAccountID', 'm_dAvailable', 'm_dBalance'),
+    'POSITION': ('m_strAccountID', 'm_strExchangeID', 'm_strInstrumentID',
+                 'm_nVolume', 'm_nCanUseVolume', 'm_dLastPrice'),
+    'ORDER': ('m_strAccountID', 'm_strExchangeID', 'm_strInstrumentID',
+              'm_strOrderSysID', 'm_strInsertDate', 'm_strInsertTime',
+              'm_nOffsetFlag', 'm_nOrderStatus', 'm_nVolumeTotalOriginal',
+              'm_nVolumeTraded', 'm_dLimitPrice', 'm_strOrderRef', 'm_strRemark'),
+    'DEAL': ('m_strAccountID', 'm_strExchangeID', 'm_strInstrumentID',
+             'm_strOrderSysID', 'm_strTradeID', 'm_strTradeDate',
+             'm_strTradeTime', 'm_nOffsetFlag', 'm_nVolume', 'm_dPrice'),
+}
 
 # Collection window is expressed in BEIJING time and derived from the
 # epoch (UTC+8), never from the machine timezone. The machine here runs
@@ -56,6 +67,7 @@ ORDER_FNS = (
 )
 
 _ST = {'done': 0, 'bars': 0, 'guard': [], 'first_end': 0.0}
+_WIRE = {'n': 0, 'checksum': 0}
 
 
 def _w(s):
@@ -65,21 +77,14 @@ def _w(s):
         pass
 
 
-def _stamp(t):
-    return '%s.%03d' % (time.strftime('%H:%M:%S', time.localtime(t)),
-                        int((t % 1) * 1000))
-
-
-def _fmt(v):
-    if isinstance(v, bool):
-        return '1' if v else '0'
-    if isinstance(v, float):
-        return repr(v)
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, str):
-        return v.replace(',', '~').replace('\r', ' ').replace('\n', ' ')
-    return str(v).replace(',', '~')
+def _emit(kind, data):
+    # ascii() preserves whitespace/unicode/type without delimiter ambiguity.
+    payload = ascii(data).encode('ascii').hex()
+    line = 'V2 n=%d kind=%s data=%s' % (_WIRE['n'], kind, payload)
+    _w(line)
+    for char in line:
+        _WIRE['checksum'] = (_WIRE['checksum'] * 33 + ord(char)) & 0xffffffff
+    _WIRE['n'] += 1
 
 
 def _violation(name):
@@ -89,33 +94,48 @@ def _violation(name):
     return _blocked
 
 
-def _mask(s):
-    s = str(s)
-    return s if len(s) <= 4 else s[:2] + '*' * (len(s) - 4) + s[-2:]
-
-
-def _fields(obj):
+def _fields(obj, table):
     """All m_* non-callable attributes, name-sorted for stable output.
     dir() on these objects also yields enum constants, hence the prefix
     filter; m_dAvgOpenPrice may carry the DBL_MAX sentinel, so floats are
     emitted with repr() to keep full precision."""
-    out = []
+    out, errors = [], []
     try:
         names = dir(obj)
     except Exception:
-        return out
+        return out, ['dir_failed']
     for name in names:
         if not name.startswith('m_'):
             continue
         try:
             value = getattr(obj, name)
         except Exception:
+            errors.append('unreadable_' + name)
             continue
         if callable(value):
             continue
+        # Native bindings can return int/float subclasses (including enums).
+        # Copy their primitive value; do not serialize binding-specific repr.
+        if isinstance(value, bool):
+            value = bool(value)
+        elif isinstance(value, int):
+            value = int(value)
+        elif isinstance(value, float):
+            value = float(value)
+        elif isinstance(value, str):
+            value = str(value)
+        elif value is not None:
+            errors.append('unsupported_' + name)
+            continue
+        if isinstance(value, float) and not (-1e309 < value < 1e309):
+            errors.append('nonfinite_' + name)
+            continue
         out.append((name, value))
     out.sort()
-    return out
+    found = dict(out)
+    errors.extend('missing_' + name for name in REQUIRED[table]
+                  if name not in found or found[name] is None)
+    return out, errors
 
 
 def _read_table(aid, table):
@@ -138,23 +158,34 @@ def _read_table(aid, table):
 def _collect_round(aid, rnd):
     """One complete pass over all four tables. Returns canonical rows for
     comparison plus the round span."""
-    canon = []
+    canon, failures = [], []
     round_start = time.time()
     for table in TABLES:
-        rows, status, t0, t1 = _read_table(aid, table)
-        _w('Q r=%d t=%s n=%d st=%s t0=%s t1=%s ms=%d'
-           % (rnd, table, len(rows), status, _stamp(t0), _stamp(t1),
-              int((t1 - t0) * 1000)))
+        rows, status, t0, api_t1 = _read_table(aid, table)
+        extracted, errors = [], []
+        for obj in rows:
+            pairs, field_errors = _fields(obj, table)
+            extracted.append(pairs)
+            errors.extend(field_errors)
+        # Include reading object fields in the evidence window, not only
+        # returning native object references from the API.
+        t1 = time.time()
+        if table == 'ACCOUNT' and len(rows) != 1:
+            errors.append('account_row_count')
+        if errors and status == 'OK':
+            status = 'FIELDS'
         if status != 'OK':
-            _w('Q r=%d t=%s ABORT=1' % (rnd, table))
+            failures.append('%d_%s_%s' % (rnd, table, status))
+        _emit('Q', dict(r=rnd, t=table, n=len(rows), st=status,
+                        t0=t0, t1=t1, ms=int((t1 - t0) * 1000),
+                        api_t1=api_t1, api_ms=int((api_t1 - t0) * 1000), errors=errors))
         for index in range(len(rows)):
-            pairs = _fields(rows[index])
-            payload = ' '.join('%s=%s' % (k, _fmt(v)) for k, v in pairs)
-            _w('D r=%d t=%s k=%d f=%d %s' % (rnd, table, index, len(pairs), payload))
-            canon.append((table, index, tuple((k, _fmt(v)) for k, v in pairs)))
+            pairs = extracted[index]
+            _emit('D', dict(r=rnd, t=table, k=index, f=len(pairs), fields=pairs))
+            canon.append((table, index, tuple(pairs)))
     round_end = time.time()
     canon.sort()
-    return canon, round_start, round_end
+    return canon, round_start, round_end, failures
 
 
 def _compare(a, b):
@@ -185,16 +216,17 @@ def _compare(a, b):
 
 def _collect():
     aid = ACCOUNT_ID_HARD
-    _w('BEGIN code=%s acct=%s local=%s asof_epoch=%.3f anytime=%d'
-       % (CODE, _mask(aid) if aid else 'MISSING',
-          time.strftime('%Y-%m-%d %H:%M:%S'), time.time(), RUN_ANYTIME))
+    _WIRE.update(n=0, checksum=0)
+    _emit('BEGIN', dict(version=2, code=CODE, account=aid, epoch=time.time(),
+                        tables=TABLES, rounds=2))
     if not aid:
-        _w('END aborted=1 reason=no_account')
+        _emit('END', dict(records=_WIRE['n'], checksum=_WIRE['checksum'],
+                          stable=False, equal=False, errors=['no_account']))
         return
 
     a_start = time.time()
-    canon_a, r1s, r1e = _collect_round(aid, 1)
-    canon_b, r2s, r2e = _collect_round(aid, 2)
+    canon_a, r1s, r1e, errors_a = _collect_round(aid, 1)
+    canon_b, r2s, r2e, errors_b = _collect_round(aid, 2)
     a_end = time.time()
 
     span_ms = int((a_end - a_start) * 1000)
@@ -203,11 +235,12 @@ def _collect():
     gap_ms = int((r2s - r1e) * 1000)
 
     diffs, first = _compare(canon_a, canon_b)
-    _w('END rows=%d span_ms=%d r1_ms=%d r2_ms=%d gap_ms=%d equal=%d diffs=%d first=%s'
-       % (len(canon_a), span_ms, r1_ms, r2_ms, gap_ms,
-          1 if diffs == 0 else 0, diffs, first or '-'))
-    _w('VERDICT stable=%s  (timeframe must also satisfy the external contract)'
-       % ('yes' if diffs == 0 else 'no'))
+    errors = errors_a + errors_b
+    _emit('END', dict(records=_WIRE['n'], checksum=_WIRE['checksum'],
+                      rows=len(canon_a), span_ms=span_ms, r1_ms=r1_ms,
+                      r2_ms=r2_ms, gap_ms=gap_ms, equal=diffs == 0,
+                      stable=diffs == 0 and not errors, diffs=diffs,
+                      first=first, errors=errors, finished_epoch=a_end))
     _ST['first_end'] = a_end
 
 
@@ -243,15 +276,7 @@ def handlebar(ContextInfo):
         if SECOND_AFTER and _ST['done'] == 1 and _ST['first_end']:
             if time.time() - _ST['first_end'] >= SECOND_AFTER:
                 _ST['done'] = 2
-                _w('BEGIN code=%s round_set=3 local=%s asof_epoch=%.3f'
-                   % (CODE, time.strftime('%Y-%m-%d %H:%M:%S'), time.time()))
-                aid = ACCOUNT_ID_HARD
-                canon_c, c1s, c1e = _collect_round(aid, 3)
-                canon_d, c2s, c2e = _collect_round(aid, 4)
-                diffs, first = _compare(canon_c, canon_d)
-                _w('END rows=%d span_ms=%d equal=%d diffs=%d first=%s'
-                   % (len(canon_c), int((c2e - c1s) * 1000),
-                      1 if diffs == 0 else 0, diffs, first or '-'))
+                _collect()
         return
 
     if not RUN_ANYTIME and not _in_window():

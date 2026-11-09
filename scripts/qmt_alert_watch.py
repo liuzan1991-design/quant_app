@@ -78,6 +78,11 @@ def in_session(now: dt.datetime) -> bool:
     if now.weekday() >= 5:
         return False
     hm = now.hour * 60 + now.minute
+    # 午休 11:30–13:00 没有 tick ⇒ 策略不产出 [RO] 行，判活无意义。
+    # 2026-11-09 误报：11:29 是上午末根，12:35 按「66 分钟无输出」发了心跳超时邮件。
+    # 13:00 后再给 5 分钟宽限，等复市第一根 bar 落地才判。
+    if (11 * 60 + 30) <= hm < (13 * 60 + 5):
+        return False
     return (9 * 60 + 30) <= hm <= (15 * 60)
 
 

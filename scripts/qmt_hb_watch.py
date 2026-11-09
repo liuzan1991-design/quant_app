@@ -58,6 +58,9 @@ def in_session(now: dt.datetime) -> bool:
     if bj.weekday() >= 5:
         return False
     hm = bj.hour * 60 + bj.minute
+    # 午休 11:30–13:00 无 tick ⇒ 无新 [RO] 行，判活无意义；13:00 后留 5 分钟宽限。
+    if (11 * 60 + 30) <= hm < (13 * 60 + 5):
+        return False
     return (9 * 60 + 30) <= hm <= (15 * 60)
 
 

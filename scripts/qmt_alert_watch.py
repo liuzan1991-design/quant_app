@@ -188,8 +188,8 @@ def check_once(stale_min: int, cooldown_min: int, cfg: dict) -> int:
                 "\n可能原因：QMT 客户端退出 / 网络中断 / 策略被停止。"
                 % (now.strftime("%Y-%m-%d %H:%M:%S"), age, txt[-300:]))
     else:
-        log("OK 最后输出 %.1f 分钟前（非交易时段不告警）" % age if not in_session(now)
-            else "OK 最后输出 %.1f 分钟前" % age)
+        log("OK 最后输出 %.1f 分钟前（判活窗口外不告警：午休/开收盘边界）" % age
+            if not in_session(now) else "OK 最后输出 %.1f 分钟前" % age)
         return 0
 
     if not cooldown_ok(cooldown_min):

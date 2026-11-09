@@ -72,6 +72,9 @@ STALE_SECONDS = 20 * 60          # 心跳静默超过 20 分钟 → 判定不在
 # 取 900s = 正常最大的 1.3 倍、P99 的 7.7 倍：全样本触发 13 次（0.22%），
 # **全部落在已知故障日**（09-09/10/11/24/28/30、10-08/09/13/19），正常日零触发。
 SUCCESS_STALE_SECONDS = 15 * 60
+# 进程缺失判据的心跳停刷下限：任务拉起通常 5~40 秒内就有新心跳，120 秒足够区分
+# "正在拉起"与"已经死了"，避免把启动窗口误判成死亡而重复 schtasks /Run。
+PROC_GONE_SECONDS = 120
 WINDOW_START = (4, 35)           # 本地时间窗口起（盘前 5 分钟）
 WINDOW_END = (10, 30)            # 本地时间窗口止（收盘缓冲结束后预留）
 MARKET_CLOSE_HHMM = "14:59"      # 北京时间的收盘最后一根 bar
@@ -108,8 +111,19 @@ def _parse_dt(s):
         return None
 
 
+# 进程查询是否可信。本机实测 PowerShell 偶发"返回 0 + 空 stdout"（见 MEMORY 硬约束），
+# 空输出会被解析成"没有 live_run 进程"。旧代码只 WARN 后返回 []，与"真的没进程"
+# 无法区分 ⇒ 一旦拿它当重启判据就会误杀/误拉。故显式记录可信度，由调用方决定。
+PROC_QUERY_TRUSTED = True
+
+
 def _live_run_processes() -> list:
-    """返回持有 live_run.py 的 python 进程 (pid, cmdline) 列表。"""
+    """返回持有 live_run.py 的 python 进程 (pid, cmdline) 列表。
+
+    查询失败或空 stdout 时返回 [] **并把 PROC_QUERY_TRUSTED 置 False**：
+    此时 [] 只表示"查不到"，不表示"没有"。
+    """
+    global PROC_QUERY_TRUSTED
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
           "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
     try:
@@ -121,15 +135,20 @@ def _live_run_processes() -> list:
                            errors="replace", timeout=60)
         out = (r.stdout or "").strip()
         if not out:
-            log(f"[WARN] 进程查询返回空 stdout（rc={r.returncode}, stderr={(r.stderr or '')[:200]!r}）")
+            PROC_QUERY_TRUSTED = False
+            log(f"[WARN] 进程查询返回空 stdout（rc={r.returncode}, stderr={(r.stderr or '')[:200]!r}）"
+                f" ⇒ 本次结果不可信，按「未知」处理")
             return []
         data = json.loads(out)
         if isinstance(data, dict):
             data = [data]
+        PROC_QUERY_TRUSTED = True
         return [(d.get("ProcessId"), d.get("CommandLine") or "")
                 for d in data if "live_run.py" in (d.get("CommandLine") or "")]
     except Exception as e:
-        log(f"[WARN] 进程查询失败: {e!r} | 原始输出片段: {(locals().get('out') or '')[:200]!r}")
+        PROC_QUERY_TRUSTED = False
+        log(f"[WARN] 进程查询失败: {e!r} | 原始输出片段: {(locals().get('out') or '')[:200]!r}"
+            f" ⇒ 本次结果不可信，按「未知」处理")
         return []
 
 
@@ -389,7 +408,25 @@ def main() -> int:
         f"距今={f'{succ_age:.0f}s' if succ_age is not None else 'N/A'} "
         f"collect_err={hb.get('collect_errors')}{suffix}")
 
-    # ---- 判据：用 updated_at（循环存活）----
+    # ---- 判据 A：进程不存在（最硬的"人没了"信号，优先于心跳年龄）----
+    # 2026-11-09 实证：12:36:49 / 12:56:49 两次 exit 0 静默退出，心跳分别只停在
+    # 195s / 495s。旧规则只看到"age < STALE_SECONDS(1200)"就判"循环还活着"，只做
+    # H36 告警 ⇒ 死透后干等 13 分钟才可能进死亡分支。进程缺失是直接证据，
+    # 只要心跳已停够 PROC_GONE_SECONDS（排除计划任务拉起窗口）就立即重启。
+    # PROC_QUERY_TRUSTED=False 时 [] 只代表"查不到"，退回原心跳年龄判据。
+    procs = _live_run_processes()
+    if (not procs and PROC_QUERY_TRUSTED and age is not None
+            and age >= PROC_GONE_SECONDS):
+        if _today_watermark_reached_close():
+            log(f"[OK] 心跳静默 {age:.0f}s 且无 live_run 进程，但今日水位已达收盘 → 不重启{suffix}")
+            return 0
+        log(f"[ALERT-DEAD] 无 live_run 进程且心跳已停 {age:.0f}s（进程缺失判据）"
+            f"→ 不等 {STALE_SECONDS // 60} 分钟静默阈值{suffix}")
+        if not dry:
+            _restart(f"进程缺失，心跳已停 {age:.0f}s")
+        return 0
+
+    # ---- 判据 B：用 updated_at（循环存活）----
     if age is not None and age <= STALE_SECONDS:
         if _today_watermark_reached_close():
             log(f"[OK] 全部启用组合今日水位已收盘，不报采集陈旧{suffix}")
@@ -404,7 +441,6 @@ def main() -> int:
         return 0   # 健康
 
     # ---- 心跳静默：分三种情况处置 ----
-    procs = _live_run_processes()
     log(f"[判定] 心跳静默 {age:.0f}s；检出 live_run 进程 {len(procs)} 个"
         f"{[p[0] for p in procs] if procs else ''}{suffix}")
 

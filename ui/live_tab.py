@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -125,8 +126,9 @@ def latest_history(unit: dict) -> dict:
     return hist[-1] if hist else {}
 
 
-def snapshot_table(status: dict) -> pd.DataFrame:
+def snapshot_table(status: dict, today: str | None = None) -> pd.DataFrame:
     """把 units 摊平成一张表（纯函数，便于测试与导出）。"""
+    today = today or datetime.now().strftime("%Y-%m-%d")
     rows = []
     for u in status.get("units", []):
         s, st_, wm = u["summary"], u["state"], u["watermark"]
@@ -138,7 +140,11 @@ def snapshot_table(status: dict) -> pd.DataFrame:
         # H78：陈旧行情的权益不得当"当前收益"呈现。三态：True/False/None(未知)
         fr = s.get("data_freshness") or {}
         stale = s.get("stale")
-        fresh_label = ("未知" if stale is None else ("⚠ 陈旧" if stale else "正常"))
+        if s.get("date") and s.get("date") != today and stale is not True:
+            # 摘要只在收盘写：盘中出现"昨天的摘要"本身就说明今天还没写过 ⇒ 不能当当日数字
+            fresh_label, stale = "⚠ 非当日", True
+        else:
+            fresh_label = ("未知" if stale is None else ("⚠ 陈旧" if stale else "正常"))
         # E1 累计回撤：优先 history（权威），summary 只作兜底
         cdd = hist.get("cumulative_drawdown")
         if cdd is None:
@@ -221,8 +227,10 @@ def _render_units(status: dict) -> None:
         st.info("live_outputs 下没有可读的观察单元（未运行或路径为空）")
         return
     # H78：陈旧必须标红，且明确"权益来自旧价格、不是当前收益"
-    if "新鲜度" in df.columns and (df["新鲜度"] == "⚠ 陈旧").any():
-        stale_asof = ", ".join(str(x) for x in df.loc[df["新鲜度"] == "⚠ 陈旧", "行情时点"].unique())
+    if "新鲜度" in df.columns and df["新鲜度"].astype(str).str.startswith("⚠").any():
+        bad = df[df["新鲜度"].astype(str).str.startswith("⚠")]
+        stale_asof = ", ".join(str(x) for x in
+                               (bad["行情时点"].where(bad["行情时点"] != "—", bad["日期"])).unique())
         st.error(f"⚠ 行情陈旧（最后一根 {stale_asof}）：表中权益与盈亏由**旧价格**计算，"
                  f"不代表当前收益；当日盈亏已置空。")
     st.dataframe(df, width="stretch", hide_index=True)

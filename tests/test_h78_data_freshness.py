@@ -171,18 +171,20 @@ def test_ui_marks_stale_and_blanks_day_pnl(tmp_path):
                     "data_quality": {"status": "void", "gap_pct": 0.9}},
         "state": {}, "watermark": {}, "history": [],
     }]}
-    df = live_tab.snapshot_table(status)
+    df = live_tab.snapshot_table(status, today="2026-11-10")
     assert df.loc[0, "新鲜度"] == "⚠ 陈旧"
     assert pd.isna(df.loc[0, "当日盈亏"])          # 旧价格的盈亏不得呈现
     assert df.loc[0, "行情时点"] == "2026-11-10T09:54:00"
 
 
 def test_ui_unknown_stale_is_not_shown_as_normal(tmp_path):
+    """摘要停留在上一交易日 ⇒ 必须标"非当日"，不能因为字段缺失就显示正常。"""
     from ui import live_tab
     status = {"units": [{
         "symbol": "300319.SZ", "strategy": "ma_swing",
         "summary": {"date": "2026-11-09", "equity": 300000.0},
         "state": {}, "watermark": {}, "history": [],
     }]}
-    df = live_tab.snapshot_table(status)
-    assert df.loc[0, "新鲜度"] == "未知"
+    df = live_tab.snapshot_table(status, today="2026-11-10")
+    assert df.loc[0, "新鲜度"] == "⚠ 非当日"
+    assert pd.isna(df.loc[0, "当日盈亏"])

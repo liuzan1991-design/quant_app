@@ -21,6 +21,17 @@ APP_DIR = Path(__file__).resolve().parent
 LOG_DIR = APP_DIR / "live_outputs" / "logs"
 _LOGGER = logging.getLogger("live_run")
 _LOGGER.setLevel(logging.INFO)
+_TRACE = None            # H80：ExitTrace 句柄（main 里安装，顶栏异常分支要用）
+
+
+def _mark_exit(kind: str, **detail) -> None:
+    """从顶层异常分支补记退出原因；未安装则静默跳过。"""
+    if _TRACE is None:
+        return
+    try:
+        _TRACE.mark(kind, **detail)
+    except Exception:  # noqa: BLE001
+        pass
 _CONSOLE_LOG = None
 for _p in (str(APP_DIR), str(APP_DIR / "core")):
     if _p not in sys.path:
@@ -57,6 +68,8 @@ from core.market_collector import MarketCollector  # noqa: E402
 from core.data_fetch import format_failure_line  # noqa: E402
 from core import data_fetch as _ad_fetch  # noqa: E402
 from core.live_exhaust import make_hook as _make_exhaust_hook  # noqa: E402
+from core.exit_trace import install as _install_exit_trace  # noqa: E402,H80
+from core.exit_trace import KIND_NORMAL as _EXIT_NORMAL  # noqa: E402,H80
 from core import live_config  # noqa: E402  （H72）
 
 # COMBOS 里同一 code 可能对应多个策略，去重保留出现顺序（日志里不再出现重复 code）。
@@ -120,6 +133,19 @@ def _freshness_snapshot(codes) -> dict | None:
     except Exception:  # noqa: BLE001 —— 可观测性字段失败不得阻断心跳
         _LOGGER.warning("[heartbeat] 新鲜度计算失败", exc_info=True)
         return None
+
+
+def _heartbeat_brief(path: Path) -> dict:
+    """H80：退出留痕里附带的现场快照（读不到就返回 {}，绝不影响退出）。"""
+    try:
+        hb = json.loads(Path(path).read_text(encoding="utf-8")) or {}
+        if not isinstance(hb, dict):
+            return {}
+        return {k: hb.get(k) for k in
+                ("status", "date", "last_success_at", "collect_errors", "match_errors", "stale")
+                if k in hb}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _write_heartbeat(path: Path, started_at: datetime, status: str,
@@ -215,6 +241,15 @@ def main() -> None:
 
     health_path = match.OUTPUT_DIR / "health.json"
     heartbeat_path = match.OUTPUT_DIR / "heartbeat.json"
+    # H80：退出留痕必须在**启动心跳之前**装好 —— 此后每次退出（含 SystemExit、
+    # 信号、线程异常）都留 start/exit 成对记录；缺 exit 即判 untraced。
+    global _TRACE
+    trace = _install_exit_trace(
+        heartbeat_path.parent / "logs" / "exit_trace.jsonl",
+        started_at=started_at,
+        snapshot=lambda: _heartbeat_brief(heartbeat_path))
+    _TRACE = trace
+    trace.set_stage("startup")
     # 启动心跳：即使随后 init/build_observers/login 卡死或崩，也能看出"今天启动过但没采到数据"。
     _write_heartbeat(heartbeat_path, started_at, status="starting",
                      last_success_at=None, collect_errors=0, match_errors=0)
@@ -264,6 +299,7 @@ def main() -> None:
         # H78：每轮只算一次新鲜度，成功/失败两条心跳共用（陈旧必须在失败分支也可见）
         freshness = _freshness_snapshot(codes)
         # 采集当天实时数据
+        trace.set_stage("collect")
         try:
             collected = collector.run_once(codes, datetime.now().strftime("%Y-%m-%d"))
             last_collected = dict(collected) if isinstance(collected, dict) else {}
@@ -288,6 +324,7 @@ def main() -> None:
                              freshness=freshness)
 
         # 撮合新 bar：单轮异常只记日志不退出，下一轮从持久化状态继续。
+        trace.set_stage("match")
         try:
             summary = match._run_once(observers, match.OUTPUT_DIR,
                                       quote_now=match.live_quote_time())
@@ -336,6 +373,7 @@ def main() -> None:
                 close_reason = f"今日 14:59 后连续 {quiet_rounds} 轮无新 bar"
 
         if close_reason:
+            trace.set_stage("close")
             _LOGGER.info("== 收盘（%s），写每日摘要 ==", close_reason)
             print(f"== 收盘（{close_reason}），写每日摘要 ==")
             for obs in observers:
@@ -361,14 +399,24 @@ def main() -> None:
             health_path.write_text(json.dumps(health, ensure_ascii=False, indent=2),
                                    encoding="utf-8")
             _LOGGER.info("[health] %s", health)
+            trace.mark(_EXIT_NORMAL, via="close", reason=close_reason)
             break
 
+        trace.set_stage("sleep")
         time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except SystemExit as exc:
+        # H80：旧实现只 `except Exception`，`sys.exit(0)`（SDK 原生层直接调用）
+        # 会穿透顶层、零日志零码退出 —— 现在至少留下可归因的日志与 exit 记录。
+        _mark_exit(f"SystemExit({getattr(exc, 'code', None)})", via="top_level")
+        _LOGGER.warning("== 进程收到 SystemExit(code=%r)，退出原因见 exit_trace.jsonl ==",
+                        getattr(exc, "code", None))
+        raise
+    except BaseException as exc:
+        _mark_exit(f"Exception({type(exc).__name__})", via="top_level")
         _LOGGER.exception("== 主循环致命退出（非零码，交由计划任务重启）==")
         raise SystemExit(1)

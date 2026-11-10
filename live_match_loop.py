@@ -835,6 +835,20 @@ def _write_daily_summary(obs: Observer) -> dict:
     # H35 另一半：**数据不完整日必须带缺口标记**（缺口≥5% ⇒ void/作废）。
     # 否则 D11 那种 161/240 的日子会写出"看起来正常"的摘要，被误读成数据完整。
     payload["data_quality"] = day_bar_stats(_day_bar_count(obs.code, payload["date"]))
+    # H78：**陈旧行情的权益不得当"当前收益"呈现**（11-10 用 09:54 的 mark 报出 +0.31%）。
+    # 判据是"最后一根已完成 bar vs 应有水位"，不是总根数；总根数只作历史缺口。
+    # 取不到 ⇒ 字段为 None（未知），读取方不得当正常。
+    try:
+        from core import data_freshness as _fresh
+        _last, _n = _fresh.scan_day_bars(
+            LIVE_DIR / f"stock_{obs.code}_1m.csv", payload["date"])
+        _fr = _fresh.assess(live_quote_time(), _last, _n, suspension="unknown")
+    except Exception:  # noqa: BLE001 —— 观测字段失败不得影响摘要写出
+        _fr = None
+    payload["data_freshness"] = _fr
+    payload["stale"] = bool(_fr and _fr.get("stale"))
+    payload["equity_asof"] = (_fr or {}).get("last_bar_at")
+    payload["day_pnl_is_stale"] = payload["stale"]
     # H46-③：底仓集中度（阈值与 RiskConfig.max_symbol_position_pct 同源 = 10%）。
     # ⚠️ 只监控与告警，**不减仓**（自动减仓需改 base_position 语义，属行为改动，另立）。
     cap = _position_cap_snapshot(obs)

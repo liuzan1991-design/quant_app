@@ -101,9 +101,30 @@ def _past_hard_close() -> bool:
     return (now.hour, now.minute) >= (CLOSE_HARD_LOCAL_HOUR, CLOSE_HARD_LOCAL_MINUTE)
 
 
+def _freshness_snapshot(codes) -> dict | None:
+    """H78：行情新鲜度（按"最后一根已完成 bar vs 应有水位"，不看总根数）。
+
+    多标的取最落后的那一个；任何异常 ⇒ None（心跳里字段缺失，**绝不**写成"正常"）。
+    """
+    try:
+        from core import data_freshness as fresh
+        now = match.live_quote_time()          # 北京时间墙钟，不依赖主机时区
+        day = now.strftime("%Y-%m-%d")
+        items = []
+        for code in codes:
+            last, n = fresh.scan_day_bars(
+                match.LIVE_DIR / f"stock_{code}_1m.csv", day)
+            # 停牌状态无可靠来源 ⇒ 一律 unknown：宁可报"需人工确认"，不擅自判正常
+            items.append(fresh.assess(now, last, n, suspension="unknown"))
+        return fresh.worst_of(items)
+    except Exception:  # noqa: BLE001 —— 可观测性字段失败不得阻断心跳
+        _LOGGER.warning("[heartbeat] 新鲜度计算失败", exc_info=True)
+        return None
+
+
 def _write_heartbeat(path: Path, started_at: datetime, status: str,
                      last_success_at: datetime | None, collect_errors: int = 0,
-                     match_errors: int = 0) -> None:
+                     match_errors: int = 0, freshness: dict | None = None) -> None:
     """启动心跳：一启动就落盘，采集成功持续更新。
 
     用途：health.json 只在收盘写，盘中"启动即死 / 采集停摆"靠它暴露——
@@ -124,6 +145,13 @@ def _write_heartbeat(path: Path, started_at: datetime, status: str,
             "match_errors": match_errors,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
+        # H78：陈旧行情必须显性化。字段缺失 ≠ 正常，读取方要按"未知"处理。
+        if freshness:
+            heartbeat.update({
+                "stale": bool(freshness.get("stale")),
+                "data_stale_seconds": freshness.get("data_stale_seconds"),
+                "data_freshness": freshness,
+            })
         try:
             from core import data_fetch as _df
             heartbeat.update(_df.session_stats())
@@ -233,6 +261,8 @@ def main() -> None:
     match_errors = 0  # 连续撮合异常计数；超过阈值说明状态已坏，退出交计划任务重启
     while True:
         round_t0 = time.monotonic()
+        # H78：每轮只算一次新鲜度，成功/失败两条心跳共用（陈旧必须在失败分支也可见）
+        freshness = _freshness_snapshot(codes)
         # 采集当天实时数据
         try:
             collected = collector.run_once(codes, datetime.now().strftime("%Y-%m-%d"))
@@ -240,7 +270,8 @@ def main() -> None:
             last_success_at = datetime.now()
             _write_heartbeat(heartbeat_path, started_at, status="running",
                              last_success_at=last_success_at,
-                             collect_errors=collect_errors, match_errors=match_errors)
+                             collect_errors=collect_errors, match_errors=match_errors,
+                             freshness=freshness)
             _LOGGER.info("[collector] 采集完成 %s", collected)
         except Exception as exc:  # noqa: BLE001
             collect_errors += 1
@@ -253,7 +284,8 @@ def main() -> None:
             # 采集失败也落心跳（last_success_at 保持上次成功值），让断网可从 collect_errors 观测。
             _write_heartbeat(heartbeat_path, started_at, status="running",
                              last_success_at=last_success_at,
-                             collect_errors=collect_errors, match_errors=match_errors)
+                             collect_errors=collect_errors, match_errors=match_errors,
+                             freshness=freshness)
 
         # 撮合新 bar：单轮异常只记日志不退出，下一轮从持久化状态继续。
         try:

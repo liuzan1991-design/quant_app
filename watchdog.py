@@ -50,6 +50,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from core.trading_calendar import beijing_today, is_trading_day
 from core.alerts import clear_alert, raise_alert   # H36 告警送达
@@ -61,7 +62,7 @@ APP_DIR = Path(__file__).resolve().parent
 LIVE_DIR = Path(os.environ.get("QUANT_LIVE_DIR") or (APP_DIR / "live_outputs"))
 HEARTBEAT = LIVE_DIR / "heartbeat.json"
 WATCHDOG_LOG = LIVE_DIR / "logs" / "watchdog.log"
-TASK_NAME = "QuantLiveRun"
+TASK_NAME = os.environ.get("QUANT_WATCHDOG_TASK", "QuantLiveRun")
 
 # ---- 阈值（标定依据见模块 docstring）----
 STALE_SECONDS = 20 * 60          # 心跳静默超过 20 分钟 → 判定不在跑
@@ -108,6 +109,16 @@ ZOMBIE_MAX_RESTARTS = 3          # 每日受控重启上限（防重启风暴；
 SUCCESS_STALL_SECONDS = SUCCESS_STALE_SECONDS
 STALL_MIN_ERRORS = 4             # 两轮检查间新增失败 ≥4 次（5 分钟窗口的 2/3 分位）
 STALL_RSS_LIMIT_MB = 1500        # ≥1.5GB 判为 10-19 型内存泄漏，重启无效
+# ---- 2026-11-10 用户审阅后的四条收紧（H78/H79）----
+# 1) 额度：**尝试次数与恢复成功次数分开记账**；一次恢复失败即停止自动重试。
+#    旧实现只有"重启次数"，kill 失败也扣额度、且失败后下一轮还会再试 ⇒ 反复重启。
+STALL_MAX_ATTEMPTS = 2           # 每日自动尝试上限（正常路径 1 次成功即结束）
+STALL_VERIFY_TIMEOUT = 180       # 恢复验证窗口（秒）；至少覆盖 3 个采集轮次
+STALL_VERIFY_POLL = 10           # 轮询间隔（秒）
+# 2) 失败关闭：RSS 未知、进程查询不可信，一律**不动作**（只告警），
+#    否则"查不到"会被当成"没有风险"。
+STALL_BLOCK_ALERT = "stall_blocked"   # 不确定而未动作时的告警 kind
+STALL_DATA_DIR = Path(os.environ.get("QUANT_STALL_DATA_DIR") or (APP_DIR / "data" / "live"))
 
 
 def log(msg: str) -> None:
@@ -230,7 +241,7 @@ def _report_success_staleness(hb: dict, succ_age: float | None, suffix: str) -> 
         msg = (f"采集已停摆 {succ_age:.0f}s（> {SUCCESS_STALE_SECONDS}s）"
                f"last_success={hb.get('last_success_at')} "
                f"collect_err={hb.get('collect_errors')} status={hb.get('status')}"
-               f" → 仅告警，不重启")
+               f" → 告警；是否重启由 H79 判据（含恢复验证）决定")
         log(f"[ALERT-STALE] 循环存活但**{msg}{suffix}")
         raise_alert("collect_stale", msg)
         return
@@ -298,12 +309,15 @@ def _error_delta(day: str, current: int) -> tuple[int, int | None]:
 
 
 def _success_stall_decision(hb: dict, succ_age: float | None, err_delta: int,
-                            rss_mb: float | None, water_closed: bool = False
-                            ) -> tuple[bool, str]:
+                            rss_mb: float | None, water_closed: bool = False,
+                            *, proc_query_trusted: bool = True,
+                            proc_count: int = 1) -> tuple[bool, str]:
     """H79 纯函数：有过成功记录、但成功已长时间停摆 ⇒ 是否受控重启。
 
     只在「有成功记录」时走这里；「从未成功」归 H60 僵尸路径，二者互斥。
-    关键防线见常量区注释：RSS 分界拦住 10-19 型内存泄漏，错误增量免疫午休。
+
+    **失败关闭**（用户 2026-11-10 口径）：RSS 未知、进程查询不可信、进程列表为空
+    都不允许动作。旧实现把这三种"未知"当"没问题"放行，会起双实例或空转。
     """
     if succ_age is None:
         return False, "从未成功（归 H60 僵尸路径，不走本判据）"
@@ -313,12 +327,153 @@ def _success_stall_decision(hb: dict, succ_age: float | None, err_delta: int,
         return False, f"近轮新增失败仅 {err_delta} 次（< {STALL_MIN_ERRORS}）⇒ 非采集失败，不动"
     if water_closed:
         return False, "今日水位已达收盘，属正常结束"
-    if rss_mb is not None and rss_mb >= STALL_RSS_LIMIT_MB:
+    if not proc_query_trusted:
+        return False, "进程查询不可信（空 stdout / 查询失败）⇒ 失败关闭：不杀也不拉"
+    if proc_count <= 0:
+        return False, "无 live_run 进程（归判据 A / H60，不在此处重启）"
+    if rss_mb is None:
+        return False, "RSS 未知 ⇒ 失败关闭（无法排除 10-19 内存泄漏型）"
+    if rss_mb >= STALL_RSS_LIMIT_MB:
         return False, (f"RSS {rss_mb:.0f}MB ≥ {STALL_RSS_LIMIT_MB}MB ⇒ 10-19 内存泄漏型，"
                        f"换进程无效（H60 反例）")
     return True, (f"{succ_age / 60:.0f} 分钟无成功、近轮新增失败 {err_delta} 次、"
-                  f"RSS {rss_mb:.0f}MB" if rss_mb is not None
-                  else f"{succ_age / 60:.0f} 分钟无成功、近轮新增失败 {err_delta} 次（RSS 未知）")
+                  f"RSS {rss_mb:.0f}MB、进程 {proc_count} 个")
+
+
+# ---- H79：尝试/成功分开记账 + 三重恢复验证（2026-11-10 收紧）----
+
+def _stall_ledger_path(day: str) -> Path:
+    return WATCHDOG_LOG.parent / f"watchdog_stall_ledger_{str(day).replace('-', '')}.json"
+
+
+def _load_stall_ledger(day: str) -> dict:
+    """当日 H79 账本：attempts（动作尝试）/ successes（恢复成功）/ stop_reason。"""
+    base = {"attempts": 0, "successes": 0, "last_attempt_at": None,
+            "last_outcome": None, "stop_reason": None, "detail": None}
+    try:
+        p = _stall_ledger_path(day)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8")) or {}
+            base.update(data)
+    except Exception as e:  # noqa: BLE001
+        log(f"[WARN] H79 账本读取失败: {e!r}")
+    return base
+
+
+def _save_stall_ledger(day: str, **fields) -> dict:
+    led = _load_stall_ledger(day)
+    led.update(fields)
+    try:
+        p = _stall_ledger_path(day)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(led, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log(f"[WARN] H79 账本写入失败: {e!r}")
+    return led
+
+
+def _stall_gate(led: dict) -> tuple[bool, str]:
+    """是否允许再动手。一次恢复失败 ⇒ 当日停止自动重试（不是靠"额度没用完"）。"""
+    if led.get("stop_reason"):
+        return False, f"已停止自动重试：{led['stop_reason']}"
+    if int(led.get("attempts") or 0) >= STALL_MAX_ATTEMPTS:
+        return False, f"今日尝试已达上限 {led['attempts']}/{STALL_MAX_ATTEMPTS}"
+    return True, ""
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _combos() -> list[tuple[str, str]]:
+    try:
+        from core import live_config
+        cfg = live_config.load()
+        return list(live_config.to_combos(cfg)) if cfg is not None else [("300308", "grid_trade")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _recovery_snapshot(day: str | None = None) -> dict:
+    """恢复验证用的现场快照：进程身份 + last_success_at + CSV 最后一根 bar。"""
+    from core import data_freshness
+
+    day = day or f"{datetime.now():%Y-%m-%d}"
+    hb = _read_json(HEARTBEAT)
+    pids = None
+    for _try in range(2):                      # 查询抖动重试一次，仍不可信才判"未知"
+        pids = [p[0] for p in _live_run_processes()]
+        if PROC_QUERY_TRUSTED:
+            break
+        _sleep(2)
+    if not PROC_QUERY_TRUSTED:
+        pids = None
+    last_bar = None
+    for code, _sid in _combos() or [("300308", "grid_trade")]:
+        t, _n = data_freshness.scan_day_bars(
+            STALL_DATA_DIR / f"stock_{code}_1m.csv", day)
+        if t is not None and (last_bar is None or t > last_bar):
+            last_bar = t
+    return {
+        "pids": pids,
+        "started_at": hb.get("started_at"),
+        "last_success_at": hb.get("last_success_at"),
+        "last_bar_at": last_bar.isoformat(timespec="seconds") if last_bar else None,
+    }
+
+
+def _recovery_verdict(prev: dict, cur: dict, attempt_ts: datetime | None
+                      ) -> tuple[bool, str]:
+    """三重验证：新实例身份 / last_success_at 前进 / CSV 水位推进。
+
+    **单纯再次读到旧数据不算恢复**（用户 2026-11-10 明确）。
+    """
+    # ① 新实例身份：started_at 必须不早于本次尝试，且旧 PID 必须消失
+    #    容差 2s：heartbeat 的 started_at 截断到秒，拉起很快时可能比 attempt_ts 早 1s 内
+    st = _parse_dt(cur.get("started_at") or "")
+    if attempt_ts is None or st is None or st < attempt_ts - timedelta(seconds=2):
+        return False, f"新实例身份未成立（started_at={cur.get('started_at')} < 尝试时刻）"
+    if cur.get("pids") is None:
+        return False, "进程列表不可信 ⇒ 无法确认新实例身份"
+    if set(cur["pids"]) & set(prev.get("pids") or []):
+        return False, f"旧 PID 仍存活 {sorted(set(cur['pids']) & set(prev.get('pids') or []))}"
+
+    # ② last_success_at 前进
+    ps = _parse_dt(prev.get("last_success_at") or "")
+    cs = _parse_dt(cur.get("last_success_at") or "")
+    if cs is None or (ps is not None and cs <= ps):
+        return False, (f"last_success_at 未前进（{prev.get('last_success_at')} → "
+                       f"{cur.get('last_success_at')}）")
+
+    # ③ CSV 行情水位推进
+    pb = _parse_dt(prev.get("last_bar_at") or "")
+    cb = _parse_dt(cur.get("last_bar_at") or "")
+    if cb is None or (pb is not None and cb <= pb):
+        return False, f"CSV 水位未推进（{prev.get('last_bar_at')} → {cur.get('last_bar_at')}）"
+
+    return True, (f"实例 {sorted(cur['pids'])}、last_success {cur.get('last_success_at')}、"
+                  f"水位 {cur.get('last_bar_at')}")
+
+
+def _verify_recovery(prev: dict, attempt_ts: datetime | None,
+                     timeout: int | None = None, poll: int | None = None
+                     ) -> tuple[bool, str]:
+    """轮询直到三重验证通过或超时。超时即判失败（调用方随后停止自动重试）。"""
+    timeout = STALL_VERIFY_TIMEOUT if timeout is None else timeout
+    poll = STALL_VERIFY_POLL if poll is None else poll
+    deadline = time.monotonic() + timeout
+    detail = "未取到现场"
+    while True:
+        cur = _recovery_snapshot()
+        ok, detail = _recovery_verdict(prev, cur, attempt_ts)
+        if ok:
+            return True, detail
+        if time.monotonic() >= deadline:
+            return False, detail
+        _sleep(poll)
 
 
 def _live_run_rss_mb(procs: list) -> float | None:
@@ -342,7 +497,14 @@ def _live_run_rss_mb(procs: list) -> float | None:
 
 
 def _maybe_restart_stall(hb: dict, succ_age: float | None, suffix: str = "") -> bool:
-    """H79：成功停摆 + 错误累积 ⇒ 杀进程 + 拉起。与 H60 共享每日重启额度。"""
+    """H79：成功停摆 + 错误累积 ⇒ 受控重启，并**验证数据真的恢复**。
+
+    与旧版的区别（用户 2026-11-10 四条收紧）：
+    - 尝试次数 / 恢复成功次数分开记账；一次恢复失败即停，不再"失败也继续试"；
+    - RSS 未知、进程查询不可信 ⇒ 失败关闭（只告警）；
+    - 恢复判据 = 新实例身份 + last_success_at 前进 + CSV 水位推进，三者全中；
+    - 失败会把 stop_reason 写进账本，当日不再自动重试。
+    """
     day = str(hb.get("date") or f"{datetime.now():%Y-%m-%d}")
     current = int(hb.get("collect_errors") or 0)
     delta, prev = _error_delta(day, current)
@@ -350,35 +512,67 @@ def _maybe_restart_stall(hb: dict, succ_age: float | None, suffix: str = "") -> 
 
     water_closed = _today_watermark_reached_close()
     procs = _live_run_processes()
-    rss = _live_run_rss_mb(procs)
-    need, reason = _success_stall_decision(hb, succ_age, delta, rss, water_closed)
+    trusted = PROC_QUERY_TRUSTED
+    rss = _live_run_rss_mb(procs) if trusted else None
+    need, reason = _success_stall_decision(
+        hb, succ_age, delta, rss, water_closed,
+        proc_query_trusted=trusted, proc_count=len(procs))
     if not need:
         log(f"[判定] 成功停摆不重启：{reason}{suffix}")
+        if ("失败关闭" in reason) or ("不可信" in reason):
+            # 不确定不等于安全：必须让人知道"看门狗这轮没能力判断"
+            raise_alert(STALL_BLOCK_ALERT, f"H79 未动作（{reason}）", level="alert")
         return False
 
-    used = _restart_budget(day)
-    if used >= ZOMBIE_MAX_RESTARTS:
-        log(f"[ALERT-STALL] {reason} → 今日受控重启已用 {used}/{ZOMBIE_MAX_RESTARTS}，"
-            f"不再重启{suffix}")
+    led = _load_stall_ledger(day)
+    allowed, why = _stall_gate(led)
+    if not allowed:
+        log(f"[ALERT-STALL] {reason} → {why}{suffix}")
         return False
 
-    log(f"[ALERT-STALL] {reason} → 上次成功 {hb.get('last_success_at')}，"
+    # 动作前现场（用于恢复比对；进程列表不可信时此处已不会走到）
+    prev_state = _recovery_snapshot(day)
+    attempt_ts = datetime.now()
+    n_attempt = int(led.get("attempts") or 0) + 1
+    _save_stall_ledger(day, attempts=n_attempt,
+                       last_attempt_at=attempt_ts.isoformat(timespec="seconds"),
+                       last_outcome="pending", detail=reason)
+
+    log(f"[ALERT-STALL] {reason} → 上次成功 {hb.get('last_success_at')}、"
         f"累计失败 {current} 次（上轮 {prev}）⇒ 受控重启"
-        f"（今日第 {used + 1}/{ZOMBIE_MAX_RESTARTS} 次）{suffix}")
-    _bump_restart_budget(day, f"成功停摆：{reason}")
+        f"（今日第 {n_attempt}/{STALL_MAX_ATTEMPTS} 次尝试）{suffix}")
 
-    if procs:
-        if not _kill_live_run(procs):
-            log("[ERROR] 部分进程未能终止 ⇒ 放弃本次重启（双实例会互相覆盖同一 CSV）")
-            return False
-        _sleep(3)
-        left = _live_run_processes()
-        if left:
-            log(f"[ERROR] 仍残留进程 {[p[0] for p in left]} ⇒ 放弃重启（双实例风险）")
-            return False
+    if not _kill_live_run(procs):
+        _fail_stall(day, "kill_failed", "部分进程未能终止，放弃本次重启")
+        return False
+    _sleep(3)
+    left = _live_run_processes()
+    if left:
+        _fail_stall(day, "kill_failed", f"仍残留进程 {[p[0] for p in left]}")
+        return False
 
-    _restart(f"成功停摆：{reason}")
-    return True
+    _restart(f"成功停摆：{reason}", wait=False)
+    ok, detail = _verify_recovery(prev_state, attempt_ts)
+    if ok:
+        _save_stall_ledger(day, successes=int(led.get("successes") or 0) + 1,
+                           last_outcome="recovered", stop_reason=None, detail=detail)
+        log(f"[动作] ✅ 恢复验证通过：{detail}{suffix}")
+        clear_alert(STALL_BLOCK_ALERT)
+        return True
+
+    _fail_stall(day, "no_recovery", detail)
+    return False
+
+
+def _fail_stall(day: str, outcome: str, detail: str) -> None:
+    """恢复失败：写账本 + 停止当日自动重试 + 告警（不静默）。"""
+    led = _load_stall_ledger(day)
+    _save_stall_ledger(day, last_outcome=outcome,
+                       stop_reason=f"{outcome}：{detail}",
+                       failures=int(led.get("failures") or 0) + 1, detail=detail)
+    log(f"[ALERT-STALL] ❌ 恢复未验证（{outcome}）：{detail} ⇒ 今日停止自动重试，需人工介入")
+    raise_alert("stall_no_recovery",
+                f"H79 自动恢复失败（{outcome}）：{detail}；已停止当日自动重试", level="alert")
 
 
 def _restart_budget_path(day: str) -> Path:
@@ -606,7 +800,13 @@ def main() -> int:
     return 0
 
 
-def _restart(reason: str) -> None:
+def _restart(reason: str, wait: bool = True) -> None:
+    """触发计划任务。
+
+    ⚠️ 这里**不判定"重启成功"**：旧版以"心跳 20s 内刷新"为成功判据，而停摆进程
+    本来就每轮刷心跳 ⇒ 什么都没做也会打印"✅ 重启生效"（H79 复核发现的假绿）。
+    真正的成功判据由调用方按业务口径验（H79：实例身份 + last_success 前进 + 水位推进）。
+    """
     log(f"[动作] 触发重启 {TASK_NAME}（原因：{reason}）")
     try:
         r = subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME],
@@ -616,18 +816,19 @@ def _restart(reason: str) -> None:
         log(f"[ERROR] 触发失败: {e!r}")
         return
 
-    # 验证：进程启动后立刻会写 status=starting 的心跳
-    import time
+    if not wait:
+        return
     time.sleep(20)
     try:
         hb = json.loads(HEARTBEAT.read_text(encoding="utf-8"))
         ua = _parse_dt(hb.get("updated_at") or "")
         if ua and (datetime.now() - ua).total_seconds() < 120:
-            log(f"[动作] ✅ 重启生效，心跳已刷新至 {hb.get('updated_at')} status={hb.get('status')}")
+            log(f"[动作] 进程已起（心跳刷新至 {hb.get('updated_at')}）"
+                f"⚠️ 仅证明进程在写心跳，**未证明采数恢复**")
         else:
             log(f"[动作] ⚠️ 重启后心跳仍未刷新（updated_at={hb.get('updated_at')}）→ 需人工介入")
     except Exception as e:
-        log(f"[动作] ⚠️ 重启验证失败: {e!r}")
+        log(f"[动作] ⚠️ 重启后心跳读取失败: {e!r}")
 
 
 if __name__ == "__main__":

@@ -77,7 +77,9 @@ def test_stale_success_emits_alert(sandbox):
     text = _log_text(log_path)
     assert "ALERT-STALE" in text
     assert "采集已停摆" in text
-    assert "仅告警，不重启" in text
+    # H79 起：陈旧先告警，是否重启由独立判据决定（含恢复验证），不再写死"不重启"
+    assert "H79 判据" in text
+    assert "触发重启" not in text
 
 
 def test_threshold_boundary_below_does_not_fire(sandbox):

@@ -135,6 +135,10 @@ def snapshot_table(status: dict) -> pd.DataFrame:
         dq = s.get("data_quality") or {}
         cap = s.get("position_cap") or {}
         upto = wm.get("processed_upto_by_day") or {}
+        # H78：陈旧行情的权益不得当"当前收益"呈现。三态：True/False/None(未知)
+        fr = s.get("data_freshness") or {}
+        stale = s.get("stale")
+        fresh_label = ("未知" if stale is None else ("⚠ 陈旧" if stale else "正常"))
         # E1 累计回撤：优先 history（权威），summary 只作兜底
         cdd = hist.get("cumulative_drawdown")
         if cdd is None:
@@ -145,7 +149,10 @@ def snapshot_table(status: dict) -> pd.DataFrame:
             "日期": s.get("date") or hist.get("date") or "—",
             "权益": s.get("equity"),
             "现金": s.get("cash"),
+            "当日盈亏": (None if stale else s.get("day_pnl")),
             "累计盈亏": s.get("cum_pnl"),
+            "行情时点": fr.get("last_bar_at") or "—",
+            "新鲜度": fresh_label,
             "持仓股数": pos.get("shares"),
             "持仓成本": pos.get("cost"),
             "累计回撤%": (round(cdd * 100, 2) if cdd is not None else None),
@@ -178,10 +185,16 @@ def _render_health(status: dict) -> None:
 
     # 卡片窄，只留到分钟（原来 [:19] 会被截成 "2026-10-2…"，看着像日期缺失）
     last_succ = str(hb.get("last_success_at") or "—")[:16].replace("T", " ")
+    # H78：心跳里没有 stale 字段 ⇒ 显示"未知"，不得默认成正常
+    _fr = hb.get("data_freshness") or {}
+    _stale = hb.get("stale")
+    _fresh_txt = ("未知" if _stale is None
+                  else (f"⚠ 陈旧 {_fr.get('lag_bars', '?')} 根" if _stale else "正常"))
     cards = [
         ("进程状态", str(hb.get("status") or "—"), "flat"),
         ("心跳日期", str(hb.get("date") or "—"), "flat"),
         ("最近采集成功", last_succ, "flat"),
+        ("行情新鲜度", _fresh_txt, "down" if _stale else "flat"),
         ("采集失败次数", str(hb.get("collect_errors", "—")), "flat"),
         ("活跃告警", str(len(alerts)), "down" if alerts else "up"),
     ]
@@ -207,6 +220,11 @@ def _render_units(status: dict) -> None:
     if df.empty:
         st.info("live_outputs 下没有可读的观察单元（未运行或路径为空）")
         return
+    # H78：陈旧必须标红，且明确"权益来自旧价格、不是当前收益"
+    if "新鲜度" in df.columns and (df["新鲜度"] == "⚠ 陈旧").any():
+        stale_asof = ", ".join(str(x) for x in df.loc[df["新鲜度"] == "⚠ 陈旧", "行情时点"].unique())
+        st.error(f"⚠ 行情陈旧（最后一根 {stale_asof}）：表中权益与盈亏由**旧价格**计算，"
+                 f"不代表当前收益；当日盈亏已置空。")
     st.dataframe(df, width="stretch", hide_index=True)
 
 

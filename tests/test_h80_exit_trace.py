@@ -141,6 +141,14 @@ def test_summarize_marks_untraced():
     assert "untraced" in an.render(s)
 
 
+def test_summarize_empty_is_not_reported_as_healthy():
+    """0 实例必须报"还没观测"，不能打 ✅（假绿）。"""
+    s = an.summarize([])
+    text = an.render(s)
+    assert "✅" not in text
+    assert "还没观测" in text
+
+
 def test_summarize_detects_short_lived():
     recs = [
         {"event": "start", "pid": 3, "started_at": "2026-11-10T08:25:07", "stage": "collect"},

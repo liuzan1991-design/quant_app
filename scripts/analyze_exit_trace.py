@@ -101,7 +101,11 @@ def render(s: dict) -> str:
                    f"{i['uptime_s'] if i['uptime_s'] is not None else '—'} | {i['last_stage']} |")
 
     out.append("")
-    if s["untraced"]:
+    if s["total"] == 0:
+        # 0 实例不能说"每个实例都有 exit"——那是假绿：文件可能还没生成。
+        out.append("⚠ 无任何实例记录：`exit_trace.jsonl` 不存在，或 live 尚未用 H80 版本启动。"
+                   "**这不等于健康**，只等于「还没观测」。")
+    elif s["untraced"]:
         out.append(f"⚠ untraced {len(s['untraced'])} 个 ⇒ 非 Python 层退出，"
                    f"请对照 console_<date>.log 的 `Fatal Python error`："
                    f"有转储=原生崩溃，无转储=静默终止")

@@ -87,6 +87,28 @@ ZOMBIE_MIN_AGE = 30 * 60         # 启动满 30 分钟仍 0 成功（≈60 轮�
 ZOMBIE_MIN_ERRORS = 30           # 且失败轮次 ≥30（排除"刚启动慢一轮"误杀）
 ZOMBIE_MAX_RESTARTS = 3          # 每日受控重启上限（防重启风暴；今天是 1 次就救回）
 
+# ---- H79：「有过成功记录」之后的成功停摆（2026-11-10 立号）----
+# 背景：11-10 09:56 券商断连后，AD SDK 会话卡死，每轮 90 秒硬超时、0 成功，
+#       心跳照刷 3.5 小时，watchdog 走「已有成功记录 ⇒ 只告警」分支，全程不动作。
+#       人工重启一次后 11.8 秒即恢复 ⇒ **这一类重启有效**，与 10-19 不同。
+# 与 10-19 的分界（10-19 重启 5 次全败）：
+#   10-19 = RSS 涨到 ~2GB 的内存泄漏型，换进程无效；
+#   11-10 = RSS 107MB 的 SDK 会话卡死型，换进程有效。
+#   ⇒ 故以 RSS 作分界，超限一律不动（避免制造僵尸）。
+# 阈值纪律：**不新造时间阈值**，直接复用 SUCCESS_STALE_SECONDS(900s) ——
+#   该值已由 24 个交易日 6015 个间隔标定（P99.5=234s、正常日最大 695s），
+#   全样本仅 13 次触发且全部落在已知故障日、正常日零触发。
+# 午休免疫：不靠时段判定（时段判错会误重启，比不重启更糟），
+#   改要求**两轮检查间 collect_errors 必须新增** —— 午休期没有失败、增量为 0，
+#   天然不触发；今天是从 0 涨到 229，必然触发。
+# STALL_MIN_ERRORS 标定（2026-11-10 当日 230 次真实失败）：
+#   失败轮次间隔中位 36s；按 watchdog 5 分钟周期切桶（42 个桶）——
+#   每桶失败次数 中位 6、分布 {6:28, 5:10, 4:2, 3:1, 1:1}。
+#   取 4：42 个桶中 40 个达标（95%），既不会因一轮慢就漏判，也不至于 1-2 次就动手。
+SUCCESS_STALL_SECONDS = SUCCESS_STALE_SECONDS
+STALL_MIN_ERRORS = 4             # 两轮检查间新增失败 ≥4 次（5 分钟窗口的 2/3 分位）
+STALL_RSS_LIMIT_MB = 1500        # ≥1.5GB 判为 10-19 型内存泄漏，重启无效
+
 
 def log(msg: str) -> None:
     WATCHDOG_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +260,125 @@ def _zombie_restart_decision(hb: dict, succ_age: float | None,
     if errs < ZOMBIE_MIN_ERRORS:
         return False, f"失败仅 {errs} 次（< {ZOMBIE_MIN_ERRORS}）"
     return True, f"启动 {age / 60:.0f} 分钟 0 成功、失败 {errs} 次"
+
+
+def _stall_state_path(day: str) -> Path:
+    return WATCHDOG_LOG.parent / f"watchdog_stall_{str(day).replace('-', '')}.json"
+
+
+def _prev_collect_errors(day: str) -> int | None:
+    try:
+        p = _stall_state_path(day)
+        if p.exists():
+            return int((json.loads(p.read_text(encoding="utf-8")) or {}).get("collect_errors"))
+    except Exception as e:  # noqa: BLE001
+        log(f"[WARN] 停摆状态读取失败: {e!r}")
+    return None
+
+
+def _save_collect_errors(day: str, current: int) -> None:
+    try:
+        p = _stall_state_path(day)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"collect_errors": current,
+                                 "checked_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}"},
+                                ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log(f"[WARN] 停摆状态写入失败: {e!r}")
+
+
+def _error_delta(day: str, current: int) -> tuple[int, int | None]:
+    """返回 (两轮间新增失败数, 上轮值)。进程重启导致计数归零时，按当日累计计。"""
+    prev = _prev_collect_errors(day)
+    if prev is None:
+        return current, None
+    if current < prev:
+        return current, prev          # 进程已重启，计数归零
+    return current - prev, prev
+
+
+def _success_stall_decision(hb: dict, succ_age: float | None, err_delta: int,
+                            rss_mb: float | None, water_closed: bool = False
+                            ) -> tuple[bool, str]:
+    """H79 纯函数：有过成功记录、但成功已长时间停摆 ⇒ 是否受控重启。
+
+    只在「有成功记录」时走这里；「从未成功」归 H60 僵尸路径，二者互斥。
+    关键防线见常量区注释：RSS 分界拦住 10-19 型内存泄漏，错误增量免疫午休。
+    """
+    if succ_age is None:
+        return False, "从未成功（归 H60 僵尸路径，不走本判据）"
+    if succ_age < SUCCESS_STALL_SECONDS:
+        return False, f"上次成功 {succ_age / 60:.0f} 分钟前（< {SUCCESS_STALL_SECONDS // 60}）"
+    if err_delta < STALL_MIN_ERRORS:
+        return False, f"近轮新增失败仅 {err_delta} 次（< {STALL_MIN_ERRORS}）⇒ 非采集失败，不动"
+    if water_closed:
+        return False, "今日水位已达收盘，属正常结束"
+    if rss_mb is not None and rss_mb >= STALL_RSS_LIMIT_MB:
+        return False, (f"RSS {rss_mb:.0f}MB ≥ {STALL_RSS_LIMIT_MB}MB ⇒ 10-19 内存泄漏型，"
+                       f"换进程无效（H60 反例）")
+    return True, (f"{succ_age / 60:.0f} 分钟无成功、近轮新增失败 {err_delta} 次、"
+                  f"RSS {rss_mb:.0f}MB" if rss_mb is not None
+                  else f"{succ_age / 60:.0f} 分钟无成功、近轮新增失败 {err_delta} 次（RSS 未知）")
+
+
+def _live_run_rss_mb(procs: list) -> float | None:
+    """所有 live_run 进程 RSS 合计（MB）。查不到返回 None（判据按"未知"放行）。"""
+    if not procs:
+        return None
+    try:
+        import psutil
+        total = 0
+        for pid, _cmd in procs:
+            if pid is None:
+                continue
+            try:
+                total += psutil.Process(int(pid)).memory_info().rss
+            except Exception:  # noqa: BLE001  进程已退出
+                continue
+        return total / 1024 / 1024 if total else None
+    except Exception as e:  # noqa: BLE001
+        log(f"[WARN] RSS 查询失败: {e!r}")
+        return None
+
+
+def _maybe_restart_stall(hb: dict, succ_age: float | None, suffix: str = "") -> bool:
+    """H79：成功停摆 + 错误累积 ⇒ 杀进程 + 拉起。与 H60 共享每日重启额度。"""
+    day = str(hb.get("date") or f"{datetime.now():%Y-%m-%d}")
+    current = int(hb.get("collect_errors") or 0)
+    delta, prev = _error_delta(day, current)
+    _save_collect_errors(day, current)
+
+    water_closed = _today_watermark_reached_close()
+    procs = _live_run_processes()
+    rss = _live_run_rss_mb(procs)
+    need, reason = _success_stall_decision(hb, succ_age, delta, rss, water_closed)
+    if not need:
+        log(f"[判定] 成功停摆不重启：{reason}{suffix}")
+        return False
+
+    used = _restart_budget(day)
+    if used >= ZOMBIE_MAX_RESTARTS:
+        log(f"[ALERT-STALL] {reason} → 今日受控重启已用 {used}/{ZOMBIE_MAX_RESTARTS}，"
+            f"不再重启{suffix}")
+        return False
+
+    log(f"[ALERT-STALL] {reason} → 上次成功 {hb.get('last_success_at')}，"
+        f"累计失败 {current} 次（上轮 {prev}）⇒ 受控重启"
+        f"（今日第 {used + 1}/{ZOMBIE_MAX_RESTARTS} 次）{suffix}")
+    _bump_restart_budget(day, f"成功停摆：{reason}")
+
+    if procs:
+        if not _kill_live_run(procs):
+            log("[ERROR] 部分进程未能终止 ⇒ 放弃本次重启（双实例会互相覆盖同一 CSV）")
+            return False
+        _sleep(3)
+        left = _live_run_processes()
+        if left:
+            log(f"[ERROR] 仍残留进程 {[p[0] for p in left]} ⇒ 放弃重启（双实例风险）")
+            return False
+
+    _restart(f"成功停摆：{reason}")
+    return True
 
 
 def _restart_budget_path(day: str) -> Path:
@@ -435,9 +576,13 @@ def main() -> int:
         # 采集停摆时 updated_at 照刷、age 恒小，旧版会直接判健康退出。
         _report_success_staleness(hb, succ_age, suffix)
         # H60：活着但**从未采到数** ⇒ 受控重启（杀进程 + 拉起），否则会像 10-27 那样
-        # 空转到收盘。只处理 succ_age is None，其余仍留给 H36 告警旁路。
+        # 空转到收盘。只处理 succ_age is None，其余走 H79。
         if not dry:
-            _maybe_restart_zombie(hb, succ_age, suffix)
+            if not _maybe_restart_zombie(hb, succ_age, suffix):
+                # H79：有过成功记录、但成功已长时间停摆且错误在累积 ⇒ 受控重启。
+                # 11-10 实证：AD SDK 会话卡死后每轮硬超时 90s、心跳照刷 3.5 小时，
+                # 旧逻辑只告警不动作；重启一次即恢复（11.8s 取到数）。
+                _maybe_restart_stall(hb, succ_age, suffix)
         return 0   # 健康
 
     # ---- 心跳静默：分三种情况处置 ----

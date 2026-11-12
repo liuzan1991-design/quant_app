@@ -112,27 +112,32 @@ ATTEMPT = datetime(2026, 11, 10, 13, 40, 0)
 
 def test_verdict_requires_new_instance_identity():
     prev = _snap(pids=[100])
-    ok, why = w._recovery_verdict(prev, _snap(pids=[100]), ATTEMPT)
-    assert ok is False and "旧 PID" in why
-    ok, why = w._recovery_verdict(prev, _snap(started_at="2026-11-10T13:30:00"), ATTEMPT)
-    assert ok is False and "身份未成立" in why
-    ok, why = w._recovery_verdict(prev, _snap(pids=None), ATTEMPT)
-    assert ok is False and "无法确认" in why
+    later = ATTEMPT + timedelta(seconds=600)          # 已过冷启动上限
+    st, why = w._recovery_verdict(prev, _snap(pids=[100]), ATTEMPT, now=later)
+    assert st == "failed" and "旧 PID" in why
+    st, why = w._recovery_verdict(prev, _snap(started_at="2026-11-10T13:30:00"), ATTEMPT, now=later)
+    assert st == "failed" and "尚未上线" in why
+    st, why = w._recovery_verdict(prev, _snap(pids=None), ATTEMPT, now=later)
+    assert st == "failed" and "无法确认" in why
 
 
 def test_verdict_requires_last_success_advance():
     prev = _snap(pids=[100], last_success_at="2026-11-10T13:45:30")
-    ok, why = w._recovery_verdict(prev, _snap(last_success_at="2026-11-10T13:45:30"), ATTEMPT)
-    assert ok is False and "last_success_at 未前进" in why
+    later = ATTEMPT + timedelta(seconds=600)
+    st, why = w._recovery_verdict(prev, _snap(last_success_at="2026-11-10T13:45:30"),
+                                  ATTEMPT, now=later)
+    assert st == "failed" and "尚未采集成功" in why
 
 
 def test_verdict_requires_bar_watermark_advance():
-    """重读旧数据不算恢复：last_success 前进但水位没动 ⇒ 失败。"""
+    """重读旧数据不算恢复：last_success 前进但水位没动 ⇒ 失败（盘中口径）。"""
     prev = _snap(pids=[100], last_bar_at="2026-11-10T13:44:00")
     cur = _snap(last_bar_at="2026-11-10T13:44:00",
                 last_success_at="2026-11-10T13:45:59")
-    ok, why = w._recovery_verdict(prev, cur, ATTEMPT)
-    assert ok is False and "水位未推进" in why
+    st, why = w._recovery_verdict(prev, cur, ATTEMPT,
+                                  now=ATTEMPT + timedelta(seconds=120),
+                                  session="in_session")
+    assert st == "failed" and "水位未推进" in why
 
 
 def test_verdict_passes_only_when_all_three_hold():
@@ -140,13 +145,15 @@ def test_verdict_passes_only_when_all_three_hold():
                  last_bar_at="2026-11-10T13:39:00", started_at="2026-11-10T08:40:00")
     cur = _snap(pids=[200], started_at="2026-11-10T13:45:00",
                 last_success_at="2026-11-10T13:45:30", last_bar_at="2026-11-10T13:44:00")
-    ok, why = w._recovery_verdict(prev, cur, ATTEMPT)
-    assert ok is True and "实例 [200]" in why
+    st, why = w._recovery_verdict(prev, cur, ATTEMPT,
+                                  now=ATTEMPT + timedelta(seconds=120),
+                                  session="in_session")
+    assert st == "recovered" and "实例 [200]" in why
 
 
 # ── 四、端到端动作链 ───────────────────────────────────────────────────────
 
-def _wire(monkeypatch, verify=(True, "三重验证通过"), kill_ok=True, procs_after=()):
+def _wire(monkeypatch, verify=("recovered", "三重验证通过"), kill_ok=True, procs_after=()):
     calls = {"kill": 0, "restart": 0}
     state = {"procs": [(100, "live_run.py")]}
 
@@ -184,7 +191,7 @@ def test_restart_success_records_attempt_and_recovery(sandbox, monkeypatch):
 
 
 def test_failed_recovery_stops_second_attempt(sandbox, monkeypatch):
-    calls = _wire(monkeypatch, verify=(False, "CSV 水位未推进（旧数据重读）"))
+    calls = _wire(monkeypatch, verify=("failed", "CSV 水位未推进（旧数据重读）"))
     assert w._maybe_restart_stall(_hb(), 3600) is False
     led = w._load_stall_ledger(_hb()["date"])
     assert led["attempts"] == 1 and led["successes"] == 0

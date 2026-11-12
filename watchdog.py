@@ -52,7 +52,7 @@ import subprocess
 import sys
 import time
 
-from core.trading_calendar import beijing_today, is_trading_day
+from core.trading_calendar import BJ, beijing_today, is_trading_day
 from core.alerts import clear_alert, raise_alert   # H36 告警送达
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -113,8 +113,17 @@ STALL_RSS_LIMIT_MB = 1500        # ≥1.5GB 判为 10-19 型内存泄漏，重�
 # 1) 额度：**尝试次数与恢复成功次数分开记账**；一次恢复失败即停止自动重试。
 #    旧实现只有"重启次数"，kill 失败也扣额度、且失败后下一轮还会再试 ⇒ 反复重启。
 STALL_MAX_ATTEMPTS = 2           # 每日自动尝试上限（正常路径 1 次成功即结束）
-STALL_VERIFY_TIMEOUT = 180       # 恢复验证窗口（秒）；至少覆盖 3 个采集轮次
+# ---- H81（2026-11-12 立号）：验证窗口与冷启动对齐 + pending 跨轮次 ----
+# 实证：11-12 07:05:04 受控重启，新实例 07:05:25 启动、07:09:58 首次采集成功
+#   ⇒ **冷启动 273s**；同日 04:30:12→04:34:46 冷启动 **274s**（两次高度一致）。
+#   而旧 STALL_VERIFY_TIMEOUT=180s ⇒ 判据在首次成功**前 101 秒**就下 no_recovery，
+#   属结构性假失败（重启其实成功），并因此锁死当日额度、留下永久告警。
+# 口径：单轮窗口（180s）只决定"这一轮等多久"，**不再决定成败**；
+#   成败由冷启动上限（420s）决定，到点仍无首次成功才算真失败。
+#   420s = 实测最大 274s + 一轮采集约 40s + 余量，覆盖 3 个采集轮次仍有富余。
+STALL_VERIFY_TIMEOUT = 180       # 单轮验证窗口（秒）；到点转 pending，跨轮次续验
 STALL_VERIFY_POLL = 10           # 轮询间隔（秒）
+STALL_COLD_START_MAX = 420       # 冷启动上限（秒）：超过仍无首次成功 ⇒ 判真失败
 # 2) 失败关闭：RSS 未知、进程查询不可信，一律**不动作**（只告警），
 #    否则"查不到"会被当成"没有风险"。
 STALL_BLOCK_ALERT = "stall_blocked"   # 不确定而未动作时的告警 kind
@@ -425,54 +434,120 @@ def _recovery_snapshot(day: str | None = None) -> dict:
     }
 
 
-def _recovery_verdict(prev: dict, cur: dict, attempt_ts: datetime | None
-                      ) -> tuple[bool, str]:
-    """三重验证：新实例身份 / last_success_at 前进 / CSV 水位推进。
+def _bj_now(now: datetime | None = None) -> datetime:
+    """本机时刻 → 北京时间（naive）。本机 GMT+3，**不能直接拿钟点比交易时段**。"""
+    now = now or datetime.now()
+    if now.tzinfo is None:
+        now = now.astimezone()          # naive 按本机时区解释（与 beijing_today 同口径）
+    return now.astimezone(BJ).replace(tzinfo=None)
 
-    **单纯再次读到旧数据不算恢复**（用户 2026-11-10 明确）。
+
+def _session_now(now: datetime | None = None) -> str:
+    """当前北京时段；复用 data_freshness 唯一实现，取不到时按盘中从严处理。"""
+    try:
+        from core import data_freshness
+        return data_freshness.session_of(_bj_now(now))
+    except Exception:  # noqa: BLE001 —— 判不出时段就按交易时段，宁可严不可松
+        return "in_session"
+
+
+def _recovery_verdict(prev: dict, cur: dict, attempt_ts: datetime | None,
+                      now: datetime | None = None, session: str | None = None
+                      ) -> tuple[str, str]:
+    """三重验证，返回三态：``recovered`` / ``pending`` / ``failed``。
+
+    H81（用户 2026-11-12 口径）相对旧版的两处改动：
+
+    1. **冷启动期内不判死**。旧版只有 bool，180s 窗口一到就判 no_recovery；
+       而实测冷启动 273~274s（两次），判据必然在首次成功前下结论。
+       现在「新实例还没上线 / 还没首次成功」返回 ``pending``，由下一轮续验；
+       只有超过 ``STALL_COLD_START_MAX``(420s) 仍无首次成功才 ``failed``。
+    2. **非交易时段放宽水位判据**。午休（11:30–13:00）与盘前盘后本来就不产 bar，
+       要求"CSV 水位推进"等于永不通过（11-12 07:08 的假失败里，这一条同样会拦）。
+       非交易时段改要求"水位不倒退"，恢复信号以 ``last_success_at`` 前进为准。
+
+    **不放宽的硬边界**：进程列表不可信、旧 PID 仍存活 —— 任何时点都直接 failed，
+    这类是"双实例写同一 CSV"的风险，不能用等待换时间。
+
+    Args:
+        prev: 动作前快照
+        cur: 当前快照
+        attempt_ts: 发起重启的时刻（本机 naive）
+        now: 判定时刻（本机 naive；测试注入用）
+        session: 北京时段；None ⇒ 按当前时刻算
     """
-    # ① 新实例身份：started_at 必须不早于本次尝试，且旧 PID 必须消失
-    #    容差 2s：heartbeat 的 started_at 截断到秒，拉起很快时可能比 attempt_ts 早 1s 内
-    st = _parse_dt(cur.get("started_at") or "")
-    if attempt_ts is None or st is None or st < attempt_ts - timedelta(seconds=2):
-        return False, f"新实例身份未成立（started_at={cur.get('started_at')} < 尝试时刻）"
-    if cur.get("pids") is None:
-        return False, "进程列表不可信 ⇒ 无法确认新实例身份"
-    if set(cur["pids"]) & set(prev.get("pids") or []):
-        return False, f"旧 PID 仍存活 {sorted(set(cur['pids']) & set(prev.get('pids') or []))}"
+    now = now or datetime.now()
+    session = session or _session_now(now)
+    elapsed = (now - attempt_ts).total_seconds() if attempt_ts else None
+    if elapsed is not None and elapsed < -60:
+        # 时钟回拨 / 账本来自未来：不能靠"再等等"把额度无限挂住
+        return "failed", f"尝试时刻在未来（{attempt_ts}），判定时刻 {now} ⇒ 用时为负，拒绝续验"
+    over_cold = elapsed is None or elapsed > STALL_COLD_START_MAX
+    waiting = "failed" if over_cold else "pending"
+    waited = f"{elapsed:.0f}s/{STALL_COLD_START_MAX}s" if elapsed is not None else "N/A"
 
-    # ② last_success_at 前进
+    # ① 硬边界：查不到进程 / 旧 PID 还在 —— 任何时点都不放行
+    if cur.get("pids") is None:
+        return "failed", "进程列表不可信 ⇒ 无法确认新实例身份"
+    old_pids = sorted(set(cur.get("pids") or []) & set(prev.get("pids") or []))
+    if old_pids:
+        return "failed", f"旧 PID 仍存活 {old_pids}"
+
+    # ② 新实例身份：started_at 必须不早于本次尝试（容差 2s：心跳截断到秒）
+    if attempt_ts is None:
+        return "failed", "缺少尝试时刻 ⇒ 无法确认新实例身份"
+    st = _parse_dt(cur.get("started_at") or "")
+    if st is None or st < attempt_ts - timedelta(seconds=2):
+        return waiting, (f"新实例尚未上线（started_at={cur.get('started_at')} < "
+                         f"尝试时刻 {attempt_ts:%H:%M:%S}，已等 {waited}）")
+
+    # ③ last_success_at 前进（新实例必须真的采到一次）
     ps = _parse_dt(prev.get("last_success_at") or "")
     cs = _parse_dt(cur.get("last_success_at") or "")
     if cs is None or (ps is not None and cs <= ps):
-        return False, (f"last_success_at 未前进（{prev.get('last_success_at')} → "
-                       f"{cur.get('last_success_at')}）")
+        return waiting, (f"新实例尚未采集成功（last_success_at "
+                         f"{prev.get('last_success_at')} → {cur.get('last_success_at')}，"
+                         f"已等 {waited}）")
 
-    # ③ CSV 行情水位推进
+    # ④ 行情水位
     pb = _parse_dt(prev.get("last_bar_at") or "")
     cb = _parse_dt(cur.get("last_bar_at") or "")
-    if cb is None or (pb is not None and cb <= pb):
-        return False, f"CSV 水位未推进（{prev.get('last_bar_at')} → {cur.get('last_bar_at')}）"
+    if session == "in_session":
+        if cb is None or (pb is not None and cb <= pb):
+            return "failed", (f"CSV 水位未推进（{prev.get('last_bar_at')} → "
+                              f"{cur.get('last_bar_at')}）")
+        bar_note = f"水位 {cur.get('last_bar_at')}"
+    else:
+        # 午休 / 盘前 / 盘后：本来不产 bar，只要不倒退即视为一致
+        if pb is not None and (cb is None or cb < pb):
+            return "failed", (f"非交易时段（{session}）水位倒退（{prev.get('last_bar_at')} → "
+                              f"{cur.get('last_bar_at')}）")
+        bar_note = f"非交易时段（{session}）水位不变属正常（{cur.get('last_bar_at')}）"
 
-    return True, (f"实例 {sorted(cur['pids'])}、last_success {cur.get('last_success_at')}、"
-                  f"水位 {cur.get('last_bar_at')}")
+    return "recovered", (f"实例 {sorted(cur['pids'])}、"
+                         f"last_success {cur.get('last_success_at')}、{bar_note}")
 
 
 def _verify_recovery(prev: dict, attempt_ts: datetime | None,
-                     timeout: int | None = None, poll: int | None = None
-                     ) -> tuple[bool, str]:
-    """轮询直到三重验证通过或超时。超时即判失败（调用方随后停止自动重试）。"""
+                     timeout: int | None = None, poll: int | None = None,
+                     now_fn=None) -> tuple[str, str]:
+    """轮询到「有结论」或单轮窗口到点。
+
+    H81：单轮窗口（默认 180s）**只决定这一轮等多久**，不再决定成败。
+    到点仍 pending ⇒ 返回 pending，由调用方落账本、下一轮接着验。
+    """
     timeout = STALL_VERIFY_TIMEOUT if timeout is None else timeout
     poll = STALL_VERIFY_POLL if poll is None else poll
     deadline = time.monotonic() + timeout
     detail = "未取到现场"
     while True:
         cur = _recovery_snapshot()
-        ok, detail = _recovery_verdict(prev, cur, attempt_ts)
-        if ok:
-            return True, detail
+        status, detail = _recovery_verdict(
+            prev, cur, attempt_ts, now=(now_fn() if now_fn else None))
+        if status != "pending":
+            return status, detail
         if time.monotonic() >= deadline:
-            return False, detail
+            return "pending", f"{detail} ⇒ 本轮窗口 {timeout}s 到点，转下一轮续验"
         _sleep(poll)
 
 
@@ -504,8 +579,38 @@ def _maybe_restart_stall(hb: dict, succ_age: float | None, suffix: str = "") -> 
     - RSS 未知、进程查询不可信 ⇒ 失败关闭（只告警）；
     - 恢复判据 = 新实例身份 + last_success_at 前进 + CSV 水位推进，三者全中；
     - 失败会把 stop_reason 写进账本，当日不再自动重试。
+
+    H81（用户 2026-11-12 口径）在其上补两条：
+    - **pending 跨轮次**：冷启动 273s > 单轮窗口 180s，本轮验不完就落账本 pending，
+      下一轮接着验，不重复 kill / 不重复消耗额度；
+    - **非交易时段放宽水位**：由 `_recovery_verdict` 按时段分支处理。
     """
     day = str(hb.get("date") or f"{datetime.now():%Y-%m-%d}")
+    led = _load_stall_ledger(day)
+
+    # ---- H81 首步：账本里已有 pending ⇒ 只续验，不再杀/拉/扣额度 ----
+    pend = led.get("pending")
+    if isinstance(pend, dict) and pend.get("attempt_at"):
+        prev = pend.get("prev") or {}
+        at = _parse_dt(pend.get("attempt_at") or "")
+        status, detail = _verify_recovery(prev, at)
+        if status == "recovered":
+            _save_stall_ledger(day, successes=int(led.get("successes") or 0) + 1,
+                               last_outcome="recovered", stop_reason=None,
+                               pending=None, detail=detail)
+            log(f"[动作] ✅ 恢复验证通过（跨轮次续验）：{detail}{suffix}")
+            clear_alert(STALL_BLOCK_ALERT)
+            clear_alert("stall_no_recovery")   # H81：假失败留下的告警必须一并撤掉
+            return True
+        if status == "failed":
+            _save_stall_ledger(day, pending=None)
+            _fail_stall(day, "no_recovery", detail)
+            return False
+        _save_stall_ledger(day, pending={**pend, "checked_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}"},
+                           detail=detail)
+        log(f"[判定] 恢复验证 pending（跨轮次续验中）：{detail}{suffix}")
+        return False
+
     current = int(hb.get("collect_errors") or 0)
     delta, prev = _error_delta(day, current)
     _save_collect_errors(day, current)
@@ -524,7 +629,6 @@ def _maybe_restart_stall(hb: dict, succ_age: float | None, suffix: str = "") -> 
             raise_alert(STALL_BLOCK_ALERT, f"H79 未动作（{reason}）", level="alert")
         return False
 
-    led = _load_stall_ledger(day)
     allowed, why = _stall_gate(led)
     if not allowed:
         log(f"[ALERT-STALL] {reason} → {why}{suffix}")
@@ -552,14 +656,27 @@ def _maybe_restart_stall(hb: dict, succ_age: float | None, suffix: str = "") -> 
         return False
 
     _restart(f"成功停摆：{reason}", wait=False)
-    ok, detail = _verify_recovery(prev_state, attempt_ts)
-    if ok:
+    status, detail = _verify_recovery(prev_state, attempt_ts)
+    if status == "recovered":
         _save_stall_ledger(day, successes=int(led.get("successes") or 0) + 1,
-                           last_outcome="recovered", stop_reason=None, detail=detail)
+                           last_outcome="recovered", stop_reason=None,
+                           pending=None, detail=detail)
         log(f"[动作] ✅ 恢复验证通过：{detail}{suffix}")
         clear_alert(STALL_BLOCK_ALERT)
+        clear_alert("stall_no_recovery")
         return True
 
+    if status == "pending":
+        # H81：冷启动未走完 ⇒ 落 pending，下一轮续验；**不判失败、不锁当日额度**
+        _save_stall_ledger(day, last_outcome="pending",
+                           pending={"attempt_at": attempt_ts.isoformat(timespec="seconds"),
+                                    "prev": prev_state,
+                                    "created_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}"},
+                           detail=detail)
+        log(f"[判定] 恢复验证 pending（待下一轮续验）：{detail}{suffix}")
+        return False
+
+    _save_stall_ledger(day, pending=None)
     _fail_stall(day, "no_recovery", detail)
     return False
 
@@ -567,7 +684,7 @@ def _maybe_restart_stall(hb: dict, succ_age: float | None, suffix: str = "") -> 
 def _fail_stall(day: str, outcome: str, detail: str) -> None:
     """恢复失败：写账本 + 停止当日自动重试 + 告警（不静默）。"""
     led = _load_stall_ledger(day)
-    _save_stall_ledger(day, last_outcome=outcome,
+    _save_stall_ledger(day, last_outcome=outcome, pending=None,
                        stop_reason=f"{outcome}：{detail}",
                        failures=int(led.get("failures") or 0) + 1, detail=detail)
     log(f"[ALERT-STALL] ❌ 恢复未验证（{outcome}）：{detail} ⇒ 今日停止自动重试，需人工介入")
@@ -742,6 +859,17 @@ def main() -> int:
         f"last_success={last_success} "
         f"距今={f'{succ_age:.0f}s' if succ_age is not None else 'N/A'} "
         f"collect_err={hb.get('collect_errors')}{suffix}")
+
+    # ---- H81：账本里有 pending（冷启动未验完）⇒ 优先续验，其余判据让位 ----
+    # 不加这一段的话，新实例还没写心跳时 age 会一路涨到判据 A/死亡分支，
+    # 那里会直接再 `/Run` 一次 —— 等于绕过额度、可能叠出第二个实例。
+    _day = str(hb_date or f"{datetime.now():%Y-%m-%d}")
+    if isinstance(_load_stall_ledger(_day).get("pending"), dict):
+        if dry:
+            log(f"[判定] 存在待续验的恢复（pending）→ dry-run 不动作{suffix}")
+            return 0
+        _maybe_restart_stall(hb, succ_age, suffix)
+        return 0
 
     # ---- 判据 A：进程不存在（最硬的"人没了"信号，优先于心跳年龄）----
     # 2026-11-09 实证：12:36:49 / 12:56:49 两次 exit 0 静默退出，心跳分别只停在

@@ -88,6 +88,17 @@ ZOMBIE_MIN_AGE = 30 * 60         # 启动满 30 分钟仍 0 成功（≈60 轮�
 ZOMBIE_MIN_ERRORS = 30           # 且失败轮次 ≥30（排除"刚启动慢一轮"误杀）
 ZOMBIE_MAX_RESTARTS = 3          # 每日受控重启上限（防重启风暴；今天是 1 次就救回）
 
+# ---- H82（2026-11-13 立号）：startup 阶段卡死没有独立超时判据 ----
+# 实证：11-13 07:55:25 判据 A 拉起实例 2 后，进程卡在 startup（只写过一次心跳，
+#   status=starting、last_success=None），07:55→08:20 **白等 1498s**，直到 HANG 的
+#   心跳静默阈值（1200s）才发现。代价：13:00–13:24 无实时采集，网格 20 笔买单被
+#   stale_quote 拒掉，下午开盘 22 分钟策略失效。
+# 正常冷启动实测（首行日志→首采完成）：274s / 273s / 283s / 334s。
+#   取 600：对最慢样本留 266s 余量；不取 420——那只剩 86s，AD 登录变慢即误杀。
+# 与 H62 分工：H62 看"心跳静默 1200s"（运行中卡死），本条看"startup 超 600s 无首采"。
+STALL_STARTUP_MAX = 600          # startup 阶段上限（秒）：超时仍无首次采集 ⇒ 判卡死
+STARTUP_ALERT = "startup_hang"   # 额度耗尽时的人工介入告警 kind
+
 # ---- H79：「有过成功记录」之后的成功停摆（2026-11-10 立号）----
 # 背景：11-10 09:56 券商断连后，AD SDK 会话卡死，每轮 90 秒硬超时、0 成功，
 #       心跳照刷 3.5 小时，watchdog 走「已有成功记录 ⇒ 只告警」分支，全程不动作。
@@ -823,6 +834,88 @@ def _maybe_restart_hang(hb: dict, succ_age: float | None, procs: list,
     return True
 
 
+def _startup_hang_decision(hb: dict, procs: list, now: datetime | None = None
+                           ) -> tuple[bool, str]:
+    """H82：进程在、当日从未采到数、启动已超上限 ⇒ 判 startup 卡死。
+
+    只处理 ``status=starting`` 且 ``last_success_at`` 为空的情形：
+    已在采数的进程归 H62/H79，本条不越界。
+
+    失败关闭：进程查询不可信（procs 为空）不动手、缺 started_at 不动手、
+    started_at 在未来（时钟回拨）不动手——这几条都不许用"再等等"糊过去。
+    """
+    if not procs:
+        if not PROC_QUERY_TRUSTED:
+            # 查不到 ≠ 没有：本机 PowerShell 偶发"exit 0 + 空输出"，
+            # 这种时候必须失败关闭，不能当成"进程已经没了"。
+            return False, "进程查询不可信 ⇒ 不动手（失败关闭）"
+        return False, "无 live_run 进程（归判据 A）"
+    status = str(hb.get("status") or "")
+    if status != "starting":
+        return False, f"status={status or '空'}（非 starting）"
+    if hb.get("last_success_at"):
+        return False, f"已有成功记录（{hb['last_success_at']}）⇒ 归 H62/H79"
+    st = _parse_dt(hb.get("started_at") or "")
+    if st is None:
+        return False, "缺少 started_at ⇒ 无法判断启动时长"
+    now = now or datetime.now()
+    elapsed = (now - st).total_seconds()
+    if elapsed < 0:
+        return False, f"started_at 在未来（{hb.get('started_at')}）⇒ 时钟异常，不动手"
+    if elapsed < STALL_STARTUP_MAX:
+        return False, f"启动仅 {elapsed:.0f}s（< {STALL_STARTUP_MAX}）"
+    return True, f"启动 {elapsed:.0f}s 仍停在 {status}、当日 0 成功"
+
+
+def _maybe_restart_startup(hb: dict, procs: list, suffix: str = "",
+                           dry: bool = False) -> bool:
+    """H82：startup 超时 ⇒ taskkill + 拉起。
+
+    返回 True 表示"本轮到此为止"（已动作、dry-run 已判定、或额度耗尽需人工），
+    调用方据此 ``return 0``，不再往下走判据 B/HANG。
+    """
+    need, reason = _startup_hang_decision(hb, procs)
+    if not need:
+        log(f"[判定] startup 超时不触发：{reason}{suffix}")
+        return False
+
+    # 收盘后不动作：此时水位已满，手动启动的实例（复盘/演练）本来就不产新 bar，
+    # 600s 后照判就成了误杀。与判据 A 的收盘护栏保持同一口径。
+    if _today_watermark_reached_close():
+        log(f"[判定] startup 超时不动作：今日水位已达收盘（{reason}）{suffix}")
+        return False
+
+    if dry:
+        log(f"[判定] startup 超时重启被 dry-run 抑制（{reason}）{suffix}")
+        return True
+
+    day = str(hb.get("date") or f"{datetime.now():%Y-%m-%d}")
+    used = _restart_budget(day)
+    if used >= ZOMBIE_MAX_RESTARTS:
+        log(f"[ALERT-STARTUP] {reason} → 今日受控重启已用 "
+            f"{used}/{ZOMBIE_MAX_RESTARTS}，不再重启{suffix}")
+        raise_alert(STARTUP_ALERT,
+                    f"H82 startup 卡死但当日重启额度已耗尽（{reason}），需人工介入",
+                    level="alert")
+        return True
+
+    log(f"[ALERT-STARTUP] {reason} ⇒ 执行受控重启"
+        f"（今日第 {used + 1}/{ZOMBIE_MAX_RESTARTS} 次）{suffix}")
+    _bump_restart_budget(day, "startup 超时仍无首采")
+
+    if not _kill_live_run(procs):
+        log("[ERROR] 部分进程未能终止 ⇒ 放弃本次重启（双实例会互相覆盖同一 CSV）")
+        return True
+    _sleep(3)
+    left = _live_run_processes()
+    if left:
+        log(f"[ERROR] 仍残留进程 {[p[0] for p in left]} ⇒ 放弃重启（双实例风险）")
+        return True
+
+    _restart(f"startup 卡死：{reason}")
+    return True
+
+
 def main() -> int:
     dry = "--dry-run" in sys.argv
     force = "--ignore-window" in sys.argv   # 测试用：跳过时间窗限制
@@ -887,6 +980,12 @@ def main() -> int:
             f"→ 不等 {STALE_SECONDS // 60} 分钟静默阈值{suffix}")
         if not dry:
             _restart(f"进程缺失，心跳已停 {age:.0f}s")
+        return 0
+
+    # ---- H82：startup 卡死（进程在、当日 0 成功、启动超上限）----
+    # 放在判据 A 之后：进程已消失的归 A；这里只处理"进程还在但起不来"。
+    # 11-13 实证：这一路原先要等到 HANG 的 1200s 心跳静默阈值，白等 1498s。
+    if _maybe_restart_startup(hb, procs, suffix, dry=dry):
         return 0
 
     # ---- 判据 B：用 updated_at（循环存活）----
